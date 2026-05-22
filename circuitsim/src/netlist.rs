@@ -1,4 +1,4 @@
-use crate::circuit::{Capacitor, Circuit, Inductor, NodeId, Pulse, Resistor, VoltageSource, Sine};
+use crate::circuit::{Capacitor, Circuit, Inductor, NodeId, Pulse, Resistor, VoltageSource, Sine, Diode};
 use crate::error::{Result, SimError};
 use crate::units::parse_value;
 
@@ -53,6 +53,7 @@ pub fn parse(source: &str) -> Result<Netlist> {
             'R' => parse_resistor(&tokens, &mut circuit)?,
             'C' => parse_capacitor(&tokens, &mut circuit)?,
             'L' => parse_inductor(&tokens, &mut circuit)?,
+            'D' => parse_diode(&tokens, &mut circuit)?,
             'V' => parse_voltage_source(&tokens, &mut circuit)?,
             _ => {
                 return Err(SimError::Parse(format!(
@@ -107,6 +108,28 @@ fn parse_node(token: &str, circuit: &mut Circuit) -> Result<NodeId> {
     .map_err(|_| SimError::Parse(format!("invalid node '{token}'")))?;
     circuit.ensure_node(id);
     Ok(NodeId(id))
+}
+
+fn parse_diode(tokens: &[&str], circuit: &mut Circuit) -> Result<()> {
+    if tokens.len() < 4 {
+        return Err(SimError::Parse("Diode requires: Dname Anode Cathode Model".into()));
+    }
+
+    let anode = parse_node(tokens[1], circuit)?;
+    let cathode = parse_node(tokens[2], circuit)?;
+
+    // For a minimal implementation, hardcode a standard silicon model
+    // (1N4148 approximation) if a model name is provided.
+    // Later, you can implement a separate .MODEL card parser.
+    circuit.diodes.push(Diode {
+        name: tokens[0].to_string(),
+                        anode,
+                        cathode,
+                        is: 1e-14, // 10 fA
+                        n: 1.0,
+                        vt: 0.02585,
+    });
+    Ok(())
 }
 
 fn parse_resistor(tokens: &[&str], circuit: &mut Circuit) -> Result<()> {

@@ -3,7 +3,6 @@ use nalgebra::{DMatrix, DVector};
 use crate::circuit::{Circuit, NodeId};
 use crate::error::{Result, SimError};
 
-/// Companion models for transient analysis (backward Euler).
 #[derive(Debug, Clone, Default)]
 pub struct TransientState {
     pub capacitor_voltages: Vec<f64>,
@@ -32,11 +31,11 @@ impl MnaSystem {
 
     pub fn solve(&self) -> Result<DVector<f64>> {
         let lu = self
-            .a
-            .clone()
-            .lu()
-            .solve(&self.z)
-            .ok_or_else(|| SimError::Algebra("singular MNA matrix".into()))?;
+        .a
+        .clone()
+        .lu()
+        .solve(&self.z)
+        .ok_or_else(|| SimError::Algebra("singular MNA matrix".into()))?;
         Ok(lu)
     }
 }
@@ -50,20 +49,36 @@ fn node_index(node: NodeId) -> Option<usize> {
 }
 
 pub fn build_dc(circuit: &Circuit) -> Result<MnaSystem> {
-    let size = circuit.dc_matrix_size();
+    // FIX: Use the full transient matrix size so inductors get their own branch current rows
+    let size = circuit.tran_matrix_size();
     let mut sys = MnaSystem::new(size);
+    let n_nodes = circuit.nodes.saturating_sub(1);
+
     stamp_resistors(circuit, &mut sys);
-    // Inductors are shorts at DC; capacitors are open (not stamped).
-    for l in &circuit.inductors {
-        stamp_conductance(&mut sys, l.n1, l.n2, 1e12);
+
+    // FIX: Inductors are shorts at DC. We stamp them as 0V voltage sources
+    // to cleanly solve for their exact steady-state DC current without precision loss.
+    for (i, l) in circuit.inductors.iter().enumerate() {
+        let branch = n_nodes + circuit.voltage_sources.len() + i;
+        if let Some(i1) = node_index(l.n1) {
+            sys.a[(i1, branch)] += 1.0;
+            sys.a[(branch, i1)] += 1.0;
+        }
+        if let Some(i2) = node_index(l.n2) {
+            sys.a[(i2, branch)] -= 1.0;
+            sys.a[(branch, i2)] -= 1.0;
+        }
+        // z[branch] remains 0.0 (acting as a 0V short circuit)
     }
-    stamp_voltage_sources(circuit, &mut sys, circuit.nodes.saturating_sub(1));
+
+    stamp_voltage_sources(circuit, &mut sys, n_nodes, None);
     Ok(sys)
 }
 
 pub fn build_transient(
     circuit: &Circuit,
     dt: f64,
+    t: f64,
     state: &TransientState,
 ) -> Result<MnaSystem> {
     if dt <= 0.0 {
@@ -76,7 +91,7 @@ pub fn build_transient(
     stamp_resistors(circuit, &mut sys);
     stamp_capacitors(circuit, &mut sys, dt, state);
     stamp_inductors(circuit, &mut sys, dt, state, n_nodes, circuit.voltage_sources.len());
-    stamp_voltage_sources(circuit, &mut sys, n_nodes);
+    stamp_voltage_sources(circuit, &mut sys, n_nodes, Some(t));
 
     Ok(sys)
 }
@@ -94,7 +109,6 @@ fn stamp_capacitors(circuit: &Circuit, sys: &mut MnaSystem, dt: f64, state: &Tra
         let v_prev = state.capacitor_voltages.get(i).copied().unwrap_or(0.0);
         let i_eq = g_eq * v_prev;
         stamp_conductance(sys, c.n1, c.n2, g_eq);
-        // Norton current source enters the positive node (n1).
         stamp_current_source(sys, c.n2, c.n1, i_eq);
     }
 }
@@ -108,14 +122,10 @@ fn stamp_inductors(
     n_vsources: usize,
 ) {
     for (i, l) in circuit.inductors.iter().enumerate() {
-        let g_eq = dt / l.inductance;
+        let r_eq = l.inductance / dt;
         let i_prev = state.inductor_currents.get(i).copied().unwrap_or(0.0);
         let branch = n_nodes + n_vsources + i;
 
-        stamp_conductance(sys, l.n1, l.n2, g_eq);
-        stamp_current_source(sys, l.n2, l.n1, i_prev);
-
-        // Branch current unknown for inductor companion model.
         if let Some(i1) = node_index(l.n1) {
             sys.a[(i1, branch)] += 1.0;
             sys.a[(branch, i1)] += 1.0;
@@ -124,12 +134,13 @@ fn stamp_inductors(
             sys.a[(i2, branch)] -= 1.0;
             sys.a[(branch, i2)] -= 1.0;
         }
-        sys.a[(branch, branch)] -= g_eq;
-        sys.z[branch] += g_eq * i_prev;
+
+        sys.a[(branch, branch)] -= r_eq;
+        sys.z[branch] = -r_eq * i_prev;
     }
 }
 
-fn stamp_voltage_sources(circuit: &Circuit, sys: &mut MnaSystem, n_nodes: usize) {
+fn stamp_voltage_sources(circuit: &Circuit, sys: &mut MnaSystem, n_nodes: usize, t: Option<f64>) {
     for (i, v) in circuit.voltage_sources.iter().enumerate() {
         let branch = n_nodes + i;
         if let Some(i1) = node_index(v.n1) {
@@ -140,7 +151,11 @@ fn stamp_voltage_sources(circuit: &Circuit, sys: &mut MnaSystem, n_nodes: usize)
             sys.a[(i2, branch)] -= 1.0;
             sys.a[(branch, i2)] -= 1.0;
         }
-        sys.z[branch] = v.voltage;
+
+        sys.z[branch] = match t {
+            Some(time) => v.value_at(time),
+            None => v.voltage,
+        };
     }
 }
 
@@ -168,8 +183,8 @@ fn stamp_current_source(sys: &mut MnaSystem, n1: NodeId, n2: NodeId, current: f6
 
 pub fn node_voltage(solution: &DVector<f64>, node: NodeId) -> f64 {
     node_index(node)
-        .map(|i| solution[i])
-        .unwrap_or(0.0)
+    .map(|i| solution[i])
+    .unwrap_or(0.0)
 }
 
 pub fn update_transient_state(
@@ -178,17 +193,17 @@ pub fn update_transient_state(
     state: &mut TransientState,
 ) {
     state.capacitor_voltages = circuit
-        .capacitors
-        .iter()
-        .map(|c| node_voltage(solution, c.n1) - node_voltage(solution, c.n2))
-        .collect();
+    .capacitors
+    .iter()
+    .map(|c| node_voltage(solution, c.n1) - node_voltage(solution, c.n2))
+    .collect();
 
     let n_nodes = circuit.nodes.saturating_sub(1);
     let branch_base = n_nodes + circuit.voltage_sources.len();
     state.inductor_currents = circuit
-        .inductors
-        .iter()
-        .enumerate()
-        .map(|(i, _)| solution[branch_base + i])
-        .collect();
+    .inductors
+    .iter()
+    .enumerate()
+    .map(|(i, _)| solution[branch_base + i])
+    .collect();
 }

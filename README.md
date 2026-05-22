@@ -77,7 +77,7 @@ examples/         Sample netlists
 
 ## Limitations (v0.1)
 
-- DC voltage sources only (no PULSE/SIN yet)  
+- ~~DC voltage sources only (no PULSE/SIN yet)~~
 - No nonlinear devices (diodes, BJTs, MOSFETs)  
 - No AC (.ac) or noise analysis  
 - Dense matrix solver (fine for small/medium netlists)  

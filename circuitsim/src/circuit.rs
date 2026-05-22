@@ -77,21 +77,47 @@ impl Pulse {
     }
 }
 
+use std::f64::consts::PI;
+
+#[derive(Debug, Clone)]
+pub struct Sine {
+    pub vo: f64,    // Offset voltage (V)
+    pub va: f64,    // Amplitude (V)
+    pub freq: f64,  // Frequency (Hz)
+    pub td: f64,    // Delay time (s)
+    pub theta: f64, // Damping factor (1/s)
+}
+
+impl Sine {
+    pub fn value_at(&self, t: f64) -> f64 {
+        if t < self.td {
+            return self.vo;
+        }
+
+        let t_rel = t - self.td;
+        let damping = (-self.theta * t_rel).exp();
+        let oscillation = (2.0 * PI * self.freq * t_rel).sin();
+
+        self.vo + self.va * damping * oscillation
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct VoltageSource {
     pub name: String,
     pub n1: NodeId,
     pub n2: NodeId,
-    pub voltage: f64, // Used as the constant DC value
+    pub voltage: f64,
     pub pulse: Option<Pulse>,
+    pub sine: Option<Sine>, // <-- Add the sine field
 }
 
 impl VoltageSource {
-    /// Returns the source voltage at a given time `t`.
-    /// Falls back to the DC static voltage if no pulse is specified.
     pub fn value_at(&self, t: f64) -> f64 {
         if let Some(ref pulse) = self.pulse {
             pulse.value_at(t)
+        } else if let Some(ref sine) = self.sine {
+            sine.value_at(t) // <-- Evaluate sine wave if present
         } else {
             self.voltage
         }
@@ -173,6 +199,15 @@ impl Circuit {
                     return Err(SimError::Circuit(format!(
                         "voltage source {} pulse period must be greater than active duration (tr + pw + tf)",
                                                          v.name
+                    )));
+                }
+            }
+            // Inside the loop for voltage_sources in Circuit::validate():
+            if let Some(ref s) = v.sine {
+                if s.freq < 0.0 || s.td < 0.0 {
+                    return Err(SimError::Circuit(format!(
+                        "voltage source {} sine frequency and delay cannot be negative",
+                        v.name
                     )));
                 }
             }

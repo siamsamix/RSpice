@@ -258,7 +258,7 @@ impl CircuitSimApp {
     fn toolbar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             ui.label(
-                egui::RichText::new("⚡ CircuitSim")
+                egui::RichText::new("⚡ RSpice")
                     .strong()
                     .size(20.0)
                     .color(ACCENT),

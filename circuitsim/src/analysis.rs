@@ -35,7 +35,7 @@ pub fn run(circuit: &Circuit, analysis: &AnalysisCommands) -> Result<SimulationR
     };
 
     let run_dc = analysis.dc_op
-        || (analysis.tran_step.is_none() && analysis.tran_stop.is_none());
+    || (analysis.tran_step.is_none() && analysis.tran_stop.is_none());
     let run_tran = analysis.tran_step.is_some() && analysis.tran_stop.is_some();
 
     if !run_dc && !run_tran {
@@ -62,9 +62,6 @@ pub fn run(circuit: &Circuit, analysis: &AnalysisCommands) -> Result<SimulationR
 }
 
 pub fn run_dc_op(circuit: &Circuit) -> Result<DcResult> {
-    if !circuit.capacitors.is_empty() || !circuit.inductors.is_empty() {
-        // Open capacitors, short inductors at DC — only R and V contribute.
-    }
     let sys = build_dc(circuit)?;
     let x = sys.solve()?;
     Ok(extract_dc(circuit, &x))
@@ -77,11 +74,11 @@ fn extract_dc(circuit: &Circuit, x: &nalgebra::DVector<f64>) -> DcResult {
     }
     let n_nodes = circuit.nodes.saturating_sub(1);
     let source_currents = circuit
-        .voltage_sources
-        .iter()
-        .enumerate()
-        .map(|(i, _)| x[n_nodes + i])
-        .collect();
+    .voltage_sources
+    .iter()
+    .enumerate()
+    .map(|(i, _)| x[n_nodes + i])
+    .collect();
     DcResult {
         node_voltages,
         source_currents,
@@ -98,13 +95,28 @@ pub fn run_transient(
         return Err(SimError::Analysis("tstop must be >= tstart".into()));
     }
 
+    let dc_sys = build_dc(circuit)?;
+    let dc_x = dc_sys.solve()?;
+
     let mut state = TransientState::default();
-    state.capacitor_voltages = vec![0.0; circuit.capacitors.len()];
-    state.inductor_currents = vec![0.0; circuit.inductors.len()];
+
+    // FIX: Because build_dc now solves for inductor branches natively, we can safely
+    // extract the exact starting currents directly from the DC solution vector.
+    update_transient_state(circuit, &dc_x, &mut state);
 
     let mut points = Vec::new();
-    let mut t = t_start;
-    let mut step = 0usize;
+
+    let mut initial_voltages = vec![0.0; circuit.nodes];
+    for i in 1..circuit.nodes {
+        initial_voltages[i] = node_voltage(&dc_x, crate::circuit::NodeId(i));
+    }
+    points.push(TranPoint {
+        time: t_start,
+        node_voltages: initial_voltages,
+    });
+
+    let mut t = t_start + dt;
+    let mut step = 1usize;
     const MAX_STEPS: usize = 10_000_000;
 
     while t <= t_stop + 0.5 * dt {
@@ -112,7 +124,7 @@ pub fn run_transient(
             return Err(SimError::Analysis("transient exceeded maximum steps".into()));
         }
 
-        let sys = build_transient(circuit, dt, &state)?;
+        let sys = build_transient(circuit, dt, t, &state)?;
         let x = sys.solve()?;
         update_transient_state(circuit, &x, &mut state);
 

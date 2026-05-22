@@ -1,4 +1,4 @@
-# CircuitSim
+# RSpice
 
 Analog circuit simulator in Rust, inspired by LTspice and PSpice. It uses **modified nodal analysis (MNA)** to solve linear circuits with:
 

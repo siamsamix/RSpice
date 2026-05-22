@@ -48,14 +48,13 @@ fn node_index(node: NodeId) -> Option<usize> {
     }
 }
 
-pub fn build_dc(circuit: &Circuit) -> Result<MnaSystem> {
-    // FIX: Use the full transient matrix size so inductors get their own branch current rows
+pub fn build_dc(circuit: &Circuit, guess: &DVector<f64>) -> Result<MnaSystem> {    // FIX: Use the full transient matrix size so inductors get their own branch current rows
     let size = circuit.tran_matrix_size();
     let mut sys = MnaSystem::new(size);
     let n_nodes = circuit.nodes.saturating_sub(1);
 
     stamp_resistors(circuit, &mut sys);
-
+    stamp_diodes(circuit, &mut sys, guess);
     // FIX: Inductors are shorts at DC. We stamp them as 0V voltage sources
     // to cleanly solve for their exact steady-state DC current without precision loss.
     for (i, l) in circuit.inductors.iter().enumerate() {
@@ -80,6 +79,7 @@ pub fn build_transient(
     dt: f64,
     t: f64,
     state: &TransientState,
+    guess: &DVector<f64>,
 ) -> Result<MnaSystem> {
     if dt <= 0.0 {
         return Err(SimError::Analysis("time step must be positive".into()));
@@ -89,6 +89,7 @@ pub fn build_transient(
     let n_nodes = circuit.nodes.saturating_sub(1);
 
     stamp_resistors(circuit, &mut sys);
+    stamp_diodes(circuit, &mut sys, guess);
     stamp_capacitors(circuit, &mut sys, dt, state);
     stamp_inductors(circuit, &mut sys, dt, state, n_nodes, circuit.voltage_sources.len());
     stamp_voltage_sources(circuit, &mut sys, n_nodes, Some(t));
@@ -100,6 +101,31 @@ fn stamp_resistors(circuit: &Circuit, sys: &mut MnaSystem) {
     for r in &circuit.resistors {
         let g = 1.0 / r.resistance;
         stamp_conductance(sys, r.n1, r.n2, g);
+    }
+}
+
+fn stamp_diodes(circuit: &Circuit, sys: &mut MnaSystem, guess: &DVector<f64>) {
+    for d in &circuit.diodes {
+        let v_anode = node_voltage(guess, d.anode);
+        let v_cathode = node_voltage(guess, d.cathode);
+        let vd = v_anode - v_cathode;
+
+        // Clamping is critical for Newton-Raphson stability in exponentials.
+        // Without this, a bad initial guess will cause f64 overflow.
+        let vd_clamped = vd.clamp(-100.0, 0.8);
+
+        let vt_n = d.n * d.vt;
+        let exp_term = (vd_clamped / vt_n).exp();
+
+        let id = d.is * (exp_term - 1.0);
+        let gd = (d.is / vt_n) * exp_term;
+        let ieq = id - gd * vd_clamped;
+
+        // Stamp dynamic conductance (acts like a resistor)
+        stamp_conductance(sys, d.anode, d.cathode, gd);
+
+        // Stamp equivalent current (flowing from anode to cathode)
+        stamp_current_source(sys, d.anode, d.cathode, ieq);
     }
 }
 

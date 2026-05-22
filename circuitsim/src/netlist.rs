@@ -1,4 +1,4 @@
-use crate::circuit::{Capacitor, Circuit, Inductor, NodeId, Pulse, Resistor, VoltageSource};
+use crate::circuit::{Capacitor, Circuit, Inductor, NodeId, Pulse, Resistor, VoltageSource, Sine};
 use crate::error::{Result, SimError};
 use crate::units::parse_value;
 
@@ -154,6 +154,7 @@ fn parse_voltage_source(tokens: &[&str], circuit: &mut Circuit) -> Result<()> {
 
     let mut dc_voltage = None;
     let mut pulse = None;
+    let mut sine = None;
     let mut i = 3;
 
     while i < tokens.len() {
@@ -192,11 +193,33 @@ fn parse_voltage_source(tokens: &[&str], circuit: &mut Circuit) -> Result<()> {
 
             pulse = Some(Pulse { v1, v2, td, tr, tf, pw, per });
             break; // The pulse specification consumes the rest of the source tokens
-        } else if token_lower.starts_with("sin") || token_lower.starts_with("exp") {
-            return Err(SimError::Parse(format!(
-                "waveform '{}' is not yet supported; use DC or PULSE",
-                tokens[i]
-            )));
+        } else if token_lower.starts_with("sin") {
+            let remainder = tokens[i..].join(" ");
+            let cleaned = remainder
+            .to_ascii_lowercase()
+            .replace("sin", "")
+            .replace("(", "")
+            .replace(")", "")
+            .replace(",", " ");
+
+            let s_tokens: Vec<&str> = cleaned.split_whitespace().collect();
+            // Standard SPICE requires at least 3 parameters: Offset, Amplitude, Frequency
+            if s_tokens.len() < 3 {
+                return Err(SimError::Parse(
+                    "SIN source requires at least 3 parameters: VO VA FREQ [TD [THETA]]".into(),
+                ));
+            }
+
+            let vo = parse_value(s_tokens[0]).map_err(SimError::Parse)?;
+            let va = parse_value(s_tokens[1]).map_err(SimError::Parse)?;
+            let freq = parse_value(s_tokens[2]).map_err(SimError::Parse)?;
+
+            // TD and THETA are optional
+            let td = if s_tokens.len() > 3 { parse_value(s_tokens[3]).map_err(SimError::Parse)? } else { 0.0 };
+            let theta = if s_tokens.len() > 4 { parse_value(s_tokens[4]).map_err(SimError::Parse)? } else { 0.0 };
+
+            sine = Some(Sine { vo, va, freq, td, theta });
+            break; // The sine specification consumes the rest of the source tokens
         } else {
             // Fall back to supporting positional raw numbers (e.g. `V1 1 0 5V`)
             if i == 3 && tokens.len() == 4 {
@@ -212,10 +235,12 @@ fn parse_voltage_source(tokens: &[&str], circuit: &mut Circuit) -> Result<()> {
     }
 
     // Determine the baseline value used during DC operation points (.op)
-    let final_voltage = match (dc_voltage, &pulse) {
-        (Some(v), _) => v,
-        (None, Some(p)) => p.v1, // Standard SPICE fallback rule uses V1 if DC keyword is absent
-        (None, None) => 0.0,
+    // Determine the baseline value used during DC operation points (.op)
+    let final_voltage = match (dc_voltage, &pulse, &sine) {
+        (Some(v), _, _) => v,
+        (None, Some(p), _) => p.v1,
+        (None, None, Some(s)) => s.vo, // Standard SPICE uses the offset (VO) as the DC baseline
+        (None, None, None) => 0.0,
     };
 
     circuit.voltage_sources.push(VoltageSource {
@@ -224,6 +249,7 @@ fn parse_voltage_source(tokens: &[&str], circuit: &mut Circuit) -> Result<()> {
                                  n2,
                                  voltage: final_voltage,
                                  pulse,
+                                 sine, // <-- Pass sine to struct
     });
     Ok(())
 }

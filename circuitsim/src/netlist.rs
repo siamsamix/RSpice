@@ -1,4 +1,4 @@
-use crate::circuit::{Capacitor, Circuit, Inductor, NodeId, Resistor, VoltageSource};
+use crate::circuit::{Capacitor, Circuit, Inductor, NodeId, Pulse, Resistor, VoltageSource};
 use crate::error::{Result, SimError};
 use crate::units::parse_value;
 
@@ -46,9 +46,9 @@ pub fn parse(source: &str) -> Result<Netlist> {
         }
 
         let kind = tokens[0]
-            .chars()
-            .next()
-            .ok_or_else(|| SimError::Parse(format!("line {line_no}: empty element")))?;
+        .chars()
+        .next()
+        .ok_or_else(|| SimError::Parse(format!("line {line_no}: empty element")))?;
         match kind.to_ascii_uppercase() {
             'R' => parse_resistor(&tokens, &mut circuit)?,
             'C' => parse_capacitor(&tokens, &mut circuit)?,
@@ -103,8 +103,8 @@ fn parse_dot_command(line: &str, analysis: &mut AnalysisCommands) -> Result<()> 
 
 fn parse_node(token: &str, circuit: &mut Circuit) -> Result<NodeId> {
     let id: usize = token
-        .parse()
-        .map_err(|_| SimError::Parse(format!("invalid node '{token}'")))?;
+    .parse()
+    .map_err(|_| SimError::Parse(format!("invalid node '{token}'")))?;
     circuit.ensure_node(id);
     Ok(NodeId(id))
 }
@@ -115,9 +115,9 @@ fn parse_resistor(tokens: &[&str], circuit: &mut Circuit) -> Result<()> {
     let resistance = parse_value(tokens[3]).map_err(SimError::Parse)?;
     circuit.resistors.push(Resistor {
         name: tokens[0].to_string(),
-        n1,
-        n2,
-        resistance,
+                           n1,
+                           n2,
+                           resistance,
     });
     Ok(())
 }
@@ -128,9 +128,9 @@ fn parse_capacitor(tokens: &[&str], circuit: &mut Circuit) -> Result<()> {
     let capacitance = parse_value(tokens[3]).map_err(SimError::Parse)?;
     circuit.capacitors.push(Capacitor {
         name: tokens[0].to_string(),
-        n1,
-        n2,
-        capacitance,
+                            n1,
+                            n2,
+                            capacitance,
     });
     Ok(())
 }
@@ -141,9 +141,9 @@ fn parse_inductor(tokens: &[&str], circuit: &mut Circuit) -> Result<()> {
     let inductance = parse_value(tokens[3]).map_err(SimError::Parse)?;
     circuit.inductors.push(Inductor {
         name: tokens[0].to_string(),
-        n1,
-        n2,
-        inductance,
+                           n1,
+                           n2,
+                           inductance,
     });
     Ok(())
 }
@@ -151,35 +151,79 @@ fn parse_inductor(tokens: &[&str], circuit: &mut Circuit) -> Result<()> {
 fn parse_voltage_source(tokens: &[&str], circuit: &mut Circuit) -> Result<()> {
     let n1 = parse_node(tokens[1], circuit)?;
     let n2 = parse_node(tokens[2], circuit)?;
-    let mut voltage = 0.0;
+
+    let mut dc_voltage = None;
+    let mut pulse = None;
     let mut i = 3;
+
     while i < tokens.len() {
-        if tokens[i].eq_ignore_ascii_case("dc") {
+        let token_lower = tokens[i].to_ascii_lowercase();
+        if token_lower == "dc" {
             i += 1;
             if i >= tokens.len() {
                 return Err(SimError::Parse("voltage source missing DC value".into()));
             }
-            voltage = parse_value(tokens[i]).map_err(SimError::Parse)?;
-            break;
+            dc_voltage = Some(parse_value(tokens[i]).map_err(SimError::Parse)?);
+            i += 1;
+        } else if token_lower.starts_with("pulse") {
+            // Join remainder of the tokens to accurately capture the parameter arguments
+            let remainder = tokens[i..].join(" ");
+            let cleaned = remainder
+            .to_ascii_lowercase()
+            .replace("pulse", "")
+            .replace("(", "")
+            .replace(")", "")
+            .replace(",", " ");
+
+            let p_tokens: Vec<&str> = cleaned.split_whitespace().collect();
+            if p_tokens.len() < 7 {
+                return Err(SimError::Parse(
+                    "PULSE source requires 7 parameters: V1 V2 TD TR TF PW PER".into(),
+                ));
+            }
+
+            let v1 = parse_value(p_tokens[0]).map_err(SimError::Parse)?;
+            let v2 = parse_value(p_tokens[1]).map_err(SimError::Parse)?;
+            let td = parse_value(p_tokens[2]).map_err(SimError::Parse)?;
+            let tr = parse_value(p_tokens[3]).map_err(SimError::Parse)?;
+            let tf = parse_value(p_tokens[4]).map_err(SimError::Parse)?;
+            let pw = parse_value(p_tokens[5]).map_err(SimError::Parse)?;
+            let per = parse_value(p_tokens[6]).map_err(SimError::Parse)?;
+
+            pulse = Some(Pulse { v1, v2, td, tr, tf, pw, per });
+            break; // The pulse specification consumes the rest of the source tokens
+        } else if token_lower.starts_with("sin") || token_lower.starts_with("exp") {
+            return Err(SimError::Parse(format!(
+                "waveform '{}' is not yet supported; use DC or PULSE",
+                tokens[i]
+            )));
+        } else {
+            // Fall back to supporting positional raw numbers (e.g. `V1 1 0 5V`)
+            if i == 3 && tokens.len() == 4 {
+                dc_voltage = Some(parse_value(tokens[3]).map_err(SimError::Parse)?);
+                break;
+            } else {
+                return Err(SimError::Parse(format!(
+                    "unexpected token '{}' in voltage source definition",
+                    tokens[i]
+                )));
+            }
         }
-        if tokens[i].eq_ignore_ascii_case("pulse")
-            || tokens[i].eq_ignore_ascii_case("sin")
-            || tokens[i].eq_ignore_ascii_case("exp")
-        {
-            return Err(SimError::Parse(
-                "time-varying sources not yet supported; use DC".into(),
-            ));
-        }
-        i += 1;
     }
-    if i >= tokens.len() && tokens.len() == 4 {
-        voltage = parse_value(tokens[3]).map_err(SimError::Parse)?;
-    }
+
+    // Determine the baseline value used during DC operation points (.op)
+    let final_voltage = match (dc_voltage, &pulse) {
+        (Some(v), _) => v,
+        (None, Some(p)) => p.v1, // Standard SPICE fallback rule uses V1 if DC keyword is absent
+        (None, None) => 0.0,
+    };
+
     circuit.voltage_sources.push(VoltageSource {
         name: tokens[0].to_string(),
-        n1,
-        n2,
-        voltage,
+                                 n1,
+                                 n2,
+                                 voltage: final_voltage,
+                                 pulse,
     });
     Ok(())
 }

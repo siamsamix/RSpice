@@ -62,8 +62,31 @@ pub fn run(circuit: &Circuit, analysis: &AnalysisCommands) -> Result<SimulationR
 }
 
 pub fn run_dc_op(circuit: &Circuit) -> Result<DcResult> {
-    let sys = build_dc(circuit)?;
-    let x = sys.solve()?;
+    let size = circuit.tran_matrix_size(); // Or dc_matrix_size depending on your setup
+    let mut x = nalgebra::DVector::zeros(size);
+
+    let max_iter = 100;
+    let tol = 1e-6; // 1 microvolt tolerance
+    let mut converged = false;
+
+    for _ in 0..max_iter {
+        let sys = build_dc(circuit, &x)?;
+        let x_next = sys.solve()?;
+
+        // Check for convergence (max difference between old and new guess)
+        let diff = (&x_next - &x).amax();
+        x = x_next;
+
+        if diff < tol {
+            converged = true;
+            break;
+        }
+    }
+
+    if !converged {
+        return Err(SimError::Analysis("DC operating point failed to converge".into()));
+    }
+
     Ok(extract_dc(circuit, &x))
 }
 
@@ -94,9 +117,8 @@ pub fn run_transient(
     if t_stop < t_start {
         return Err(SimError::Analysis("tstop must be >= tstart".into()));
     }
-
-    let dc_sys = build_dc(circuit)?;
-    let dc_x = dc_sys.solve()?;
+    let size = circuit.tran_matrix_size();
+    let mut dc_x = nalgebra::DVector::zeros(size);
 
     let mut state = TransientState::default();
 
@@ -124,8 +146,26 @@ pub fn run_transient(
             return Err(SimError::Analysis("transient exceeded maximum steps".into()));
         }
 
-        let sys = build_transient(circuit, dt, t, &state)?;
-        let x = sys.solve()?;
+        let mut x = dc_x.clone(); // Use the last known state as the initial guess
+        let mut converged = false;
+
+        for _ in 0..100 { // Newton-Raphson loop for this specific time step
+            let sys = build_transient(circuit, dt, t, &state, &x)?;
+            let x_next = sys.solve()?;
+
+            let diff = (&x_next - &x).amax();
+            x = x_next;
+
+            if diff < 1e-6 {
+                converged = true;
+                break;
+            }
+        }
+
+        if !converged {
+            return Err(SimError::Analysis(format!("Transient failed to converge at t={}", t)));
+        }
+
         update_transient_state(circuit, &x, &mut state);
 
         let mut node_voltages = vec![0.0; circuit.nodes];

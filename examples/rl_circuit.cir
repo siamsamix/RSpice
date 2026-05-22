@@ -1,0 +1,7 @@
+* RL circuit — DC (inductor shorts) and transient
+V1 1 0 DC 12
+R1 1 2 100
+L1 2 0 1m
+.op
+.tran 1u 1m
+.end

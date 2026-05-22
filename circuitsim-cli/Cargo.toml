@@ -1,0 +1,15 @@
+[package]
+name = "circuitsim-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+authors.workspace = true
+description = "CLI for the analog circuit simulator"
+
+[[bin]]
+name = "circuitsim"
+path = "src/main.rs"
+
+[dependencies]
+circuitsim = { path = "../circuitsim" }
+clap = { version = "4.5", features = ["derive"] }

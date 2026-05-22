@@ -8,12 +8,12 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_inner_size([1280.0, 800.0])
             .with_min_inner_size([900.0, 600.0])
-            .with_title("CircuitSim"),
+            .with_title("RSpice"),
         ..Default::default()
     };
 
     eframe::run_native(
-        "CircuitSim",
+        "RSpice",
         options,
         Box::new(|cc| {
             theme::apply(&cc.egui_ctx);

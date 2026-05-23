@@ -9,6 +9,7 @@ description = "Analog circuit simulator using modified nodal analysis"
 [dependencies]
 nalgebra = "0.33"
 thiserror = "2.0"
+num-complex = "0.4"
 
 [dev-dependencies]
 approx = "0.5"

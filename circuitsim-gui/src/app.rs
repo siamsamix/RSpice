@@ -117,8 +117,8 @@ impl Dsu {
 
 
 use crate::theme::{
-    self, card_frame, editor_frame, panel_frame, section_heading, status_chip, ACCENT, ERROR,
-    PLOT_COLORS, SUCCESS, SURFACE, SURFACE_ELEVATED, TEXT_MUTED,
+    self, card_frame, code_frame, editor_frame, panel_frame, section_heading, status_chip,
+    ACCENT, BG_PANEL, BG_SURFACE, PLOT_COLORS, STATUS_ERROR, STATUS_OK, TEXT_SECONDARY,
 };
 
 const DEFAULT_NETLIST: &str = r#"* RC charging — edit and press Run (F5)
@@ -408,7 +408,7 @@ impl eframe::App for CircuitSimApp {
         }
 
         egui::TopBottomPanel::top("toolbar")
-            .frame(panel_frame(SURFACE))
+            .frame(panel_frame(BG_PANEL))
             .show(ctx, |ui| {
                 self.toolbar(ui);
             });
@@ -416,7 +416,7 @@ impl eframe::App for CircuitSimApp {
         egui::TopBottomPanel::bottom("status")
             .frame(
                 egui::Frame::none()
-                    .fill(SURFACE)
+                    .fill(BG_PANEL)
                     .stroke(egui::Stroke::new(1.0, theme::BORDER))
                     .inner_margin(egui::Margin::symmetric(16.0, 8.0)),
             )
@@ -430,7 +430,7 @@ impl eframe::App for CircuitSimApp {
             .min_width(280.0)
             .frame(
                 egui::Frame::none()
-                    .fill(SURFACE_ELEVATED)
+                    .fill(BG_SURFACE)
                     .inner_margin(egui::Margin::same(14.0)),
             )
             .show(ctx, |ui| {
@@ -440,7 +440,7 @@ impl eframe::App for CircuitSimApp {
         egui::CentralPanel::default()
             .frame(
                 egui::Frame::none()
-                    .fill(SURFACE)
+                    .fill(BG_PANEL)
                     .inner_margin(egui::Margin::same(14.0)),
             )
             .show(ctx, |ui| {
@@ -501,7 +501,7 @@ impl CircuitSimApp {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
                     egui::RichText::new("F5 run · SPICE-style netlist")
-                        .color(TEXT_MUTED)
+                        .color(TEXT_SECONDARY)
                         .size(12.0),
                 );
             });
@@ -511,19 +511,19 @@ impl CircuitSimApp {
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
             if let Some((ok, msg)) = &self.status {
-                let color = if *ok { SUCCESS } else { ERROR };
+                let color = if *ok { STATUS_OK } else { STATUS_ERROR };
                 status_chip(ui, msg, color);
             } else {
                 ui.label(
                     egui::RichText::new("Ready")
-                        .color(TEXT_MUTED)
+                        .color(TEXT_SECONDARY)
                         .italics(),
                 );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
                     egui::RichText::new(&self.file_label)
-                        .color(TEXT_MUTED)
+                        .color(TEXT_SECONDARY)
                         .family(egui::FontFamily::Monospace),
                 );
             });
@@ -540,7 +540,7 @@ impl CircuitSimApp {
         ui.add_space(6.0);
 
         if self.editor_mode == EditorMode::Text {
-            ui.label(egui::RichText::new("R · C · L · V  —  .op  .tran").color(TEXT_MUTED).size(12.0));
+            ui.label(egui::RichText::new("R · C · L · V  —  .op  .tran").color(TEXT_SECONDARY).size(12.0));
             editor_frame().show(ui, |ui| {
                 ui.add(
                     egui::TextEdit::multiline(&mut self.netlist)
@@ -565,7 +565,7 @@ impl CircuitSimApp {
 
         // Toolbar — styled tool buttons with icons
         egui::Frame::none()
-            .fill(theme::SURFACE_ELEVATED)
+            .fill(theme::BG_SURFACE)
             .stroke(egui::Stroke::new(1.0, theme::BORDER))
             .rounding(egui::Rounding::same(6.0))
             .inner_margin(egui::Margin::symmetric(8.0, 4.0))
@@ -579,7 +579,7 @@ impl CircuitSimApp {
                         let active = self.schematic.tool == t;
                         let btn_text = egui::RichText::new(format!("{icon} {label}"))
                             .size(12.0)
-                            .color(if active { egui::Color32::WHITE } else { TEXT_MUTED });
+                            .color(if active { egui::Color32::WHITE } else { TEXT_SECONDARY });
                         let btn = egui::Button::new(btn_text)
                             .fill(if active { ACCENT } else { egui::Color32::TRANSPARENT })
                             .rounding(egui::Rounding::same(4.0))
@@ -600,7 +600,7 @@ impl CircuitSimApp {
                     ];
                     for &(t, icon, label) in comp_tools {
                         let active = self.schematic.tool == t;
-                        let color = if active { egui::Color32::WHITE } else { TEXT_MUTED };
+                        let color = if active { egui::Color32::WHITE } else { TEXT_SECONDARY };
                         let btn_text = egui::RichText::new(format!("{icon} {label}"))
                             .size(12.0)
                             .color(color);
@@ -629,7 +629,7 @@ impl CircuitSimApp {
                             Direction::Right => "→", Direction::Down => "↓",
                             Direction::Left => "←",  Direction::Up => "↑",
                         };
-                        ui.label(egui::RichText::new(format!("Space: rotate {rot_dir}")).size(11.0).color(TEXT_MUTED));
+                        ui.label(egui::RichText::new(format!("Space: rotate {rot_dir}")).size(11.0).color(TEXT_SECONDARY));
                     });
                 });
             });
@@ -676,7 +676,7 @@ impl CircuitSimApp {
 
                 painter.line_segment(
                     [to_screen(hover_grid), to_screen(p2_grid)],
-                    Stroke::new(1.5, theme::TEXT_MUTED.gamma_multiply(0.4))
+                    Stroke::new(1.5, theme::TEXT_SECONDARY.gamma_multiply(0.4))
                 );
                 // Ghost body box at center of preview
                 let ghost_center = to_screen(hover_grid) + (to_screen(p2_grid) - to_screen(hover_grid)) / 2.0;
@@ -741,7 +741,7 @@ impl CircuitSimApp {
                     // Value label
                     let off = if is_horizontal { Vec2::new(0.0, 14.0) } else { Vec2::new(18.0, 0.0) };
                     painter.text(center + off, egui::Align2::CENTER_CENTER, &c.val,
-                        egui::FontId::proportional(10.0), TEXT_MUTED);
+                        egui::FontId::proportional(10.0), TEXT_SECONDARY);
                     painter.text(center - off * 0.8, egui::Align2::CENTER_CENTER, "R",
                         egui::FontId::proportional(9.0), ACCENT);
                 }
@@ -774,7 +774,7 @@ impl CircuitSimApp {
 
                     let off = if is_horizontal { Vec2::new(0.0, 16.0) } else { Vec2::new(20.0, 0.0) };
                     painter.text(center + off, egui::Align2::CENTER_CENTER, &c.val,
-                        egui::FontId::proportional(10.0), TEXT_MUTED);
+                        egui::FontId::proportional(10.0), TEXT_SECONDARY);
                     painter.text(center - off * 0.8, egui::Align2::CENTER_CENTER, "C",
                         egui::FontId::proportional(9.0), ACCENT);
                 }
@@ -814,7 +814,7 @@ impl CircuitSimApp {
 
                     let off = if is_horizontal { Vec2::new(0.0, 14.0) } else { Vec2::new(18.0, 0.0) };
                     painter.text(center + off, egui::Align2::CENTER_CENTER, &c.val,
-                        egui::FontId::proportional(10.0), TEXT_MUTED);
+                        egui::FontId::proportional(10.0), TEXT_SECONDARY);
                     painter.text(center - off * 0.8, egui::Align2::CENTER_CENTER, "L",
                         egui::FontId::proportional(9.0), ACCENT);
                 }
@@ -848,7 +848,7 @@ impl CircuitSimApp {
 
                     let off = if is_horizontal { Vec2::new(0.0, 16.0) } else { Vec2::new(20.0, 0.0) };
                     painter.text(center + off, egui::Align2::CENTER_CENTER, &c.val,
-                        egui::FontId::proportional(10.0), TEXT_MUTED);
+                        egui::FontId::proportional(10.0), TEXT_SECONDARY);
                     painter.text(center - off * 0.8, egui::Align2::CENTER_CENTER, "V",
                         egui::FontId::proportional(9.0), Color32::from_rgb(255, 200, 80));
                 }
@@ -989,7 +989,7 @@ impl CircuitSimApp {
                 .open(&mut is_open)
                 .frame(
                     egui::Frame::none()
-                        .fill(theme::SURFACE_ELEVATED)
+                        .fill(theme::BG_SURFACE)
                         .stroke(egui::Stroke::new(1.5, kind_color.gamma_multiply(0.6)))
                         .rounding(egui::Rounding::same(8.0))
                         .inner_margin(egui::Margin::same(12.0))
@@ -1004,7 +1004,7 @@ impl CircuitSimApp {
                                 .color(kind_color)
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            ui.label(egui::RichText::new("✕ close").size(10.0).color(TEXT_MUTED));
+                            ui.label(egui::RichText::new("✕ close").size(10.0).color(TEXT_SECONDARY));
                         });
                     });
                     ui.add_space(6.0);
@@ -1012,7 +1012,7 @@ impl CircuitSimApp {
                     ui.add_space(6.0);
                     if c.kind == CompKind::Voltage {
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Type").size(11.0).color(TEXT_MUTED));
+                            ui.label(egui::RichText::new("Type").size(11.0).color(TEXT_SECONDARY));
                             ui.add_space(8.0);
 
                             // Determine current type based on string prefix
@@ -1046,19 +1046,19 @@ impl CircuitSimApp {
                         });
                         ui.add_space(6.0);
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Params").size(11.0).color(TEXT_MUTED));
+                            ui.label(egui::RichText::new("Params").size(11.0).color(TEXT_SECONDARY));
                             ui.add_space(4.0);
                             ui.add(egui::TextEdit::singleline(&mut c.val).desired_width(140.0));
                         });
 
                     } else if c.kind != CompKind::Ground {
                         ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Value").size(11.0).color(TEXT_MUTED));
+                            ui.label(egui::RichText::new("Value").size(11.0).color(TEXT_SECONDARY));
                             ui.add_space(4.0);
                             ui.add(egui::TextEdit::singleline(&mut c.val).desired_width(110.0));
                         });
                     } else {
-                        ui.label(egui::RichText::new("Reference ground node (0)").size(11.0).color(TEXT_MUTED));
+                        ui.label(egui::RichText::new("Reference ground node (0)").size(11.0).color(TEXT_SECONDARY));
                     }
 
                     ui.add_space(8.0);
@@ -1122,11 +1122,11 @@ impl CircuitSimApp {
                 ui.label(
                     egui::RichText::new("No results yet")
                         .size(18.0)
-                        .color(TEXT_MUTED),
+                        .color(TEXT_SECONDARY),
                 );
                 ui.label(
                     egui::RichText::new("Edit the netlist and press Run (F5)")
-                        .color(TEXT_MUTED),
+                        .color(TEXT_SECONDARY),
                 );
             });
             return;
@@ -1143,7 +1143,7 @@ impl CircuitSimApp {
                             ui.add_space(8.0);
                             ui.label(
                                 egui::RichText::new("DC operating point")
-                                    .color(SUCCESS)
+                                    .color(STATUS_OK)
                                     .strong(),
                             );
                             for (i, v) in dc.node_voltages.iter().enumerate() {
@@ -1173,7 +1173,7 @@ impl CircuitSimApp {
                                     "{} points · open Waveforms for full plot",
                                     tran.points.len()
                                 ))
-                                .color(TEXT_MUTED)
+                                .color(TEXT_SECONDARY)
                                 .size(12.0),
                             );
                             ui.add_space(6.0);
@@ -1221,7 +1221,7 @@ impl CircuitSimApp {
 
     fn dc_tab(&mut self, ui: &mut egui::Ui) {
         let Some(dc) = &self.dc else {
-            ui.label(egui::RichText::new("No DC analysis in netlist (.op)").color(TEXT_MUTED));
+            ui.label(egui::RichText::new("No DC analysis in netlist (.op)").color(TEXT_SECONDARY));
             return;
         };
 
@@ -1269,13 +1269,13 @@ impl CircuitSimApp {
         let Some(tran) = &self.tran else {
             ui.label(
                 egui::RichText::new("No transient analysis (.tran) in netlist")
-                    .color(TEXT_MUTED),
+                    .color(TEXT_SECONDARY),
             );
             return;
         };
 
         ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("Plot nodes:").color(TEXT_MUTED));
+            ui.label(egui::RichText::new("Plot nodes:").color(TEXT_SECONDARY));
             for i in 1..self.plot_nodes.len() {
                 let mut on = self.plot_nodes[i];
                 if ui.checkbox(&mut on, format!("V({i})")).changed() {
@@ -1285,11 +1285,7 @@ impl CircuitSimApp {
         });
         ui.add_space(8.0);
 
-        egui::Frame::none()
-            .fill(SURFACE_ELEVATED)
-            .stroke(egui::Stroke::new(1.0, theme::BORDER))
-            .rounding(egui::Rounding::same(10.0))
-            .inner_margin(egui::Margin::same(8.0))
+        code_frame()
             .show(ui, |ui| {
                 let plot = Plot::new("waveforms")
                     .height(ui.available_height() - 8.0)

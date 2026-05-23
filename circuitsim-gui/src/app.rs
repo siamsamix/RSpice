@@ -1433,7 +1433,7 @@ impl CircuitSimApp {
                     CompKind::Resistor  => ("Resistor",  Color32::from_rgb(100, 180, 255)),
                     CompKind::Capacitor => ("Capacitor", Color32::from_rgb(180, 130, 255)),
                     CompKind::Inductor  => ("Inductor",  Color32::from_rgb(255, 180, 80)),
-                    CompKind::Voltage   => ("Voltage Src", Color32::from_rgb(255, 200, 80)),
+                    CompKind::Voltage   => ("Voltage Source", Color32::from_rgb(255, 200, 80)),
                     CompKind::Ground    => ("Ground",    Color32::from_rgb(160, 170, 185)),
                 };
 
@@ -1468,17 +1468,18 @@ impl CircuitSimApp {
                     ui.separator();
                     ui.add_space(6.0);
                     if c.kind == CompKind::Voltage {
+                        // Determine current type based on string prefix
+                        let current_type = if c.val.starts_with("SIN") { "SIN" }
+                        else if c.val.starts_with("PULSE") { "PULSE" }
+                        else if c.val.starts_with("AC") { "AC" }
+                        else { "DC" };
+
+                        let mut new_type = current_type;
+                        let mem_id = ui.id().with("v_params").with(idx);
+
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new("Type").size(11.0).color(TEXT_SECONDARY));
                             ui.add_space(8.0);
-
-                            // Determine current type based on string prefix
-                            let current_type = if c.val.starts_with("SIN") { "SIN" }
-                            else if c.val.starts_with("PULSE") { "PULSE" }
-                            else if c.val.starts_with("AC") { "AC" }
-                            else { "DC" };
-
-                            let mut new_type = current_type;
 
                             egui::ComboBox::from_id_salt("v_type")
                             .selected_text(current_type)
@@ -1494,19 +1495,102 @@ impl CircuitSimApp {
                             if new_type != current_type {
                                 c.val = match new_type {
                                     "DC" => "DC 5".to_string(),
-                                      "AC" => "AC 1".to_string(),
+                                      "AC" => "AC 1 0".to_string(),
                                       "SIN" => "SIN(0 5 1k 0 0)".to_string(),
                                       "PULSE" => "PULSE(0 5 1m 1u 1u 5m 10m)".to_string(),
                                       _ => c.val.clone(),
                                 };
                             }
                         });
+
                         ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Params").size(11.0).color(TEXT_SECONDARY));
-                            ui.add_space(4.0);
-                            ui.add(egui::TextEdit::singleline(&mut c.val).desired_width(140.0));
+
+                        // Cache strings in UI memory so text cursors survive immediate mode updates
+                        let mut cache: (String, Vec<String>) = ui.data_mut(|d| {
+                            let mut cache = d.get_temp::<(String, Vec<String>)>(mem_id).unwrap_or_else(|| {
+                                ("".to_string(), vec![])
+                            });
+
+                            // Re-parse from c.val if the external string was altered (e.g., loaded/changed type)
+                            if cache.0 != c.val {
+                                let expected_len = match new_type {
+                                    "DC" => 1, "AC" => 2, "SIN" => 5, "PULSE" => 7, _ => 1,
+                                };
+                                let mut extracted = vec![];
+                                let s = &c.val;
+
+                                if new_type == "SIN" || new_type == "PULSE" {
+                                    if let Some(start) = s.find('(') {
+                                        let end = s.rfind(')').unwrap_or(s.len());
+                                        let inner = &s[start+1..end];
+                                        extracted = inner.split_whitespace().map(|x| x.to_string()).collect();
+                                    }
+                                } else {
+                                    let inner = if s.starts_with(new_type) {
+                                        s[new_type.len()..].trim()
+                                    } else {
+                                        s.trim()
+                                    };
+                                    extracted = inner.split_whitespace().map(|x| x.to_string()).collect();
+                                }
+
+                                // Pad or truncate to ensure perfect UI grid mapping
+                                while extracted.len() < expected_len {
+                                    extracted.push("".to_string());
+                                }
+                                extracted.truncate(expected_len);
+
+                                cache.1 = extracted;
+                                cache.0 = c.val.clone();
+                            }
+                            cache
                         });
+
+                        let labels = match new_type {
+                            "DC" => vec!["Voltage"],
+                            "AC" => vec!["Magnitude", "Phase"],
+                            "SIN" => vec!["V_offset", "V_amp", "Freq", "T_delay", "Theta"],
+                            "PULSE" => vec!["V_initial", "V_on", "T_delay", "T_rise", "T_fall", "T_on", "T_period"],
+                            _ => vec!["Params"],
+                        };
+
+                        let mut changed = false;
+
+                        // Display parameters in an organized vertical grid
+                        egui::Grid::new("v_params_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                            for (i, label) in labels.iter().enumerate() {
+                                ui.label(egui::RichText::new(*label).size(11.0).color(TEXT_SECONDARY));
+                                if ui.add(egui::TextEdit::singleline(&mut cache.1[i]).desired_width(70.0)).changed() {
+                                    changed = true;
+                                }
+                                ui.end_row();
+                            }
+                        });
+
+                        // Reconstruct SPICE param string seamlessly on edit
+                        if changed {
+                            c.val = match new_type {
+                                "DC" => {
+                                    let v = if cache.1[0].is_empty() { "0" } else { &cache.1[0] };
+                                    format!("DC {}", v)
+                                },
+                                "AC" => {
+                                    let mag = if cache.1[0].is_empty() { "0" } else { &cache.1[0] };
+                                    let phase = if cache.1[1].is_empty() { "0" } else { &cache.1[1] };
+                                    format!("AC {} {}", mag, phase)
+                                },
+                                "SIN" => {
+                                    format!("SIN({})", cache.1.join(" "))
+                                },
+                                "PULSE" => {
+                                    format!("PULSE({})", cache.1.join(" "))
+                                },
+                                _ => cache.1.join(" "),
+                            };
+                            cache.0 = c.val.clone(); // Inform cache that we drove this update safely
+                        }
+
+                        ui.data_mut(|d| d.insert_temp(mem_id, cache));
 
                     } else if c.kind != CompKind::Ground {
                         ui.horizontal(|ui| {

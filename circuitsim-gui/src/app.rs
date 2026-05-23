@@ -197,7 +197,7 @@ L1 2 0 1m
 V1 1 0 DC 0
 R1 1 2 1k
 C1 2 0 100n
-.ac dec 20 10 1Meg
+.ac dec 200 10 100k
 .end
 "#
             }
@@ -245,6 +245,13 @@ pub struct CircuitSimApp {
     result_tab: ResultTab,
     editor_mode: EditorMode,
     schematic: SchematicState,
+    plot_x_scale: String,
+    plot_y_scale: String,
+    plot_x_min: String,
+    plot_x_max: String,
+    plot_y_min: String,
+    plot_y_max: String,
+    apply_plot_bounds: bool,
 }
 
 impl Default for CircuitSimApp {
@@ -263,6 +270,13 @@ impl Default for CircuitSimApp {
             result_tab: ResultTab::Overview,
             editor_mode: EditorMode::Text,
             schematic: SchematicState::default(),
+            plot_x_scale: "1.0".to_string(),
+            plot_y_scale: "1.0".to_string(),
+            plot_x_min: "".to_string(),
+            plot_x_max: "".to_string(),
+            plot_y_min: "".to_string(),
+            plot_y_max: "".to_string(),
+            apply_plot_bounds: false,
         }
     }
 }
@@ -1558,7 +1572,44 @@ impl CircuitSimApp {
                 }
             }
         });
+
+        // NEW: Scaling and Limits Controls
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("Mult X:").color(TEXT_SECONDARY));
+            ui.add(egui::TextEdit::singleline(&mut self.plot_x_scale).desired_width(40.0));
+            ui.label(egui::RichText::new("Mult Y:").color(TEXT_SECONDARY));
+            ui.add(egui::TextEdit::singleline(&mut self.plot_y_scale).desired_width(40.0));
+
+            ui.separator();
+
+            ui.label(egui::RichText::new("Limits X [").color(TEXT_SECONDARY));
+            ui.add(egui::TextEdit::singleline(&mut self.plot_x_min).desired_width(40.0));
+            ui.label(",");
+            ui.add(egui::TextEdit::singleline(&mut self.plot_x_max).desired_width(40.0));
+            ui.label("]");
+
+            ui.label(egui::RichText::new("Y [").color(TEXT_SECONDARY));
+            ui.add(egui::TextEdit::singleline(&mut self.plot_y_min).desired_width(40.0));
+            ui.label(",");
+            ui.add(egui::TextEdit::singleline(&mut self.plot_y_max).desired_width(40.0));
+            ui.label("]");
+
+            if ui.button("Apply").clicked() {
+                self.apply_plot_bounds = true;
+            }
+            if ui.button("Auto Fit").clicked() {
+                self.plot_x_min.clear();
+                self.plot_x_max.clear();
+                self.plot_y_min.clear();
+                self.plot_y_max.clear();
+                self.apply_plot_bounds = true;
+            }
+        });
+
         ui.add_space(8.0);
+
+        let x_mult = self.plot_x_scale.parse::<f64>().unwrap_or(1.0);
+        let y_mult = self.plot_y_scale.parse::<f64>().unwrap_or(1.0);
 
         code_frame()
             .show(ui, |ui| {
@@ -1573,6 +1624,34 @@ impl CircuitSimApp {
                     .allow_boxed_zoom(true);
 
                 plot.show(ui, |plot_ui| {
+
+                    // NEW: Apply Manual View Bounds
+                    if self.apply_plot_bounds {
+                        // Check if user cleared all inputs to trigger an auto-fit reset
+                        if self.plot_x_min.is_empty() && self.plot_x_max.is_empty()
+                            && self.plot_y_min.is_empty() && self.plot_y_max.is_empty() {
+                                plot_ui.set_auto_bounds(egui::Vec2b::new(true, true));
+                            } else {
+                                let current = plot_ui.plot_bounds();
+                                let mut x_min = current.min()[0];
+                                let mut x_max = current.max()[0];
+                                let mut y_min = current.min()[1];
+                                let mut y_max = current.max()[1];
+
+                                // Override only the fields the user has typed into
+                                if let Ok(v) = self.plot_x_min.parse::<f64>() { x_min = v; }
+                                if let Ok(v) = self.plot_x_max.parse::<f64>() { x_max = v; }
+                                if let Ok(v) = self.plot_y_min.parse::<f64>() { y_min = v; }
+                                if let Ok(v) = self.plot_y_max.parse::<f64>() { y_max = v; }
+
+                                plot_ui.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
+                                    [x_min, y_min],
+                                    [x_max, y_max],
+                                ));
+                            }
+                            self.apply_plot_bounds = false; // Execute once per click
+                    }
+
                     for (node, &enabled) in self.plot_nodes.iter().enumerate() {
                         if !enabled || node == 0 {
                             continue;
@@ -1582,8 +1661,8 @@ impl CircuitSimApp {
                             .iter()
                             .map(|p| {
                                 [
-                                    p.time as f64,
-                                    p.node_voltages.get(node).copied().unwrap_or(0.0) as f64,
+                                    (p.time as f64) * x_mult,
+                                 (p.node_voltages.get(node).copied().unwrap_or(0.0) as f64) * y_mult,
                                 ]
                             })
                             .collect();
@@ -1604,13 +1683,13 @@ impl CircuitSimApp {
                 ui.add_space(60.0);
                 ui.label(
                     egui::RichText::new("No AC analysis in netlist")
-                        .size(16.0)
-                        .color(TEXT_SECONDARY),
+                    .size(16.0)
+                    .color(TEXT_SECONDARY),
                 );
                 ui.label(
-                    egui::RichText::new("Add  .ac dec 20 1 1Meg  to your netlist and run")
-                        .color(TEXT_SECONDARY)
-                        .size(12.0),
+                    egui::RichText::new("Add  .ac dec 200 1 100k  to your netlist and run")
+                    .color(TEXT_SECONDARY)
+                    .size(12.0),
                 );
             });
             return;
@@ -1652,22 +1731,30 @@ impl CircuitSimApp {
         };
 
         code_frame().show(ui, |ui| {
-            let plot = Plot::new("ac_magnitude")
-                .height(half_h.max(120.0))
-                .x_axis_label("frequency (Hz)")
-                .y_axis_label(mag_label)
-                .legend(Legend::default().position(egui_plot::Corner::RightTop))
-                .show_background(true)
-                .allow_scroll(true)
-                .allow_drag(true)
-                .allow_boxed_zoom(true)
+            let mut plot = Plot::new("ac_magnitude")
+            .height(half_h.max(120.0))
+            .x_axis_label("frequency (Hz)")
+            .y_axis_label(mag_label)
+            .legend(Legend::default().position(egui_plot::Corner::RightTop))
+            .show_background(true)
+            .allow_scroll(true)
+            .allow_drag(true)
+            .allow_boxed_zoom(true);
+
+            plot = match mag_scale {
+                AcMagScale::Db => plot
                 .x_grid_spacer(egui_plot::log_grid_spacer(10))
-                .label_formatter(|name, val| {
+                .label_formatter(move |name, val| {
                     if name.is_empty() { return String::new(); }
-                    format!("{name}
-f = {:.3e} Hz
-{mag_label} = {:.3e}", val.x, val.y)
-                });
+                    let f = 10.0_f64.powf(val.x); // convert log10(x) back to real freq for the tooltip
+                    format!("{}\nf = {:.3e} Hz\n{} = {:.3e}", name, f, mag_label, val.y)
+                }),
+                AcMagScale::Linear => plot
+                .label_formatter(move |name, val| {
+                    if name.is_empty() { return String::new(); }
+                    format!("{}\nf = {:.3e} Hz\n{} = {:.3e}", name, val.x, mag_label, val.y)
+                }),
+            };
 
             plot.show(ui, |plot_ui| {
                 for node in 1..n_nodes.min(ac_plot_nodes.len()) {
@@ -1677,16 +1764,20 @@ f = {:.3e} Hz
                         let mag = v.norm();
                         let y = match mag_scale {
                             AcMagScale::Db     => if mag > 0.0 { 20.0 * mag.log10() } else { -200.0 },
-                            AcMagScale::Linear => mag,
+                                                                     AcMagScale::Linear => mag,
                         };
-                        [freq.log10(), y]
+                        let x = match mag_scale {
+                            AcMagScale::Db     => freq.log10(),
+                                                                     AcMagScale::Linear => *freq,
+                        };
+                        [x, y]
                     }).collect();
                     let color = PLOT_COLORS[node % PLOT_COLORS.len()];
                     plot_ui.line(
                         Line::new(pts)
-                            .name(format!("V({node})"))
-                            .color(color)
-                            .width(2.0),
+                        .name(format!("V({node})"))
+                        .color(color)
+                        .width(2.0),
                     );
                 }
             });
@@ -1696,22 +1787,30 @@ f = {:.3e} Hz
 
         // ── Phase plot ───────────────────────────────────────────────────────
         code_frame().show(ui, |ui| {
-            let plot = Plot::new("ac_phase")
-                .height(half_h.max(120.0))
-                .x_axis_label("frequency (Hz)")
-                .y_axis_label("phase (°)")
-                .legend(Legend::default().position(egui_plot::Corner::RightTop))
-                .show_background(true)
-                .allow_scroll(true)
-                .allow_drag(true)
-                .allow_boxed_zoom(true)
+            let mut plot = Plot::new("ac_phase")
+            .height(half_h.max(120.0))
+            .x_axis_label("frequency (Hz)")
+            .y_axis_label("phase (°)")
+            .legend(Legend::default().position(egui_plot::Corner::RightTop))
+            .show_background(true)
+            .allow_scroll(true)
+            .allow_drag(true)
+            .allow_boxed_zoom(true);
+
+            plot = match mag_scale {
+                AcMagScale::Db => plot
                 .x_grid_spacer(egui_plot::log_grid_spacer(10))
                 .label_formatter(|name, val| {
                     if name.is_empty() { return String::new(); }
-                    format!("{name}
-f = {:.3e} Hz
-phase = {:.2}°", val.x, val.y)
-                });
+                    let f = 10.0_f64.powf(val.x); // convert log10(x) back to real freq for the tooltip
+                    format!("{}\nf = {:.3e} Hz\nphase = {:.2}°", name, f, val.y)
+                }),
+                AcMagScale::Linear => plot
+                .label_formatter(|name, val| {
+                    if name.is_empty() { return String::new(); }
+                    format!("{}\nf = {:.3e} Hz\nphase = {:.2}°", name, val.x, val.y)
+                }),
+            };
 
             plot.show(ui, |plot_ui| {
                 for node in 1..n_nodes.min(ac_plot_nodes.len()) {
@@ -1719,14 +1818,18 @@ phase = {:.2}°", val.x, val.y)
                     let pts: PlotPoints = points_snapshot.iter().map(|(freq, voltages)| {
                         let v = voltages.get(node).copied().unwrap_or_default();
                         let phase_deg = v.arg().to_degrees();
-                        [freq.log10(), phase_deg]
+                        let x = match mag_scale {
+                            AcMagScale::Db     => freq.log10(),
+                                                                     AcMagScale::Linear => *freq,
+                        };
+                        [x, phase_deg]
                     }).collect();
                     let color = PLOT_COLORS[node % PLOT_COLORS.len()];
                     plot_ui.line(
                         Line::new(pts)
-                            .name(format!("V({node}) phase"))
-                            .color(color)
-                            .width(2.0),
+                        .name(format!("V({node}) phase"))
+                        .color(color)
+                        .width(2.0),
                     );
                 }
             });

@@ -118,7 +118,7 @@ pub fn run_transient(
         return Err(SimError::Analysis("tstop must be >= tstart".into()));
     }
     let size = circuit.tran_matrix_size();
-    let mut dc_x = nalgebra::DVector::zeros(size);
+    let dc_x = nalgebra::DVector::zeros(size);
 
     let mut state = TransientState::default();
 

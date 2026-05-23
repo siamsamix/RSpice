@@ -77,6 +77,9 @@ struct SchematicState {
     current_dir: Direction,
     selected_component: Option<usize>,
     selected_wire: Option<usize>,
+    drag_last_grid: Option<GridPt>,
+    pan: Vec2,
+    zoom: f32,
     analysis_type: AnalysisType,
     tran_step: String,
     tran_stop: String,
@@ -96,6 +99,9 @@ impl Default for SchematicState {
             current_dir: Direction::Down,
             selected_component: None,
             selected_wire: None,
+            drag_last_grid: None,
+            pan: Vec2::ZERO,
+            zoom: 1.0,
             analysis_type: AnalysisType::Tran,
             tran_step: "1u".to_string(),
             tran_stop: "5m".to_string(),
@@ -701,7 +707,33 @@ impl CircuitSimApp {
     fn schematic_panel(&mut self, ui: &mut egui::Ui) {
         // Handle keyboard shortcut for rotation (Spacebar)
         if ui.input(|i| i.key_pressed(egui::Key::Space)) {
-            self.schematic.current_dir = self.schematic.current_dir.next();
+            if let Some(idx) = self.schematic.selected_component {
+                // Rotate the selected component 90 degrees around p1
+                if let Some(c) = self.schematic.components.get_mut(idx) {
+                    let dx = c.p2.0 - c.p1.0;
+                    let dy = c.p2.1 - c.p1.1;
+
+                    // 90-degree rotation formula: (x, y) -> (-y, x)
+                    let new_dx = -dy;
+                    let new_dy = dx;
+
+                    let old_p2 = c.p2;
+                    c.p2 = GridPt(c.p1.0 + new_dx, c.p1.1 + new_dy);
+
+                    // Keep wires attached to the rotated pin
+                    for w in self.schematic.wires.iter_mut() {
+                        if w.p1 == old_p2 {
+                            w.p1 = c.p2;
+                        }
+                        if w.p2 == old_p2 {
+                            w.p2 = c.p2;
+                        }
+                    }
+                }
+            } else {
+                // No component selected, update future placement direction
+                self.schematic.current_dir = self.schematic.current_dir.next();
+            }
         }
 
         // Toolbar — styled tool buttons with icons
@@ -859,37 +891,72 @@ impl CircuitSimApp {
         let (response, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
         let rect = response.rect;
 
-        // Draw dot grid for a clean PCB/schematic look
-        let dot_color = theme::BORDER.gamma_multiply(0.6);
-        for xi in 0..=(rect.width() as i32 / GRID_SIZE as i32) {
-            for yi in 0..=(rect.height() as i32 / GRID_SIZE as i32) {
-                let pos = rect.left_top() + Vec2::new(xi as f32 * GRID_SIZE, yi as f32 * GRID_SIZE);
-                painter.circle_filled(pos, 0.8, dot_color);
+        // --- NEW PAN & ZOOM LOGIC ---
+        // Handle Zoom (Ctrl + Scroll or Pinch)
+        let zoom_delta = ui.input(|i| i.zoom_delta());
+        if response.hovered() && zoom_delta != 1.0 {
+            if let Some(mouse_pos) = ui.input(|i| i.pointer.hover_pos()) {
+                let mouse_in_canvas = mouse_pos - rect.left_top();
+                let old_zoom = self.schematic.zoom;
+                let new_zoom = (old_zoom * zoom_delta).clamp(0.2, 5.0);
+
+                let pos_in_grid = (mouse_in_canvas - self.schematic.pan) / old_zoom;
+                self.schematic.pan = mouse_in_canvas - pos_in_grid * new_zoom;
+                self.schematic.zoom = new_zoom;
             }
         }
 
-        let to_screen = |grid_pt: GridPt| rect.left_top() + grid_pt.to_pos().to_vec2();
+        // Handle Pan (Middle Click Drag or Right Click Drag)
+        if response.dragged_by(egui::PointerButton::Middle) || response.dragged_by(egui::PointerButton::Secondary) {
+            self.schematic.pan += response.drag_delta();
+        }
 
-        // Draw existing wires — crisp, clean lines with a slight glow tint
-        let wire_color = Color32::from_rgb(80, 200, 120); // professional green
+        let z = self.schematic.zoom;
+        let pan = self.schematic.pan;
+
+        // Draw dot grid (Dynamic based on visible bounds)
+        let dot_color = theme::BORDER.gamma_multiply(0.6);
+        let bounds_min = -pan / z;
+        let bounds_max = (rect.size() - pan) / z;
+
+        let start_x = (bounds_min.x / GRID_SIZE).floor() as i32;
+        let end_x = (bounds_max.x / GRID_SIZE).ceil() as i32;
+        let start_y = (bounds_min.y / GRID_SIZE).floor() as i32;
+        let end_y = (bounds_max.y / GRID_SIZE).ceil() as i32;
+
+        for xi in start_x..=end_x {
+            for yi in start_y..=end_y {
+                let pos = rect.left_top() + pan + Vec2::new(xi as f32 * GRID_SIZE, yi as f32 * GRID_SIZE) * z;
+                painter.circle_filled(pos, 0.8 * z.max(0.5), dot_color);
+            }
+        }
+
+        let to_screen = |grid_pt: GridPt| rect.left_top() + pan + (grid_pt.to_pos().to_vec2() * z);
+        // --- END PAN & ZOOM LOGIC ---
+
+        // Draw existing wires
+        let wire_color = Color32::from_rgb(80, 200, 120);
         let wire_selected_color = Color32::from_rgb(255, 100, 80);
         for (wi, w) in self.schematic.wires.iter().enumerate() {
             let color = if self.schematic.selected_wire == Some(wi) { wire_selected_color } else { wire_color };
-            painter.line_segment([to_screen(w.p1), to_screen(w.p2)], Stroke::new(if self.schematic.selected_wire == Some(wi) { 3.0 } else { 2.0 }, color));
-            // Junction dots at endpoints for clarity
-            painter.circle_filled(to_screen(w.p1), 2.5, color);
-            painter.circle_filled(to_screen(w.p2), 2.5, color);
+            painter.line_segment([to_screen(w.p1), to_screen(w.p2)], Stroke::new(if self.schematic.selected_wire == Some(wi) { 3.0 * z } else { 2.0 * z }, color));
+            painter.circle_filled(to_screen(w.p1), 2.5 * z, color);
+            painter.circle_filled(to_screen(w.p2), 2.5 * z, color);
         }
 
         // Draw active wire preview
         if let Some(hover_pos) = response.hover_pos() {
-            let hover_grid = GridPt::from_pos(hover_pos - rect.left_top().to_vec2());
+            // Apply reverse zoom/pan to find the actual grid point
+            let hover_grid = GridPt::from_pos(Pos2::new(
+                (hover_pos.x - rect.left_top().x - pan.x) / z,
+                                                        (hover_pos.y - rect.left_top().y - pan.y) / z
+            ));
 
             if self.schematic.tool == Tool::Wire {
                 if let Some(start_grid) = self.schematic.active_wire_start {
-                    painter.line_segment([to_screen(start_grid), to_screen(hover_grid)], Stroke::new(2.0, theme::ACCENT));
+                    painter.line_segment([to_screen(start_grid), to_screen(hover_grid)], Stroke::new(2.0 * z, theme::ACCENT));
                 }
-                painter.circle_filled(to_screen(hover_grid), 4.0, theme::ACCENT);
+                painter.circle_filled(to_screen(hover_grid), 4.0 * z, theme::ACCENT);
             } else if matches!(self.schematic.tool, Tool::R | Tool::C | Tool::L | Tool::V) {
                 // Ghost component preview
                 let (dx, dy) = self.schematic.current_dir.offset(3);
@@ -897,22 +964,21 @@ impl CircuitSimApp {
 
                 painter.line_segment(
                     [to_screen(hover_grid), to_screen(p2_grid)],
-                    Stroke::new(1.5, theme::TEXT_SECONDARY.gamma_multiply(0.4))
+                                     Stroke::new(1.5 * z, theme::TEXT_SECONDARY.gamma_multiply(0.4))
                 );
                 // Ghost body box at center of preview
                 let ghost_center = to_screen(hover_grid) + (to_screen(p2_grid) - to_screen(hover_grid)) / 2.0;
                 let is_h = hover_grid.1 == p2_grid.1;
                 let ghost_rect = Rect::from_center_size(ghost_center,
-                    if is_h { Vec2::new(28.0, 16.0) } else { Vec2::new(16.0, 28.0) });
-                painter.rect_stroke(ghost_rect, 3.0, Stroke::new(1.5, theme::ACCENT.gamma_multiply(0.5)));
-                // Mark Pin 1 so polarity is obvious (useful for Voltage sources)
-                painter.circle_filled(to_screen(hover_grid), 3.5, theme::ACCENT.gamma_multiply(0.9));
+                                                        if is_h { Vec2::new(28.0 * z, 16.0 * z) } else { Vec2::new(16.0 * z, 28.0 * z) });
+                painter.rect_stroke(ghost_rect, 3.0 * z, Stroke::new(1.5 * z, theme::ACCENT.gamma_multiply(0.5)));
+                painter.circle_filled(to_screen(hover_grid), 3.5 * z, theme::ACCENT.gamma_multiply(0.9));
             }
         }
 
         // Draw Components with proper electronic symbols
-        let comp_stroke = Stroke::new(2.0, Color32::from_rgb(220, 225, 235));
-        let selected_stroke = Stroke::new(2.0, theme::ACCENT);
+        let comp_stroke = Stroke::new(2.0 * z, Color32::from_rgb(220, 225, 235));
+        let selected_stroke = Stroke::new(2.0 * z, theme::ACCENT);
 
         for (i, c) in self.schematic.components.iter().enumerate() {
             let p1 = to_screen(c.p1);
@@ -1100,10 +1166,88 @@ impl CircuitSimApp {
             }
         }
 
+        // --- ADD THIS BLOCK FOR DRAGGING COMPONENTS ---
+        if self.schematic.tool == Tool::Select {
+            // 1. Detect drag start and lock onto the target component
+            if response.drag_started() {
+                if let Some(interact_pos) = response.interact_pointer_pos() {
+                    let mut hit = None;
+                    for (i, c) in self.schematic.components.iter().enumerate() {
+                        let p1 = to_screen(c.p1);
+                        let p2 = to_screen(c.p2);
+                        let center = p1 + (p2 - p1) / 2.0;
+                        let is_horizontal = c.p1.1 == c.p2.1;
+                        let box_size = if is_horizontal { Vec2::new(24.0, 16.0) } else { Vec2::new(16.0, 24.0) };
+                        let click_rect = Rect::from_center_size(center, box_size + Vec2::new(12.0, 12.0));
+                        if click_rect.contains(interact_pos) {
+                            hit = Some(i);
+                            break;
+                        }
+                    }
+
+                    if hit.is_some() {
+                        self.schematic.selected_component = hit;
+                        self.schematic.selected_wire = None;
+                        self.schematic.drag_last_grid = Some(GridPt::from_pos(interact_pos - rect.left_top().to_vec2()));
+                    } else {
+                        self.schematic.drag_last_grid = None;
+                    }
+                }
+            }
+
+            // 2. Continuously process movement
+            if response.dragged() {
+                if let (Some(idx), Some(interact_pos), Some(last_grid)) = (
+                    self.schematic.selected_component,
+                    response.interact_pointer_pos(),
+                                                                           self.schematic.drag_last_grid,
+                ) {
+                    let current_grid = GridPt::from_pos(Pos2::new(
+                        (interact_pos.x - rect.left_top().x - pan.x) / z,
+                                                                  (interact_pos.y - rect.left_top().y - pan.y) / z
+                    ));
+                    if current_grid != last_grid {
+                        let dx = current_grid.0 - last_grid.0;
+                        let dy = current_grid.1 - last_grid.1;
+
+                        if let Some(c) = self.schematic.components.get_mut(idx) {
+                            let old_p1 = c.p1;
+                            let old_p2 = c.p2;
+
+                            // Move component endpoints
+                            c.p1.0 += dx;
+                            c.p1.1 += dy;
+                            c.p2.0 += dx;
+                            c.p2.1 += dy;
+
+                            // Stretch wires attached to the component's pins
+                            for w in self.schematic.wires.iter_mut() {
+                                if w.p1 == old_p1 || w.p1 == old_p2 {
+                                    w.p1.0 += dx;
+                                    w.p1.1 += dy;
+                                }
+                                if w.p2 == old_p1 || w.p2 == old_p2 {
+                                    w.p2.0 += dx;
+                                    w.p2.1 += dy;
+                                }
+                            }
+                        }
+
+                        self.schematic.drag_last_grid = Some(current_grid);
+                    }
+                }
+            }
+        }
+        // --- END DRAGGING BLOCK ---
+
         // Handle Interactions
+
         if response.clicked() {
             if let Some(interact_pos) = response.interact_pointer_pos() {
-                let grid_pt = GridPt::from_pos(interact_pos - rect.left_top().to_vec2());
+                let grid_pt = GridPt::from_pos(Pos2::new(
+                    (interact_pos.x - rect.left_top().x - pan.x) / z,
+                                                         (interact_pos.y - rect.left_top().y - pan.y) / z
+                ));
 
                 match self.schematic.tool {
                     Tool::Wire => {
@@ -1178,7 +1322,7 @@ impl CircuitSimApp {
                                     let d = interact_pos - closest;
                                     d.x * d.x + d.y * d.y
                                 };
-                                if dist_sq < 36.0 { // 6px radius
+                                if dist_sq < (36.0 * z * z) { // 6px radius
                                     hit_wire = Some(wi);
                                     break;
                                 }
@@ -1212,7 +1356,7 @@ impl CircuitSimApp {
         }
 
         // Delete key removes selected wire or component
-        if ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
+        if ui.input(|i| i.key_pressed(egui::Key::Delete)) {
             if let Some(wi) = self.schematic.selected_wire {
                 self.schematic.wires.remove(wi);
                 self.schematic.selected_wire = None;

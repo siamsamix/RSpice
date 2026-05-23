@@ -106,19 +106,21 @@ fn stamp_resistors(circuit: &Circuit, sys: &mut MnaSystem) {
 
 fn stamp_diodes(circuit: &Circuit, sys: &mut MnaSystem, guess: &DVector<f64>) {
     for d in &circuit.diodes {
+        let model = circuit.diode_models.get(&d.model)
+        .expect("Diode model not found");
         let v_anode = node_voltage(guess, d.anode);
         let v_cathode = node_voltage(guess, d.cathode);
         let vd = v_anode - v_cathode;
 
         // Clamping is critical for Newton-Raphson stability in exponentials.
         // Without this, a bad initial guess will cause f64 overflow.
+        let vt = 0.02585;
         let vd_clamped = vd.clamp(-100.0, 0.8);
-
-        let vt_n = d.n * d.vt;
+        let vt_n = model.n * vt;
         let exp_term = (vd_clamped / vt_n).exp();
 
-        let id = d.is * (exp_term - 1.0);
-        let gd = (d.is / vt_n) * exp_term;
+        let id = model.is * (exp_term - 1.0);
+        let gd = (model.is / vt_n) * exp_term;
         let ieq = id - gd * vd_clamped;
 
         // Stamp dynamic conductance (acts like a resistor)

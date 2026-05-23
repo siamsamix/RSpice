@@ -1,4 +1,4 @@
-use circuitsim::{parse, run, DcResult, SimulationResult, TranResult};
+use circuitsim::{parse, run, AcResult, DcResult, SimulationResult, TranResult};
 use egui;
 use egui_plot::{Legend, Line, Plot, PlotPoints};
 
@@ -134,6 +134,7 @@ enum Example {
     RcCharge,
     VoltageDivider,
     RlCircuit,
+    RcLowPass,
 }
 
 impl Example {
@@ -167,6 +168,16 @@ L1 2 0 1m
 .end
 "#
             }
+            Example::RcLowPass => {
+                r#"* RC low-pass filter — frequency sweep
+* Corner frequency: fc = 1/(2π·R·C) ≈ 1.59 kHz
+V1 1 0 DC 0
+R1 1 2 1k
+C1 2 0 100n
+.ac dec 20 10 1Meg
+.end
+"#
+            }
         }
     }
 
@@ -175,6 +186,7 @@ L1 2 0 1m
             Example::RcCharge => "RC charge",
             Example::VoltageDivider => "Voltage divider",
             Example::RlCircuit => "RL circuit",
+            Example::RcLowPass  => "RC low-pass (.ac)",
         }
     }
 }
@@ -185,6 +197,15 @@ enum ResultTab {
     Overview,
     Dc,
     Waveforms,
+    FreqResponse,
+}
+
+/// Which quantity to show on the frequency-response magnitude plot.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AcMagScale { Db, Linear }
+
+impl Default for AcMagScale {
+    fn default() -> Self { AcMagScale::Db }
 }
 
 pub struct CircuitSimApp {
@@ -194,7 +215,10 @@ pub struct CircuitSimApp {
     circuit_summary: Option<String>,
     dc: Option<DcResult>,
     tran: Option<TranResult>,
+    ac: Option<AcResult>,
     plot_nodes: Vec<bool>,
+    ac_plot_nodes: Vec<bool>,
+    ac_mag_scale: AcMagScale,
     result_tab: ResultTab,
     editor_mode: EditorMode,
     schematic: SchematicState,
@@ -209,7 +233,10 @@ impl Default for CircuitSimApp {
             circuit_summary: None,
             dc: None,
             tran: None,
+            ac: None,
             plot_nodes: vec![false; 16],
+            ac_plot_nodes: vec![false; 16],
+            ac_mag_scale: AcMagScale::default(),
             result_tab: ResultTab::Overview,
             editor_mode: EditorMode::Text,
             schematic: SchematicState::default(),
@@ -329,8 +356,9 @@ impl CircuitSimApp {
     }
 
     fn apply_result(&mut self, result: SimulationResult) {
-        self.dc = result.dc;
+        self.dc   = result.dc;
         self.tran = result.tran.clone();
+        self.ac   = result.ac.clone();
 
         let max_nodes = self
             .tran
@@ -338,18 +366,33 @@ impl CircuitSimApp {
             .and_then(|t| t.points.first())
             .map(|p| p.node_voltages.len())
             .or_else(|| self.dc.as_ref().map(|d| d.node_voltages.len()))
+            .or_else(|| {
+                self.ac.as_ref()
+                    .and_then(|a| a.points.first())
+                    .map(|p| p.node_voltages.len())
+            })
             .unwrap_or(8);
 
         self.plot_nodes.resize(max_nodes, false);
         for i in 1..max_nodes.min(self.plot_nodes.len()) {
             self.plot_nodes[i] = i <= 3;
         }
+
+        // Default: enable same nodes for AC plots, auto-switch tab if .ac present
+        self.ac_plot_nodes.resize(max_nodes, false);
+        for i in 1..max_nodes.min(self.ac_plot_nodes.len()) {
+            self.ac_plot_nodes[i] = i <= 3;
+        }
+        if self.ac.is_some() {
+            self.result_tab = ResultTab::FreqResponse;
+        }
     }
 
     fn clear_results(&mut self) {
         self.circuit_summary = None;
-        self.dc = None;
+        self.dc   = None;
         self.tran = None;
+        self.ac   = None;
     }
 
     fn load_example(&mut self, ex: Example) {
@@ -490,6 +533,7 @@ impl CircuitSimApp {
                     Example::RcCharge,
                     Example::VoltageDivider,
                     Example::RlCircuit,
+                    Example::RcLowPass,
                 ] {
                     if ui.button(ex.label()).clicked() {
                         self.load_example(ex);
@@ -540,7 +584,7 @@ impl CircuitSimApp {
         ui.add_space(6.0);
 
         if self.editor_mode == EditorMode::Text {
-            ui.label(egui::RichText::new("R · C · L · V  —  .op  .tran").color(TEXT_SECONDARY).size(12.0));
+            ui.label(egui::RichText::new("R · C · L · V  —  .op  .tran  .ac").color(TEXT_SECONDARY).size(12.0));
             editor_frame().show(ui, |ui| {
                 ui.add(
                     egui::TextEdit::multiline(&mut self.netlist)
@@ -1098,23 +1142,21 @@ impl CircuitSimApp {
             ui.add_space(8.0);
             ui.selectable_value(&mut self.result_tab, ResultTab::Overview, "Overview");
             ui.selectable_value(&mut self.result_tab, ResultTab::Dc, "DC");
-            ui.selectable_value(
-                &mut self.result_tab,
-                ResultTab::Waveforms,
-                "Waveforms",
-            );
+            ui.selectable_value(&mut self.result_tab, ResultTab::Waveforms, "Waveforms");
+            ui.selectable_value(&mut self.result_tab, ResultTab::FreqResponse, "Frequency");
         });
         ui.add_space(8.0);
 
         match self.result_tab {
-            ResultTab::Overview => self.overview_tab(ui),
-            ResultTab::Dc => self.dc_tab(ui),
-            ResultTab::Waveforms => self.waveforms_tab(ui),
+            ResultTab::Overview    => self.overview_tab(ui),
+            ResultTab::Dc          => self.dc_tab(ui),
+            ResultTab::Waveforms   => self.waveforms_tab(ui),
+            ResultTab::FreqResponse => self.freq_response_tab(ui),
         }
     }
 
     fn overview_tab(&mut self, ui: &mut egui::Ui) {
-        if self.dc.is_none() && self.tran.is_none() {
+        if self.dc.is_none() && self.tran.is_none() && self.ac.is_none() {
             ui.vertical_centered(|ui| {
                 ui.add_space(80.0);
                 ui.label(egui::RichText::new("⚡").size(48.0).color(ACCENT.gamma_multiply(0.4)));
@@ -1293,6 +1335,8 @@ impl CircuitSimApp {
                     .y_axis_label("voltage (V)")
                     .legend(Legend::default().position(egui_plot::Corner::RightTop))
                     .show_background(true)
+                    .allow_scroll(true)
+                    .allow_drag(true)
                     .allow_boxed_zoom(true);
 
                 plot.show(ui, |plot_ui| {
@@ -1321,4 +1365,139 @@ impl CircuitSimApp {
                 });
             });
     }
+    fn freq_response_tab(&mut self, ui: &mut egui::Ui) {
+        let Some(ac) = &self.ac else {
+            ui.vertical_centered(|ui| {
+                ui.add_space(60.0);
+                ui.label(
+                    egui::RichText::new("No AC analysis in netlist")
+                        .size(16.0)
+                        .color(TEXT_SECONDARY),
+                );
+                ui.label(
+                    egui::RichText::new("Add  .ac dec 20 1 1Meg  to your netlist and run")
+                        .color(TEXT_SECONDARY)
+                        .size(12.0),
+                );
+            });
+            return;
+        };
+
+        let n_nodes = ac.points.first().map(|p| p.node_voltages.len()).unwrap_or(1);
+
+        // ── Controls row ────────────────────────────────────────────────────
+        ui.horizontal_wrapped(|ui| {
+            ui.label(egui::RichText::new("Nodes:").color(TEXT_SECONDARY));
+            for i in 1..n_nodes.min(self.ac_plot_nodes.len()) {
+                let mut on = self.ac_plot_nodes[i];
+                if ui.checkbox(&mut on, format!("V({i})")).changed() {
+                    self.ac_plot_nodes[i] = on;
+                }
+            }
+            ui.separator();
+            ui.label(egui::RichText::new("Scale:").color(TEXT_SECONDARY));
+            ui.selectable_value(&mut self.ac_mag_scale, AcMagScale::Db,     "dB");
+            ui.selectable_value(&mut self.ac_mag_scale, AcMagScale::Linear, "Linear");
+        });
+        ui.add_space(6.0);
+
+        // Take a snapshot of what we need so we can release the borrow on self.ac
+        // before calling self methods.
+        let points_snapshot: Vec<_> = ac.points.iter().map(|p| {
+            (p.freq, p.node_voltages.clone())
+        }).collect();
+        let mag_scale = self.ac_mag_scale;
+        let ac_plot_nodes = self.ac_plot_nodes.clone();
+
+        let available_h = ui.available_height();
+        let half_h = (available_h - 24.0) / 2.0;
+
+        // ── Magnitude plot ───────────────────────────────────────────────────
+        let mag_label = match mag_scale {
+            AcMagScale::Db     => "magnitude (dB)",
+            AcMagScale::Linear => "magnitude (V/V)",
+        };
+
+        code_frame().show(ui, |ui| {
+            let plot = Plot::new("ac_magnitude")
+                .height(half_h.max(120.0))
+                .x_axis_label("frequency (Hz)")
+                .y_axis_label(mag_label)
+                .legend(Legend::default().position(egui_plot::Corner::RightTop))
+                .show_background(true)
+                .allow_scroll(true)
+                .allow_drag(true)
+                .allow_boxed_zoom(true)
+                .x_grid_spacer(egui_plot::log_grid_spacer(10))
+                .label_formatter(|name, val| {
+                    if name.is_empty() { return String::new(); }
+                    format!("{name}
+f = {:.3e} Hz
+{mag_label} = {:.3e}", val.x, val.y)
+                });
+
+            plot.show(ui, |plot_ui| {
+                for node in 1..n_nodes.min(ac_plot_nodes.len()) {
+                    if !ac_plot_nodes[node] { continue; }
+                    let pts: PlotPoints = points_snapshot.iter().map(|(freq, voltages)| {
+                        let v = voltages.get(node).copied().unwrap_or_default();
+                        let mag = v.norm();
+                        let y = match mag_scale {
+                            AcMagScale::Db     => if mag > 0.0 { 20.0 * mag.log10() } else { -200.0 },
+                            AcMagScale::Linear => mag,
+                        };
+                        [freq.log10(), y]
+                    }).collect();
+                    let color = PLOT_COLORS[node % PLOT_COLORS.len()];
+                    plot_ui.line(
+                        Line::new(pts)
+                            .name(format!("V({node})"))
+                            .color(color)
+                            .width(2.0),
+                    );
+                }
+            });
+        });
+
+        ui.add_space(8.0);
+
+        // ── Phase plot ───────────────────────────────────────────────────────
+        code_frame().show(ui, |ui| {
+            let plot = Plot::new("ac_phase")
+                .height(half_h.max(120.0))
+                .x_axis_label("frequency (Hz)")
+                .y_axis_label("phase (°)")
+                .legend(Legend::default().position(egui_plot::Corner::RightTop))
+                .show_background(true)
+                .allow_scroll(true)
+                .allow_drag(true)
+                .allow_boxed_zoom(true)
+                .x_grid_spacer(egui_plot::log_grid_spacer(10))
+                .label_formatter(|name, val| {
+                    if name.is_empty() { return String::new(); }
+                    format!("{name}
+f = {:.3e} Hz
+phase = {:.2}°", val.x, val.y)
+                });
+
+            plot.show(ui, |plot_ui| {
+                for node in 1..n_nodes.min(ac_plot_nodes.len()) {
+                    if !ac_plot_nodes[node] { continue; }
+                    let pts: PlotPoints = points_snapshot.iter().map(|(freq, voltages)| {
+                        let v = voltages.get(node).copied().unwrap_or_default();
+                        let phase_deg = v.arg().to_degrees();
+                        [freq.log10(), phase_deg]
+                    }).collect();
+                    let color = PLOT_COLORS[node % PLOT_COLORS.len()];
+                    plot_ui.line(
+                        Line::new(pts)
+                            .name(format!("V({node}) phase"))
+                            .color(color)
+                            .width(2.0),
+                    );
+                }
+            });
+        });
+    }
+
 }

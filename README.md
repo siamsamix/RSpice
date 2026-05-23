@@ -5,7 +5,15 @@ Analog circuit simulator in Rust, inspired by LTspice and PSpice. It uses **modi
 - **R** — resistors  
 - **C** — capacitors (transient, backward Euler)  
 - **L** — inductors (transient, backward Euler)  
-- **V** — DC voltage sources  
+- **V** — DC voltage sources
+
+## Screenshots
+### RC circuit
+![RC](Screenshots/RC.png)
+### RL circuit
+![RL](Screenshots/RL.png)
+### Underdamped RLC circuit
+![Underdamped](Screenshots/Underdamped.png)
 
 ## Quick start
 

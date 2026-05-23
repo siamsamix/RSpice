@@ -1,4 +1,12 @@
 use crate::error::{Result, SimError};
+use std::collections::HashMap;
+
+
+#[derive(Debug, Clone)]
+pub struct DiodeModel {
+    pub is: f64,
+    pub n: f64,
+}
 
 /// Ground is always node 0 and is excluded from the unknown vector.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -33,9 +41,7 @@ pub struct Diode {
     pub name: String,
     pub anode: NodeId,
     pub cathode: NodeId,
-    pub is: f64, // Saturation current (e.g., 1e-14 A)
-    pub n: f64,  // Ideality factor (e.g., 1.0 to 2.0)
-    pub vt: f64, // Thermal voltage (roughly 0.02585 V at room temp)
+    pub model: String,
 }
 
 #[derive(Debug, Clone)]
@@ -142,6 +148,7 @@ pub struct Circuit {
     pub capacitors: Vec<Capacitor>,
     pub inductors: Vec<Inductor>,
     pub voltage_sources: Vec<VoltageSource>,
+    pub diode_models: HashMap<String, DiodeModel>,
     pub diodes: Vec<Diode>,
 }
 

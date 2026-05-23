@@ -62,6 +62,13 @@ struct Wire {
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Tool { Select, Wire, R, C, L, V, Gnd }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AnalysisType { Tran, Ac }
+
+impl Default for AnalysisType {
+    fn default() -> Self { AnalysisType::Tran }
+}
+
 struct SchematicState {
     tool: Tool,
     components: Vec<Component>,
@@ -69,6 +76,14 @@ struct SchematicState {
     active_wire_start: Option<GridPt>,
     current_dir: Direction,
     selected_component: Option<usize>,
+    selected_wire: Option<usize>,
+    analysis_type: AnalysisType,
+    tran_step: String,
+    tran_stop: String,
+    ac_variation: String,
+    ac_points: String,
+    ac_fstart: String,
+    ac_fstop: String,
 }
 
 impl Default for SchematicState {
@@ -80,6 +95,14 @@ impl Default for SchematicState {
             active_wire_start: None,
             current_dir: Direction::Down,
             selected_component: None,
+            selected_wire: None,
+            analysis_type: AnalysisType::Tran,
+            tran_step: "1u".to_string(),
+            tran_stop: "5m".to_string(),
+            ac_variation: "dec".to_string(),
+            ac_points: "20".to_string(),
+            ac_fstart: "1".to_string(),
+            ac_fstop: "1Meg".to_string(),
         }
     }
 }
@@ -245,7 +268,32 @@ impl Default for CircuitSimApp {
 }
 
 impl CircuitSimApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>) -> Self {
+    pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
+        let mut fonts = egui::FontDefinitions::default();
+
+        egui_extras::install_image_loaders(&cc.egui_ctx);
+
+        // 1. Load the custom font data
+        fonts.font_data.insert(
+            "technical_symbols".to_owned(),
+                               egui::FontData::from_static(include_bytes!("../fonts/DejaVuSans.ttf")),
+        );
+
+        // 2. Insert it as a fallback for Proportional fonts (UI text)
+        // By pushing it to the end, egui will use its default font first,
+        // and fall back to our custom font for missing symbols.
+        if let Some(vec) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
+            vec.insert(0, "technical_symbols".to_owned());
+        }
+
+        // 3. Do the same for Monospace text
+        if let Some(vec) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
+            vec.insert(0, "technical_symbols".to_owned());
+        }
+
+        // 4. Apply the new font definitions to the egui context
+        cc.egui_ctx.set_fonts(fonts);
+
         Self::default()
     }
     fn generate_netlist_from_schematic(&mut self) {
@@ -320,7 +368,21 @@ impl CircuitSimApp {
             }
         }
 
-        out.push_str(".op\n.tran 1u 5m\n.end\n");
+        out.push_str(".op\n");
+        match self.schematic.analysis_type {
+            AnalysisType::Tran => {
+                out.push_str(&format!(".tran {} {}\n", self.schematic.tran_step, self.schematic.tran_stop));
+            }
+            AnalysisType::Ac => {
+                out.push_str(&format!(".ac {} {} {} {}\n",
+                    self.schematic.ac_variation,
+                    self.schematic.ac_points,
+                    self.schematic.ac_fstart,
+                    self.schematic.ac_fstop,
+                ));
+            }
+        }
+        out.push_str(".end\n");
         self.netlist = out;
         self.status = Some((true, "Generated netlist from schematic".into()));
     }
@@ -602,81 +664,158 @@ impl CircuitSimApp {
 
     fn schematic_panel(&mut self, ui: &mut egui::Ui) {
         // Handle keyboard shortcut for rotation (Spacebar)
-
         if ui.input(|i| i.key_pressed(egui::Key::Space)) {
             self.schematic.current_dir = self.schematic.current_dir.next();
         }
 
         // Toolbar — styled tool buttons with icons
         egui::Frame::none()
-            .fill(theme::BG_SURFACE)
-            .stroke(egui::Stroke::new(1.0, theme::BORDER))
-            .rounding(egui::Rounding::same(6.0))
-            .inner_margin(egui::Margin::symmetric(8.0, 4.0))
-            .show(ui, |ui| {
-                ui.horizontal(|ui| {
-                    let tools: &[(Tool, &str, &str)] = &[
-                        (Tool::Select,  "⬡", "Select"),
-                        (Tool::Wire,    "╱", "Wire"),
-                    ];
-                    for &(t, icon, label) in tools {
-                        let active = self.schematic.tool == t;
-                        let btn_text = egui::RichText::new(format!("{icon} {label}"))
-                            .size(12.0)
-                            .color(if active { egui::Color32::WHITE } else { TEXT_SECONDARY });
-                        let btn = egui::Button::new(btn_text)
-                            .fill(if active { ACCENT } else { egui::Color32::TRANSPARENT })
-                            .rounding(egui::Rounding::same(4.0))
-                            .min_size(egui::vec2(0.0, 24.0));
-                        if ui.add(btn).clicked() {
-                            self.schematic.tool = t;
-                        }
+        .fill(theme::BG_SURFACE)
+        .stroke(egui::Stroke::new(1.0, theme::BORDER))
+        .rounding(egui::Rounding::same(6.0))
+        .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+        .show(ui, |ui| {
+
+            // FIX: Use horizontal_wrapped to naturally wrap components to a new row on small screens
+            ui.horizontal_wrapped(|ui| {
+
+                // 1. General Tools Array using include_image!
+                let tools = [
+                    // Assuming you put your SVGs in an "assets" folder next to "src"
+                    (Tool::Select, egui::include_image!("../assets/select.svg"), "Select"),
+                                  (Tool::Wire,   egui::include_image!("../assets/wire.svg"), "Wire"),
+                ];
+
+                for &(t, ref icon_source, label) in &tools {
+                    let active = self.schematic.tool == t;
+                    let color = if active { egui::Color32::WHITE } else { TEXT_SECONDARY };
+
+                    // Create the SVG image instance, scale it, and tint it
+                    let image = egui::Image::new(icon_source.clone())
+                    .max_height(14.0)
+                    .tint(color);
+
+                    let btn_text = egui::RichText::new(label)
+                    .size(12.0)
+                    .color(color);
+
+                    let btn = egui::Button::image_and_text(image, btn_text)
+                    .fill(if active { ACCENT } else { egui::Color32::TRANSPARENT })
+                    .rounding(egui::Rounding::same(4.0))
+                    .min_size(egui::vec2(0.0, 24.0));
+
+                    if ui.add(btn).clicked() {
+                        self.schematic.tool = t;
                     }
+                }
 
-                    ui.separator();
+                ui.separator();
 
-                    let comp_tools: &[(Tool, &str, &str)] = &[
-                        (Tool::R,   "≋", "R"),
-                        (Tool::C,   "⊣⊢", "C"),
-                        (Tool::L,   "ꝏ", "L"),
-                        (Tool::V,   "⊕", "V"),
-                        (Tool::Gnd, "⏚", "GND"),
-                    ];
-                    for &(t, icon, label) in comp_tools {
-                        let active = self.schematic.tool == t;
-                        let color = if active { egui::Color32::WHITE } else { TEXT_SECONDARY };
-                        let btn_text = egui::RichText::new(format!("{icon} {label}"))
-                            .size(12.0)
-                            .color(color);
-                        let btn = egui::Button::new(btn_text)
-                            .fill(if active { ACCENT.gamma_multiply(0.9) } else { egui::Color32::TRANSPARENT })
-                            .rounding(egui::Rounding::same(4.0))
-                            .min_size(egui::vec2(0.0, 24.0));
-                        if ui.add(btn).clicked() {
-                            self.schematic.tool = t;
-                        }
+                // 2. Component Tools Array using include_image!
+                let comp_tools = [
+                    (Tool::R,   egui::include_image!("../assets/resistor.svg"), "R"),
+                                  (Tool::C,   egui::include_image!("../assets/capacitor.svg"), "C"),
+                                  (Tool::L,   egui::include_image!("../assets/inductor.svg"), "L"),
+                                  (Tool::V,   egui::include_image!("../assets/voltage.svg"), "V"),
+                                  (Tool::Gnd, egui::include_image!("../assets/ground.svg"), "GND"),
+                ];
+
+                for &(t, ref icon_source, label) in &comp_tools {
+                    let active = self.schematic.tool == t;
+                    let color = if active { egui::Color32::WHITE } else { TEXT_SECONDARY };
+
+                    let image = egui::Image::new(icon_source.clone())
+                    .max_height(14.0)
+                    .tint(color);
+
+                    let btn_text = egui::RichText::new(label)
+                    .size(12.0)
+                    .color(color);
+
+                    let btn = egui::Button::image_and_text(image, btn_text)
+                    .fill(if active { ACCENT.gamma_multiply(0.9) } else { egui::Color32::TRANSPARENT })
+                    .rounding(egui::Rounding::same(4.0))
+                    .min_size(egui::vec2(0.0, 24.0));
+
+                    if ui.add(btn).clicked() {
+                        self.schematic.tool = t;
                     }
+                }
 
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        let gen_btn = egui::Button::new(
-                            egui::RichText::new("⤑ Generate Netlist").size(12.0).color(egui::Color32::WHITE)
-                        )
-                        .fill(egui::Color32::from_rgb(60, 130, 80))
-                        .rounding(egui::Rounding::same(4.0))
-                        .min_size(egui::vec2(0.0, 24.0));
-                        if ui.add(gen_btn).clicked() {
-                            self.generate_netlist_from_schematic();
-                            self.editor_mode = EditorMode::Text;
-                        }
-                        ui.add_space(4.0);
-                        let rot_dir = match self.schematic.current_dir {
-                            Direction::Right => "→", Direction::Down => "↓",
-                            Direction::Left => "←",  Direction::Up => "↑",
-                        };
-                        ui.label(egui::RichText::new(format!("Space: rotate {rot_dir}")).size(11.0).color(TEXT_SECONDARY));
-                    });
-                });
+                ui.separator();
+
+                // FIX: Replaced `right_to_left` block with Left-To-Right rendering.
+                // This flows nicely into the wrapper when squished.
+                let rot_dir = match self.schematic.current_dir {
+                    Direction::Right => "→", Direction::Down => "↓",
+                    Direction::Left => "←",  Direction::Up => "↑",
+                };
+                ui.label(egui::RichText::new(format!("Space: rotate {rot_dir}")).size(11.0).color(TEXT_SECONDARY));
+
+                ui.add_space(4.0);
+
+                let gen_btn = egui::Button::new(
+                    egui::RichText::new("Generate Netlist").size(12.0).color(egui::Color32::WHITE)
+                )
+                .fill(egui::Color32::from_rgb(60, 130, 80))
+                .rounding(egui::Rounding::same(4.0))
+                .min_size(egui::vec2(0.0, 24.0));
+                if ui.add(gen_btn).clicked() {
+                    self.generate_netlist_from_schematic();
+                    self.editor_mode = EditorMode::Text;
+                }
+
+                ui.separator();
+
+                // Analysis type selector
+                ui.label(egui::RichText::new("Analysis:").size(11.0).color(TEXT_SECONDARY));
+                ui.selectable_value(&mut self.schematic.analysis_type, AnalysisType::Ac, ".ac");
+                ui.selectable_value(&mut self.schematic.analysis_type, AnalysisType::Tran, ".tran");
+
+                ui.separator();
+
+                // Analysis params (Reordered left-to-right logic)
+                match self.schematic.analysis_type {
+                    AnalysisType::Tran => {
+                        ui.label(egui::RichText::new("step:").size(10.0).color(TEXT_SECONDARY));
+                        ui.add(egui::TextEdit::singleline(&mut self.schematic.tran_step)
+                        .desired_width(42.0).font(egui::TextStyle::Small));
+                        ui.label(egui::RichText::new("stop:").size(10.0).color(TEXT_SECONDARY));
+                        ui.add(egui::TextEdit::singleline(&mut self.schematic.tran_stop)
+                        .desired_width(42.0).font(egui::TextStyle::Small));
+                    }
+                    AnalysisType::Ac => {
+                        egui::ComboBox::from_id_salt("ac_var")
+                        .selected_text(&self.schematic.ac_variation)
+                        .width(46.0)
+                        .show_ui(ui, |ui| {
+                            let mut v = self.schematic.ac_variation.clone();
+                            if ui.selectable_value(&mut v, "dec".to_string(), "dec").clicked() {
+                                self.schematic.ac_variation = v.clone();
+                            }
+                            if ui.selectable_value(&mut v, "oct".to_string(), "oct").clicked() {
+                                self.schematic.ac_variation = v.clone();
+                            }
+                            if ui.selectable_value(&mut v, "lin".to_string(), "lin").clicked() {
+                                self.schematic.ac_variation = v;
+                            }
+                        });
+
+                        ui.label(egui::RichText::new("pts:").size(10.0).color(TEXT_SECONDARY));
+                        ui.add(egui::TextEdit::singleline(&mut self.schematic.ac_points)
+                        .desired_width(30.0).font(egui::TextStyle::Small));
+
+                        ui.label(egui::RichText::new("fstart:").size(10.0).color(TEXT_SECONDARY));
+                        ui.add(egui::TextEdit::singleline(&mut self.schematic.ac_fstart)
+                        .desired_width(42.0).font(egui::TextStyle::Small));
+
+                        ui.label(egui::RichText::new("fstop:").size(10.0).color(TEXT_SECONDARY));
+                        ui.add(egui::TextEdit::singleline(&mut self.schematic.ac_fstop)
+                        .desired_width(50.0).font(egui::TextStyle::Small));
+                    }
+                }
             });
+        });
 
         ui.add_space(4.0);
 
@@ -697,11 +836,13 @@ impl CircuitSimApp {
 
         // Draw existing wires — crisp, clean lines with a slight glow tint
         let wire_color = Color32::from_rgb(80, 200, 120); // professional green
-        for w in &self.schematic.wires {
-            painter.line_segment([to_screen(w.p1), to_screen(w.p2)], Stroke::new(2.0, wire_color));
+        let wire_selected_color = Color32::from_rgb(255, 100, 80);
+        for (wi, w) in self.schematic.wires.iter().enumerate() {
+            let color = if self.schematic.selected_wire == Some(wi) { wire_selected_color } else { wire_color };
+            painter.line_segment([to_screen(w.p1), to_screen(w.p2)], Stroke::new(if self.schematic.selected_wire == Some(wi) { 3.0 } else { 2.0 }, color));
             // Junction dots at endpoints for clarity
-            painter.circle_filled(to_screen(w.p1), 2.5, wire_color);
-            painter.circle_filled(to_screen(w.p2), 2.5, wire_color);
+            painter.circle_filled(to_screen(w.p1), 2.5, color);
+            painter.circle_filled(to_screen(w.p2), 2.5, color);
         }
 
         // Draw active wire preview
@@ -982,6 +1123,34 @@ impl CircuitSimApp {
                             }
                         }
                         self.schematic.selected_component = selected;
+
+                        // If no component hit, check wires
+                        if selected.is_none() {
+                            let mut hit_wire = None;
+                            for (wi, w) in self.schematic.wires.iter().enumerate() {
+                                let a = to_screen(w.p1);
+                                let b = to_screen(w.p2);
+                                // Point-to-segment distance
+                                let ab = b - a;
+                                let ap = interact_pos - a;
+                                let ab_len_sq = ab.x * ab.x + ab.y * ab.y;
+                                let dist_sq = if ab_len_sq < 1.0 {
+                                    ap.x * ap.x + ap.y * ap.y
+                                } else {
+                                    let t = ((ap.x * ab.x + ap.y * ab.y) / ab_len_sq).clamp(0.0, 1.0);
+                                    let closest = a + ab * t;
+                                    let d = interact_pos - closest;
+                                    d.x * d.x + d.y * d.y
+                                };
+                                if dist_sq < 36.0 { // 6px radius
+                                    hit_wire = Some(wi);
+                                    break;
+                                }
+                            }
+                            self.schematic.selected_wire = hit_wire;
+                        } else {
+                            self.schematic.selected_wire = None;
+                        }
                     }
                 }
 
@@ -996,12 +1165,76 @@ impl CircuitSimApp {
         if response.secondary_clicked() {
             self.schematic.active_wire_start = None;
             self.schematic.selected_component = None; // Deselect on right click
+            self.schematic.selected_wire = None;
         }
 
         // Cancel wire dragging on Right Click
         if response.secondary_clicked() {
             self.schematic.active_wire_start = None;
             self.schematic.selected_component = None; // Deselect on right click
+            self.schematic.selected_wire = None;
+        }
+
+        // Delete key removes selected wire or component
+        if ui.input(|i| i.key_pressed(egui::Key::Delete) || i.key_pressed(egui::Key::Backspace)) {
+            if let Some(wi) = self.schematic.selected_wire {
+                self.schematic.wires.remove(wi);
+                self.schematic.selected_wire = None;
+            } else if let Some(ci) = self.schematic.selected_component {
+                self.schematic.components.remove(ci);
+                self.schematic.selected_component = None;
+            }
+        }
+
+        // Wire selection popup — shows near the wire midpoint
+        let mut delete_wire_idx = None;
+        if let Some(wi) = self.schematic.selected_wire {
+            if let Some(w) = self.schematic.wires.get(wi) {
+                let mid = to_screen(w.p1) + (to_screen(w.p2) - to_screen(w.p1)) / 2.0;
+                let mut is_open = true;
+                egui::Window::new("")
+                    .id(egui::Id::new("edit_wire_window"))
+                    .title_bar(false)
+                    .fixed_pos(mid + Vec2::new(10.0, 10.0))
+                    .collapsible(false)
+                    .resizable(false)
+                    .open(&mut is_open)
+                    .frame(
+                        egui::Frame::none()
+                            .fill(theme::BG_SURFACE)
+                            .stroke(egui::Stroke::new(1.5, Color32::from_rgb(255, 100, 80).gamma_multiply(0.6)))
+                            .rounding(egui::Rounding::same(8.0))
+                            .inner_margin(egui::Margin::same(10.0))
+                    )
+                    .show(ui.ctx(), |ui| {
+                        ui.horizontal(|ui| {
+                            ui.label(egui::RichText::new("Wire").strong().size(12.0).color(Color32::from_rgb(80, 200, 120)));
+                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                                ui.label(egui::RichText::new("✕ close").size(10.0).color(TEXT_SECONDARY));
+                            });
+                        });
+                        ui.add_space(4.0);
+                        ui.separator();
+                        ui.add_space(4.0);
+                        ui.label(egui::RichText::new("Delete: key or button").size(10.0).color(TEXT_SECONDARY));
+                        ui.add_space(4.0);
+                        if ui.add(
+                            egui::Button::new(egui::RichText::new("🗑 Delete Wire").size(11.0).color(egui::Color32::WHITE))
+                                .fill(egui::Color32::from_rgb(180, 50, 50))
+                                .rounding(egui::Rounding::same(4.0))
+                                .min_size(egui::vec2(100.0, 22.0))
+                        ).clicked() {
+                            delete_wire_idx = Some(wi);
+                        }
+                    });
+                if !is_open {
+                    self.schematic.selected_wire = None;
+                }
+            }
+        }
+        if let Some(wi) = delete_wire_idx {
+            self.schematic.wires.remove(wi);
+            self.schematic.selected_wire = None;
         }
 
         // --- ADD THIS AT THE END OF schematic_panel ---

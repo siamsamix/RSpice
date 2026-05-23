@@ -9,8 +9,9 @@ pub mod error;
 pub mod mna;
 pub mod netlist;
 pub mod units;
+pub mod ac_mna;
 
-pub use analysis::{run, DcResult, SimulationResult, TranResult};
+pub use analysis::{AcResult, AcCommand, AcScale, run, DcResult, SimulationResult, TranResult};
 pub use circuit::Circuit;
 pub use error::{Result, SimError};
 pub use netlist::{parse, Netlist};

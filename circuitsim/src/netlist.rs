@@ -1,6 +1,8 @@
+use crate::analysis::{AcCommand, AcScale};
 use crate::circuit::{Capacitor, Circuit, Inductor, NodeId, Pulse, Resistor, VoltageSource, Sine, Diode};
 use crate::error::{Result, SimError};
 use crate::units::parse_value;
+use crate::circuit::DiodeModel;
 
 #[derive(Debug, Clone, Default)]
 pub struct AnalysisCommands {
@@ -8,6 +10,8 @@ pub struct AnalysisCommands {
     pub tran_step: Option<f64>,
     pub tran_stop: Option<f64>,
     pub tran_start: f64,
+    /// Parameters for `.ac` frequency sweep, if present.
+    pub ac: Option<AcCommand>,
 }
 
 #[derive(Debug, Clone)]
@@ -34,7 +38,7 @@ pub fn parse(source: &str) -> Result<Netlist> {
             break;
         }
         if lower.starts_with('.') {
-            parse_dot_command(line, &mut analysis)?;
+            parse_dot_command(line, &mut analysis, &mut circuit)?;
             continue;
         }
 
@@ -81,10 +85,29 @@ fn strip_comment(line: &str) -> String {
     out
 }
 
-fn parse_dot_command(line: &str, analysis: &mut AnalysisCommands) -> Result<()> {
+fn extract_model_param(body: &str, param: &str) -> Option<f64> {
+    body.find(param).map(|idx| {
+        let start = idx + param.len();
+        let end = body[start..].find(|c: char| !c.is_numeric() && c != '.' && c != 'e' && c != '-').unwrap_or(body[start..].len());
+        body[start..start+end].parse().unwrap_or(0.0)
+    })
+}
+
+fn parse_dot_command(line: &str, analysis: &mut AnalysisCommands, circuit: &mut Circuit) -> Result<()> {
     let tokens: Vec<&str> = line.split_whitespace().collect();
     let cmd = tokens[0].to_ascii_lowercase();
     match cmd.as_str() {
+        ".model" => {
+            // Expected: .model <name> D(IS=1e-14 N=1.0)
+            let name = tokens[1].to_string();
+            // Simple parser for the model body (e.g., "d(is=1e-14 n=1.0)")
+            // You can enhance this with a regex or more robust string splitting
+            let body = tokens[2..].join("").to_ascii_lowercase();
+            let is = extract_model_param(&body, "is=").unwrap_or(1e-14);
+            let n = extract_model_param(&body, "n=").unwrap_or(1.0);
+
+            circuit.diode_models.insert(name, DiodeModel { is, n });
+        }
         ".op" => analysis.dc_op = true,
         ".tran" => {
             if tokens.len() < 3 {
@@ -95,6 +118,53 @@ fn parse_dot_command(line: &str, analysis: &mut AnalysisCommands) -> Result<()> 
             if let Some(t) = tokens.get(3) {
                 analysis.tran_start = parse_value(t).map_err(SimError::Parse)?;
             }
+        }
+        // .ac <DEC|OCT|LIN> <points> <fstart> <fstop> [ac_source_index [amplitude]]
+        //
+        // Examples (mirrors SPICE syntax):
+        //   .ac dec 10 1 1meg
+        //   .ac lin 100 1k 10k
+        //   .ac oct 5 100 10k
+        ".ac" => {
+            if tokens.len() < 5 {
+                return Err(SimError::Parse(
+                    ".ac requires: .ac <DEC|OCT|LIN> <points> <fstart> <fstop> [src_idx [amplitude]]".into(),
+                ));
+            }
+            let scale = match tokens[1].to_ascii_lowercase().as_str() {
+                "dec" => AcScale::Dec,
+                "oct" => AcScale::Oct,
+                "lin" => AcScale::Lin,
+                other => {
+                    return Err(SimError::Parse(format!(
+                        ".ac sweep type must be DEC, OCT, or LIN — got '{}'", other
+                    )));
+                }
+            };
+            let points: usize = tokens[2]
+                .parse()
+                .map_err(|_| SimError::Parse(format!("invalid .ac point count '{}'", tokens[2])))?;
+            let f_start = parse_value(tokens[3]).map_err(SimError::Parse)?;
+            let f_stop  = parse_value(tokens[4]).map_err(SimError::Parse)?;
+
+            // Optional: source index and amplitude
+            let stimulus_source = tokens.get(5)
+                .map(|s| s.parse::<usize>())
+                .transpose()
+                .map_err(|_| SimError::Parse("invalid .ac source index".into()))?;
+            let stimulus_amplitude = tokens.get(6)
+                .map(|s| parse_value(s).map_err(SimError::Parse))
+                .transpose()?
+                .unwrap_or(1.0);
+
+            analysis.ac = Some(AcCommand {
+                scale,
+                points,
+                f_start,
+                f_stop,
+                stimulus_source,
+                stimulus_amplitude,
+            });
         }
         ".dc" => analysis.dc_op = true,
         _ => return Err(SimError::Parse(format!("unknown command '{}'", tokens[0]))),
@@ -117,17 +187,15 @@ fn parse_diode(tokens: &[&str], circuit: &mut Circuit) -> Result<()> {
 
     let anode = parse_node(tokens[1], circuit)?;
     let cathode = parse_node(tokens[2], circuit)?;
-
+    let model = tokens[3].to_string();
     // For a minimal implementation, hardcode a standard silicon model
     // (1N4148 approximation) if a model name is provided.
     // Later, you can implement a separate .MODEL card parser.
     circuit.diodes.push(Diode {
         name: tokens[0].to_string(),
-                        anode,
-                        cathode,
-                        is: 1e-14, // 10 fA
-                        n: 1.0,
-                        vt: 0.02585,
+        anode,
+        cathode,
+        model,
     });
     Ok(())
 }

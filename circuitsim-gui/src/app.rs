@@ -102,7 +102,7 @@ impl Default for SchematicState {
             ac_variation: "dec".to_string(),
             ac_points: "20".to_string(),
             ac_fstart: "1".to_string(),
-            ac_fstop: "1Meg".to_string(),
+            ac_fstop: "10k".to_string(),
         }
     }
 }
@@ -252,6 +252,17 @@ pub struct CircuitSimApp {
     plot_y_min: String,
     plot_y_max: String,
     apply_plot_bounds: bool,
+
+    ac_plot_x_scale: String,
+    ac_mag_y_scale: String,
+    ac_phase_y_scale: String,
+    ac_plot_x_min: String,
+    ac_plot_x_max: String,
+    ac_mag_y_min: String,
+    ac_mag_y_max: String,
+    ac_phase_y_min: String,
+    ac_phase_y_max: String,
+    ac_apply_plot_bounds: bool,
 }
 
 impl Default for CircuitSimApp {
@@ -277,6 +288,17 @@ impl Default for CircuitSimApp {
             plot_y_min: "".to_string(),
             plot_y_max: "".to_string(),
             apply_plot_bounds: false,
+
+            ac_plot_x_scale: "1.0".to_string(),
+            ac_mag_y_scale: "1.0".to_string(),
+            ac_phase_y_scale: "1.0".to_string(),
+            ac_plot_x_min: "".to_string(),
+            ac_plot_x_max: "".to_string(),
+            ac_mag_y_min: "".to_string(),
+            ac_mag_y_max: "".to_string(),
+            ac_phase_y_min: "".to_string(),
+            ac_phase_y_max: "".to_string(),
+            ac_apply_plot_bounds: false,
         }
     }
 }
@@ -1575,7 +1597,7 @@ impl CircuitSimApp {
 
         // NEW: Scaling and Limits Controls
         ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("Mult X:").color(TEXT_SECONDARY));
+            /*ui.label(egui::RichText::new("Mult X:").color(TEXT_SECONDARY));
             ui.add(egui::TextEdit::singleline(&mut self.plot_x_scale).desired_width(40.0));
             ui.label(egui::RichText::new("Mult Y:").color(TEXT_SECONDARY));
             ui.add(egui::TextEdit::singleline(&mut self.plot_y_scale).desired_width(40.0));
@@ -1596,7 +1618,7 @@ impl CircuitSimApp {
 
             if ui.button("Apply").clicked() {
                 self.apply_plot_bounds = true;
-            }
+            }*/
             if ui.button("Auto Fit").clicked() {
                 self.plot_x_min.clear();
                 self.plot_x_max.clear();
@@ -1626,12 +1648,16 @@ impl CircuitSimApp {
                 plot.show(ui, |plot_ui| {
 
                     // NEW: Apply Manual View Bounds
+                    // NEW: Apply Manual View Bounds
                     if self.apply_plot_bounds {
                         // Check if user cleared all inputs to trigger an auto-fit reset
                         if self.plot_x_min.is_empty() && self.plot_x_max.is_empty()
                             && self.plot_y_min.is_empty() && self.plot_y_max.is_empty() {
                                 plot_ui.set_auto_bounds(egui::Vec2b::new(true, true));
                             } else {
+                                // TURN OFF AUTO BOUNDS so manual bounds aren't immediately overridden
+                                plot_ui.set_auto_bounds(egui::Vec2b::new(false, false));
+
                                 let current = plot_ui.plot_bounds();
                                 let mut x_min = current.min()[0];
                                 let mut x_max = current.max()[0];
@@ -1644,9 +1670,15 @@ impl CircuitSimApp {
                                 if let Ok(v) = self.plot_y_min.parse::<f64>() { y_min = v; }
                                 if let Ok(v) = self.plot_y_max.parse::<f64>() { y_max = v; }
 
+                                // Prevent panics if the user types min >= max
+                                let safe_x_min = x_min.min(x_max);
+                                let safe_x_max = if x_min == x_max { x_max + 1e-6 } else { x_min.max(x_max) };
+                                let safe_y_min = y_min.min(y_max);
+                                let safe_y_max = if y_min == y_max { y_max + 1e-6 } else { y_min.max(y_max) };
+
                                 plot_ui.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
-                                    [x_min, y_min],
-                                    [x_max, y_max],
+                                    [safe_x_min, safe_y_min],
+                                    [safe_x_max, safe_y_max],
                                 ));
                             }
                             self.apply_plot_bounds = false; // Execute once per click
@@ -1711,6 +1743,52 @@ impl CircuitSimApp {
             ui.selectable_value(&mut self.ac_mag_scale, AcMagScale::Db,     "dB");
             ui.selectable_value(&mut self.ac_mag_scale, AcMagScale::Linear, "Linear");
         });
+
+        ui.add_space(4.0);
+
+        // NEW: Scaling and Limits Controls for AC
+        ui.horizontal_wrapped(|ui| {
+            /*ui.label(egui::RichText::new("Mult X:").color(TEXT_SECONDARY));
+            ui.add(egui::TextEdit::singleline(&mut self.ac_plot_x_scale).desired_width(40.0));
+            ui.label(egui::RichText::new("Mult Y(Mag):").color(TEXT_SECONDARY));
+            ui.add(egui::TextEdit::singleline(&mut self.ac_mag_y_scale).desired_width(40.0));
+            ui.label(egui::RichText::new("Mult Y(Phs):").color(TEXT_SECONDARY));
+            ui.add(egui::TextEdit::singleline(&mut self.ac_phase_y_scale).desired_width(40.0));
+
+            ui.separator();
+
+            ui.label(egui::RichText::new("Limits X [").color(TEXT_SECONDARY));
+            ui.add(egui::TextEdit::singleline(&mut self.ac_plot_x_min).desired_width(40.0));
+            ui.label(",");
+            ui.add(egui::TextEdit::singleline(&mut self.ac_plot_x_max).desired_width(40.0));
+            ui.label("]");
+
+            ui.label(egui::RichText::new("Y(Mag) [").color(TEXT_SECONDARY));
+            ui.add(egui::TextEdit::singleline(&mut self.ac_mag_y_min).desired_width(40.0));
+            ui.label(",");
+            ui.add(egui::TextEdit::singleline(&mut self.ac_mag_y_max).desired_width(40.0));
+            ui.label("]");
+
+            ui.label(egui::RichText::new("Y(Phs) [").color(TEXT_SECONDARY));
+            ui.add(egui::TextEdit::singleline(&mut self.ac_phase_y_min).desired_width(40.0));
+            ui.label(",");
+            ui.add(egui::TextEdit::singleline(&mut self.ac_phase_y_max).desired_width(40.0));
+            ui.label("]");
+
+            if ui.button("Apply").clicked() {
+                self.ac_apply_plot_bounds = true;
+            }*/
+            if ui.button("Auto Fit").clicked() {
+                self.ac_plot_x_min.clear();
+                self.ac_plot_x_max.clear();
+                self.ac_mag_y_min.clear();
+                self.ac_mag_y_max.clear();
+                self.ac_phase_y_min.clear();
+                self.ac_phase_y_max.clear();
+                self.ac_apply_plot_bounds = true;
+            }
+        });
+
         ui.add_space(6.0);
 
         // Take a snapshot of what we need so we can release the borrow on self.ac
@@ -1718,11 +1796,16 @@ impl CircuitSimApp {
         let points_snapshot: Vec<_> = ac.points.iter().map(|p| {
             (p.freq, p.node_voltages.clone())
         }).collect();
+
         let mag_scale = self.ac_mag_scale;
         let ac_plot_nodes = self.ac_plot_nodes.clone();
 
         let available_h = ui.available_height();
         let half_h = (available_h - 24.0) / 2.0;
+
+        let x_mult = self.ac_plot_x_scale.parse::<f64>().unwrap_or(1.0);
+        let mag_y_mult = self.ac_mag_y_scale.parse::<f64>().unwrap_or(1.0);
+        let phase_y_mult = self.ac_phase_y_scale.parse::<f64>().unwrap_or(1.0);
 
         // ── Magnitude plot ───────────────────────────────────────────────────
         let mag_label = match mag_scale {
@@ -1757,18 +1840,59 @@ impl CircuitSimApp {
             };
 
             plot.show(ui, |plot_ui| {
+
+                // NEW: Apply bounds to Magnitude Plot
+                if self.ac_apply_plot_bounds {
+                    if self.ac_plot_x_min.is_empty() && self.ac_plot_x_max.is_empty()
+                        && self.ac_mag_y_min.is_empty() && self.ac_mag_y_max.is_empty() {
+                            plot_ui.set_auto_bounds(egui::Vec2b::new(true, true));
+                        } else {
+                            // TURN OFF AUTO BOUNDS
+                            plot_ui.set_auto_bounds(egui::Vec2b::new(false, false));
+
+                            let current = plot_ui.plot_bounds();
+                            let mut x_min = current.min()[0];
+                            let mut x_max = current.max()[0];
+                            let mut y_min = current.min()[1];
+                            let mut y_max = current.max()[1];
+
+                            // Note: If using Db scale, internal X axis is actually plotted in log10
+                            if let Ok(v) = self.ac_plot_x_min.parse::<f64>() {
+                                x_min = if matches!(mag_scale, AcMagScale::Db) && v > 0.0 { v.log10() } else { v };
+                            }
+                            if let Ok(v) = self.ac_plot_x_max.parse::<f64>() {
+                                x_max = if matches!(mag_scale, AcMagScale::Db) && v > 0.0 { v.log10() } else { v };
+                            }
+                            if let Ok(v) = self.ac_mag_y_min.parse::<f64>() { y_min = v; }
+                            if let Ok(v) = self.ac_mag_y_max.parse::<f64>() { y_max = v; }
+
+                            let safe_x_min = x_min.min(x_max);
+                            let safe_x_max = if x_min == x_max { x_max + 1e-6 } else { x_min.max(x_max) };
+                            let safe_y_min = y_min.min(y_max);
+                            let safe_y_max = if y_min == y_max { y_max + 1e-6 } else { y_min.max(y_max) };
+
+                            plot_ui.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
+                                [safe_x_min, safe_y_min],
+                                [safe_x_max, safe_y_max],
+                            ));
+                        }
+                }
+
                 for node in 1..n_nodes.min(ac_plot_nodes.len()) {
                     if !ac_plot_nodes[node] { continue; }
                     let pts: PlotPoints = points_snapshot.iter().map(|(freq, voltages)| {
                         let v = voltages.get(node).copied().unwrap_or_default();
                         let mag = v.norm();
+
                         let y = match mag_scale {
                             AcMagScale::Db     => if mag > 0.0 { 20.0 * mag.log10() } else { -200.0 },
                                                                      AcMagScale::Linear => mag,
-                        };
+                        } * mag_y_mult; // Scale applied here
+
+                        let scaled_freq = freq * x_mult;
                         let x = match mag_scale {
-                            AcMagScale::Db     => freq.log10(),
-                                                                     AcMagScale::Linear => *freq,
+                            AcMagScale::Db     => scaled_freq.log10(),
+                                                                     AcMagScale::Linear => scaled_freq,
                         };
                         [x, y]
                     }).collect();
@@ -1813,14 +1937,54 @@ impl CircuitSimApp {
             };
 
             plot.show(ui, |plot_ui| {
+
+                // NEW: Apply bounds to Phase Plot
+                if self.ac_apply_plot_bounds {
+                    if self.ac_plot_x_min.is_empty() && self.ac_plot_x_max.is_empty()
+                        && self.ac_phase_y_min.is_empty() && self.ac_phase_y_max.is_empty() {
+                            plot_ui.set_auto_bounds(egui::Vec2b::new(true, true));
+                        } else {
+                            // TURN OFF AUTO BOUNDS
+                            plot_ui.set_auto_bounds(egui::Vec2b::new(false, false));
+
+                            let current = plot_ui.plot_bounds();
+                            let mut x_min = current.min()[0];
+                            let mut x_max = current.max()[0];
+                            let mut y_min = current.min()[1];
+                            let mut y_max = current.max()[1];
+
+                            if let Ok(v) = self.ac_plot_x_min.parse::<f64>() {
+                                x_min = if matches!(mag_scale, AcMagScale::Db) && v > 0.0 { v.log10() } else { v };
+                            }
+                            if let Ok(v) = self.ac_plot_x_max.parse::<f64>() {
+                                x_max = if matches!(mag_scale, AcMagScale::Db) && v > 0.0 { v.log10() } else { v };
+                            }
+                            if let Ok(v) = self.ac_phase_y_min.parse::<f64>() { y_min = v; }
+                            if let Ok(v) = self.ac_phase_y_max.parse::<f64>() { y_max = v; }
+
+                            let safe_x_min = x_min.min(x_max);
+                            let safe_x_max = if x_min == x_max { x_max + 1e-6 } else { x_min.max(x_max) };
+                            let safe_y_min = y_min.min(y_max);
+                            let safe_y_max = if y_min == y_max { y_max + 1e-6 } else { y_min.max(y_max) };
+
+                            plot_ui.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
+                                [safe_x_min, safe_y_min],
+                                [safe_x_max, safe_y_max],
+                            ));
+                        }
+                }
+
                 for node in 1..n_nodes.min(ac_plot_nodes.len()) {
                     if !ac_plot_nodes[node] { continue; }
                     let pts: PlotPoints = points_snapshot.iter().map(|(freq, voltages)| {
                         let v = voltages.get(node).copied().unwrap_or_default();
-                        let phase_deg = v.arg().to_degrees();
+
+                        let phase_deg = v.arg().to_degrees() * phase_y_mult; // Scale applied here
+                        let scaled_freq = freq * x_mult;
+
                         let x = match mag_scale {
-                            AcMagScale::Db     => freq.log10(),
-                                                                     AcMagScale::Linear => *freq,
+                            AcMagScale::Db     => scaled_freq.log10(),
+                                                                     AcMagScale::Linear => scaled_freq,
                         };
                         [x, phase_deg]
                     }).collect();
@@ -1834,6 +1998,9 @@ impl CircuitSimApp {
                 }
             });
         });
+
+        // Toggle off the bounds application after both plots have processed it
+        self.ac_apply_plot_bounds = false;
     }
 
 }

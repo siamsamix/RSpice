@@ -171,41 +171,41 @@ impl Example {
         match self {
             Example::RcCharge => {
                 r#"* RC charging
-V1 1 0 DC 5
-R1 1 2 1k
-C1 2 0 1u
-.tran 10u 5m
-.end
-"#
+                V1 1 0 DC 5
+                R1 1 2 1k
+                C1 2 0 1u
+                .tran 10u 5m
+                .end
+                "#
             }
             Example::VoltageDivider => {
                 r#"* Voltage divider
-V1 1 0 DC 10
-R1 1 2 1k
-R2 2 0 1k
-.op
-.end
-"#
+                V1 1 0 DC 10
+                R1 1 2 1k
+                R2 2 0 1k
+                .op
+                .end
+                "#
             }
             Example::RlCircuit => {
                 r#"* RL circuit
-V1 1 0 DC 12
-R1 1 2 100
-L1 2 0 1m
-.op
-.tran 1u 1m
-.end
-"#
+                V1 1 0 DC 12
+                R1 1 2 100
+                L1 2 0 1m
+                .op
+                .tran 1u 1m
+                .end
+                "#
             }
             Example::RcLowPass => {
                 r#"* RC low-pass filter — frequency sweep
-* Corner frequency: fc = 1/(2π·R·C) ≈ 1.59 kHz
-V1 1 0 DC 0
-R1 1 2 1k
-C1 2 0 100n
-.ac dec 200 10 100k
-.end
-"#
+                * Corner frequency: fc = 1/(2π·R·C) ≈ 1.59 kHz
+                V1 1 0 DC 0
+                R1 1 2 1k
+                C1 2 0 100n
+                .ac dec 200 10 100k
+                .end
+                "#
             }
         }
     }
@@ -417,10 +417,10 @@ impl CircuitSimApp {
             }
             AnalysisType::Ac => {
                 out.push_str(&format!(".ac {} {} {} {}\n",
-                    self.schematic.ac_variation,
-                    self.schematic.ac_points,
-                    self.schematic.ac_fstart,
-                    self.schematic.ac_fstop,
+                                      self.schematic.ac_variation,
+                                      self.schematic.ac_points,
+                                      self.schematic.ac_fstart,
+                                      self.schematic.ac_fstop,
                 ));
             }
         }
@@ -435,9 +435,9 @@ impl CircuitSimApp {
                     "{} nodes · {} R · {} C · {} L · {} V",
                     netlist.circuit.nodes,
                     netlist.circuit.resistors.len(),
-                    netlist.circuit.capacitors.len(),
-                    netlist.circuit.inductors.len(),
-                    netlist.circuit.voltage_sources.len()
+                                      netlist.circuit.capacitors.len(),
+                                      netlist.circuit.inductors.len(),
+                                      netlist.circuit.voltage_sources.len()
                 );
                 self.circuit_summary = Some(summary);
 
@@ -465,24 +465,23 @@ impl CircuitSimApp {
         self.ac   = result.ac.clone();
 
         let max_nodes = self
-            .tran
-            .as_ref()
-            .and_then(|t| t.points.first())
+        .tran
+        .as_ref()
+        .and_then(|t| t.points.first())
+        .map(|p| p.node_voltages.len())
+        .or_else(|| self.dc.as_ref().map(|d| d.node_voltages.len()))
+        .or_else(|| {
+            self.ac.as_ref()
+            .and_then(|a| a.points.first())
             .map(|p| p.node_voltages.len())
-            .or_else(|| self.dc.as_ref().map(|d| d.node_voltages.len()))
-            .or_else(|| {
-                self.ac.as_ref()
-                    .and_then(|a| a.points.first())
-                    .map(|p| p.node_voltages.len())
-            })
-            .unwrap_or(8);
+        })
+        .unwrap_or(8);
 
         self.plot_nodes.resize(max_nodes, false);
         for i in 1..max_nodes.min(self.plot_nodes.len()) {
             self.plot_nodes[i] = i <= 3;
         }
 
-        // Default: enable same nodes for AC plots, auto-switch tab if .ac present
         self.ac_plot_nodes.resize(max_nodes, false);
         for i in 1..max_nodes.min(self.ac_plot_nodes.len()) {
             self.ac_plot_nodes[i] = i <= 3;
@@ -510,20 +509,20 @@ impl CircuitSimApp {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("Netlist", &["cir", "sp", "cir", "txt"])
             .pick_file()
-        {
-            match std::fs::read_to_string(&path) {
-                Ok(text) => {
-                    self.netlist = text;
-                    self.file_label = path
+            {
+                match std::fs::read_to_string(&path) {
+                    Ok(text) => {
+                        self.netlist = text;
+                        self.file_label = path
                         .file_name()
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_else(|| "circuit.cir".into());
-                    self.status = Some((true, format!("Opened {}", self.file_label)));
-                    self.clear_results();
+                        self.status = Some((true, format!("Opened {}", self.file_label)));
+                        self.clear_results();
+                    }
+                    Err(e) => self.status = Some((false, e.to_string())),
                 }
-                Err(e) => self.status = Some((false, e.to_string())),
             }
-        }
     }
 
     fn save_file(&mut self) {
@@ -531,18 +530,18 @@ impl CircuitSimApp {
             .add_filter("Netlist", &["cir"])
             .set_file_name(&self.file_label)
             .save_file()
-        {
-            match std::fs::write(&path, &self.netlist) {
-                Ok(()) => {
-                    self.file_label = path
+            {
+                match std::fs::write(&path, &self.netlist) {
+                    Ok(()) => {
+                        self.file_label = path
                         .file_name()
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_else(|| "circuit.cir".into());
-                    self.status = Some((true, format!("Saved {}", self.file_label)));
+                        self.status = Some((true, format!("Saved {}", self.file_label)));
+                    }
+                    Err(e) => self.status = Some((false, e.to_string())),
                 }
-                Err(e) => self.status = Some((false, e.to_string())),
             }
-        }
     }
 
 
@@ -555,44 +554,44 @@ impl eframe::App for CircuitSimApp {
         }
 
         egui::TopBottomPanel::top("toolbar")
-            .frame(panel_frame(BG_PANEL))
-            .show(ctx, |ui| {
-                self.toolbar(ui);
-            });
+        .frame(panel_frame(BG_PANEL))
+        .show(ctx, |ui| {
+            self.toolbar(ui);
+        });
 
         egui::TopBottomPanel::bottom("status")
-            .frame(
-                egui::Frame::none()
-                    .fill(BG_PANEL)
-                    .stroke(egui::Stroke::new(1.0, theme::BORDER))
-                    .inner_margin(egui::Margin::symmetric(16.0, 8.0)),
-            )
-            .show(ctx, |ui| {
-                self.status_bar(ui);
-            });
+        .frame(
+            egui::Frame::none()
+            .fill(BG_PANEL)
+            .stroke(egui::Stroke::new(1.0, theme::BORDER))
+            .inner_margin(egui::Margin::symmetric(16.0, 8.0)),
+        )
+        .show(ctx, |ui| {
+            self.status_bar(ui);
+        });
 
         egui::SidePanel::left("editor")
-            .resizable(true)
-            .default_width(420.0)
-            .min_width(280.0)
-            .frame(
-                egui::Frame::none()
-                    .fill(BG_SURFACE)
-                    .inner_margin(egui::Margin::same(14.0)),
-            )
-            .show(ctx, |ui| {
-                self.editor_panel(ui);
-            });
+        .resizable(true)
+        .default_width(420.0)
+        .min_width(280.0)
+        .frame(
+            egui::Frame::none()
+            .fill(BG_SURFACE)
+            .inner_margin(egui::Margin::same(14.0)),
+        )
+        .show(ctx, |ui| {
+            self.editor_panel(ui);
+        });
 
         egui::CentralPanel::default()
-            .frame(
-                egui::Frame::none()
-                    .fill(BG_PANEL)
-                    .inner_margin(egui::Margin::same(14.0)),
-            )
-            .show(ctx, |ui| {
-                self.results_panel(ui);
-            });
+        .frame(
+            egui::Frame::none()
+            .fill(BG_PANEL)
+            .inner_margin(egui::Margin::same(14.0)),
+        )
+        .show(ctx, |ui| {
+            self.results_panel(ui);
+        });
     }
 }
 
@@ -601,16 +600,16 @@ impl CircuitSimApp {
         ui.horizontal(|ui| {
             ui.label(
                 egui::RichText::new("⚡ RSpice")
-                    .strong()
-                    .size(20.0)
-                    .color(ACCENT),
+                .strong()
+                .size(20.0)
+                .color(ACCENT),
             );
             ui.add_space(12.0);
 
             let run = ui.add(
                 egui::Button::new(egui::RichText::new("▶  Run").strong().color(egui::Color32::WHITE))
-                    .fill(ACCENT)
-                    .min_size(egui::vec2(100.0, 32.0)),
+                .fill(ACCENT)
+                .min_size(egui::vec2(100.0, 32.0)),
             );
             if run.clicked() {
                 self.run_simulation();
@@ -619,40 +618,40 @@ impl CircuitSimApp {
                 .add(egui::Button::new("Open"))
                 .on_hover_text("Open netlist file")
                 .clicked()
-            {
-                self.open_file();
-            }
-            if ui
-                .add(egui::Button::new("Save"))
-                .on_hover_text("Save netlist")
-                .clicked()
-            {
-                self.save_file();
-            }
-
-            ui.separator();
-
-            ui.menu_button("Examples", |ui| {
-                for ex in [
-                    Example::RcCharge,
-                    Example::VoltageDivider,
-                    Example::RlCircuit,
-                    Example::RcLowPass,
-                ] {
-                    if ui.button(ex.label()).clicked() {
-                        self.load_example(ex);
-                        ui.close_menu();
-                    }
+                {
+                    self.open_file();
                 }
-            });
+                if ui
+                    .add(egui::Button::new("Save"))
+                    .on_hover_text("Save netlist")
+                    .clicked()
+                    {
+                        self.save_file();
+                    }
 
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(
-                    egui::RichText::new("F5 run · SPICE-style netlist")
+                    ui.separator();
+
+                ui.menu_button("Examples", |ui| {
+                    for ex in [
+                        Example::RcCharge,
+                        Example::VoltageDivider,
+                        Example::RlCircuit,
+                        Example::RcLowPass,
+                    ] {
+                        if ui.button(ex.label()).clicked() {
+                            self.load_example(ex);
+                            ui.close_menu();
+                        }
+                    }
+                });
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        egui::RichText::new("F5 run · SPICE-style netlist")
                         .color(TEXT_SECONDARY)
                         .size(12.0),
-                );
-            });
+                    );
+                });
         });
     }
 
@@ -664,15 +663,15 @@ impl CircuitSimApp {
             } else {
                 ui.label(
                     egui::RichText::new("Ready")
-                        .color(TEXT_SECONDARY)
-                        .italics(),
+                    .color(TEXT_SECONDARY)
+                    .italics(),
                 );
             }
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 ui.label(
                     egui::RichText::new(&self.file_label)
-                        .color(TEXT_SECONDARY)
-                        .family(egui::FontFamily::Monospace),
+                    .color(TEXT_SECONDARY)
+                    .family(egui::FontFamily::Monospace),
                 );
             });
         });
@@ -1021,16 +1020,16 @@ impl CircuitSimApp {
                     // Selection glow
                     if is_selected {
                         let sel_rect = Rect::from_center_size(center,
-                            if is_horizontal { Vec2::new(len + 4.0, 18.0) } else { Vec2::new(18.0, len + 4.0) });
+                                                              if is_horizontal { Vec2::new(len + 4.0, 18.0) } else { Vec2::new(18.0, len + 4.0) });
                         painter.rect_stroke(sel_rect, 3.0, selected_stroke);
                     }
 
                     // Value label
                     let off = if is_horizontal { Vec2::new(0.0, 14.0) } else { Vec2::new(18.0, 0.0) };
                     painter.text(center + off, egui::Align2::CENTER_CENTER, &c.val,
-                        egui::FontId::proportional(10.0), TEXT_SECONDARY);
+                                 egui::FontId::proportional(10.0), TEXT_SECONDARY);
                     painter.text(center - off * 0.8, egui::Align2::CENTER_CENTER, "R",
-                        egui::FontId::proportional(9.0), ACCENT);
+                                 egui::FontId::proportional(9.0), ACCENT);
                 }
 
                 CompKind::Capacitor => {
@@ -1048,22 +1047,22 @@ impl CircuitSimApp {
                     let plate2_c = center + dir * (gap / 2.0);
 
                     painter.line_segment([plate1_c - perp * plate_half, plate1_c + perp * plate_half],
-                        Stroke::new(2.5, Color32::from_rgb(220, 225, 235)));
+                                         Stroke::new(2.5, Color32::from_rgb(220, 225, 235)));
                     painter.line_segment([plate2_c - perp * plate_half, plate2_c + perp * plate_half],
-                        Stroke::new(2.5, Color32::from_rgb(220, 225, 235)));
+                                         Stroke::new(2.5, Color32::from_rgb(220, 225, 235)));
 
                     if is_selected {
                         let sel_rect = Rect::from_center_size(center,
-                            if is_horizontal { Vec2::new(24.0, plate_half * 2.0 + 4.0) }
-                            else { Vec2::new(plate_half * 2.0 + 4.0, 24.0) });
+                                                              if is_horizontal { Vec2::new(24.0, plate_half * 2.0 + 4.0) }
+                                                              else { Vec2::new(plate_half * 2.0 + 4.0, 24.0) });
                         painter.rect_stroke(sel_rect, 3.0, selected_stroke);
                     }
 
                     let off = if is_horizontal { Vec2::new(0.0, 16.0) } else { Vec2::new(20.0, 0.0) };
                     painter.text(center + off, egui::Align2::CENTER_CENTER, &c.val,
-                        egui::FontId::proportional(10.0), TEXT_SECONDARY);
+                                 egui::FontId::proportional(10.0), TEXT_SECONDARY);
                     painter.text(center - off * 0.8, egui::Align2::CENTER_CENTER, "C",
-                        egui::FontId::proportional(9.0), ACCENT);
+                                 egui::FontId::proportional(9.0), ACCENT);
                 }
 
                 CompKind::Inductor => {
@@ -1095,15 +1094,15 @@ impl CircuitSimApp {
 
                     if is_selected {
                         let sel_rect = Rect::from_center_size(center,
-                            if is_horizontal { Vec2::new(len + 4.0, 18.0) } else { Vec2::new(18.0, len + 4.0) });
+                                                              if is_horizontal { Vec2::new(len + 4.0, 18.0) } else { Vec2::new(18.0, len + 4.0) });
                         painter.rect_stroke(sel_rect, 3.0, selected_stroke);
                     }
 
                     let off = if is_horizontal { Vec2::new(0.0, 14.0) } else { Vec2::new(18.0, 0.0) };
                     painter.text(center + off, egui::Align2::CENTER_CENTER, &c.val,
-                        egui::FontId::proportional(10.0), TEXT_SECONDARY);
+                                 egui::FontId::proportional(10.0), TEXT_SECONDARY);
                     painter.text(center - off * 0.8, egui::Align2::CENTER_CENTER, "L",
-                        egui::FontId::proportional(9.0), ACCENT);
+                                 egui::FontId::proportional(9.0), ACCENT);
                 }
 
                 CompKind::Voltage => {
@@ -1114,7 +1113,7 @@ impl CircuitSimApp {
                     // Circle body
                     let r = 11.0_f32;
                     painter.circle_stroke(center, r,
-                        Stroke::new(2.0, Color32::from_rgb(255, 200, 80)));
+                                          Stroke::new(2.0, Color32::from_rgb(255, 200, 80)));
 
                     // + and - polarity symbols inside
                     let dir = (p2 - p1).normalized();
@@ -1122,12 +1121,12 @@ impl CircuitSimApp {
                     let minus_c = center - dir * (r * 0.45);
                     let ps = 3.0_f32;
                     painter.line_segment([plus_c - dir * ps, plus_c + dir * ps],
-                        Stroke::new(1.5, Color32::from_rgb(255, 200, 80)));
+                                         Stroke::new(1.5, Color32::from_rgb(255, 200, 80)));
                     let perp = Vec2::new(-dir.y, dir.x);
                     painter.line_segment([plus_c - perp * ps, plus_c + perp * ps],
-                        Stroke::new(1.5, Color32::from_rgb(255, 200, 80)));
+                                         Stroke::new(1.5, Color32::from_rgb(255, 200, 80)));
                     painter.line_segment([minus_c - dir * ps, minus_c + dir * ps],
-                        Stroke::new(1.5, Color32::from_rgb(200, 200, 200)));
+                                         Stroke::new(1.5, Color32::from_rgb(200, 200, 200)));
 
                     if is_selected {
                         painter.circle_stroke(center, r + 4.0, selected_stroke);
@@ -1135,9 +1134,9 @@ impl CircuitSimApp {
 
                     let off = if is_horizontal { Vec2::new(0.0, 16.0) } else { Vec2::new(20.0, 0.0) };
                     painter.text(center + off, egui::Align2::CENTER_CENTER, &c.val,
-                        egui::FontId::proportional(10.0), TEXT_SECONDARY);
+                                 egui::FontId::proportional(10.0), TEXT_SECONDARY);
                     painter.text(center - off * 0.8, egui::Align2::CENTER_CENTER, "V",
-                        egui::FontId::proportional(9.0), Color32::from_rgb(255, 200, 80));
+                                 egui::FontId::proportional(9.0), Color32::from_rgb(255, 200, 80));
                 }
 
                 CompKind::Ground => {
@@ -1151,12 +1150,12 @@ impl CircuitSimApp {
                         let y = bar_y1.y + k as f32 * 4.0;
                         painter.line_segment(
                             [Pos2::new(pin.x - half, y), Pos2::new(pin.x + half, y)],
-                            Stroke::new(2.0, gnd_color),
+                                             Stroke::new(2.0, gnd_color),
                         );
                     }
                     // "GND" label
                     painter.text(pin + Vec2::new(0.0, 26.0), egui::Align2::CENTER_CENTER,
-                        "GND", egui::FontId::proportional(9.0), gnd_color);
+                                 "GND", egui::FontId::proportional(9.0), gnd_color);
 
                     if is_selected {
                         let sel_rect = Rect::from_center_size(pin + Vec2::new(0.0, 12.0), Vec2::new(26.0, 28.0));
@@ -1166,7 +1165,117 @@ impl CircuitSimApp {
             }
         }
 
-        // --- ADD THIS BLOCK FOR DRAGGING COMPONENTS ---
+        // ── Compute and draw node number labels ─────────────────────────
+        // Replicate the DSU node-assignment logic so labels always match
+        // what generate_netlist_from_schematic would produce.
+        {
+            // 1. Collect all unique grid points touched by components or wires.
+            let mut points = HashSet::new();
+            for c in &self.schematic.components {
+                points.insert(c.p1);
+                if c.kind != CompKind::Ground { points.insert(c.p2); }
+            }
+            for w in &self.schematic.wires {
+                points.insert(w.p1);
+                points.insert(w.p2);
+            }
+
+            let mut pt_list: Vec<GridPt> = points.into_iter().collect();
+            // Sort deterministically so DSU root assignment never changes between frames.
+            pt_list.sort_by_key(|p| (p.0, p.1));
+            let mut pt_to_idx: HashMap<GridPt, usize> = HashMap::new();
+            for (i, &pt) in pt_list.iter().enumerate() {
+                pt_to_idx.insert(pt, i);
+            }
+
+            let mut dsu = Dsu::new(pt_list.len());
+
+            // 2. Wires merge nodes.
+            for w in &self.schematic.wires {
+                if let (Some(&a), Some(&b)) = (pt_to_idx.get(&w.p1), pt_to_idx.get(&w.p2)) {
+                    dsu.union(a, b);
+                }
+            }
+
+            // 3. Identify ground roots.
+            let mut ground_roots = HashSet::new();
+            for c in &self.schematic.components {
+                if c.kind == CompKind::Ground {
+                    if let Some(&idx) = pt_to_idx.get(&c.p1) {
+                        ground_roots.insert(dsu.find(idx));
+                    }
+                }
+            }
+
+            // 4. Assign SPICE node numbers (ground = 0, others 1..n).
+            let mut root_to_node: HashMap<usize, usize> = HashMap::new();
+            let mut next_id = 1usize;
+            for i in 0..pt_list.len() {
+                let root = dsu.find(i);
+                root_to_node.entry(root).or_insert_with(|| {
+                    if ground_roots.contains(&root) {
+                        0
+                    } else {
+                        let id = next_id;
+                        next_id += 1;
+                        id
+                    }
+                });
+            }
+
+            // 5. Collect one representative screen position per node number.
+            //    Pick the point with the smallest (x, y) grid coords for stability —
+            //    deterministic and never flickers regardless of mouse position.
+            let mut node_positions: HashMap<usize, (Pos2, GridPt)> = HashMap::new();
+
+            for (i, pt) in pt_list.iter().enumerate() {
+                let root = dsu.find(i);
+                let node_num = root_to_node[&root];
+                let screen_pos = to_screen(*pt);
+                let entry = node_positions.entry(node_num).or_insert((screen_pos, *pt));
+                // Keep the point with the smallest grid coords (already sorted, so
+                // the first insertion wins — but guard explicitly for clarity).
+                if (pt.0, pt.1) < (entry.1.0, entry.1.1) {
+                    *entry = (screen_pos, *pt);
+                }
+            }
+
+            // 6. Draw node labels.
+            for (node_num, (pos, _grid_pt)) in &node_positions {
+                let label = format!("{node_num}");
+                let bg_color = if *node_num == 0 {
+                    Color32::from_rgba_unmultiplied(40, 40, 50, 200)
+                } else {
+                    Color32::from_rgba_unmultiplied(20, 50, 80, 210)
+                };
+                let text_color = if *node_num == 0 {
+                    Color32::from_rgb(160, 170, 185)
+                } else {
+                    Color32::from_rgb(100, 210, 255)
+                };
+
+                // Small filled pill background for legibility.
+                let font_id = egui::FontId::proportional((10.0 * z).clamp(8.0, 14.0));
+                let galley = painter.layout_no_wrap(label.clone(), font_id.clone(), text_color);
+                let text_size = galley.size();
+                let pad = Vec2::new(3.0, 1.5);
+                let label_offset = Vec2::new(7.0 * z, -7.0 * z);
+                let pill_rect = Rect::from_min_size(
+                    *pos + label_offset - pad,
+                    text_size + pad * 2.0,
+                );
+                painter.rect_filled(pill_rect, 3.0, bg_color);
+                painter.rect_stroke(pill_rect, 3.0, egui::Stroke::new(0.5, text_color.gamma_multiply(0.5)));
+                painter.text(
+                    *pos + label_offset,
+                    egui::Align2::LEFT_TOP,
+                    label,
+                    font_id,
+                    text_color,
+                );
+            }
+        }
+        // ── End node labels ──────────────────────────────────────────────
         if self.schematic.tool == Tool::Select {
             // 1. Detect drag start and lock onto the target component
             if response.drag_started() {
@@ -1373,40 +1482,40 @@ impl CircuitSimApp {
                 let mid = to_screen(w.p1) + (to_screen(w.p2) - to_screen(w.p1)) / 2.0;
                 let mut is_open = true;
                 egui::Window::new("")
-                    .id(egui::Id::new("edit_wire_window"))
-                    .title_bar(false)
-                    .fixed_pos(mid + Vec2::new(10.0, 10.0))
-                    .collapsible(false)
-                    .resizable(false)
-                    .open(&mut is_open)
-                    .frame(
-                        egui::Frame::none()
-                            .fill(theme::BG_SURFACE)
-                            .stroke(egui::Stroke::new(1.5, Color32::from_rgb(255, 100, 80).gamma_multiply(0.6)))
-                            .rounding(egui::Rounding::same(8.0))
-                            .inner_margin(egui::Margin::same(10.0))
-                    )
-                    .show(ui.ctx(), |ui| {
-                        ui.horizontal(|ui| {
-                            ui.label(egui::RichText::new("Wire").strong().size(12.0).color(Color32::from_rgb(80, 200, 120)));
-                            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                ui.label(egui::RichText::new("✕ close").size(10.0).color(TEXT_SECONDARY));
-                            });
+                .id(egui::Id::new("edit_wire_window"))
+                .title_bar(false)
+                .fixed_pos(mid + Vec2::new(10.0, 10.0))
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut is_open)
+                .frame(
+                    egui::Frame::none()
+                    .fill(theme::BG_SURFACE)
+                    .stroke(egui::Stroke::new(1.5, Color32::from_rgb(255, 100, 80).gamma_multiply(0.6)))
+                    .rounding(egui::Rounding::same(8.0))
+                    .inner_margin(egui::Margin::same(10.0))
+                )
+                .show(ui.ctx(), |ui| {
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("Wire").strong().size(12.0).color(Color32::from_rgb(80, 200, 120)));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            ui.label(egui::RichText::new("✕ close").size(10.0).color(TEXT_SECONDARY));
                         });
-                        ui.add_space(4.0);
-                        ui.separator();
-                        ui.add_space(4.0);
-                        ui.label(egui::RichText::new("Delete: key or button").size(10.0).color(TEXT_SECONDARY));
-                        ui.add_space(4.0);
-                        if ui.add(
-                            egui::Button::new(egui::RichText::new("🗑 Delete Wire").size(11.0).color(egui::Color32::WHITE))
-                                .fill(egui::Color32::from_rgb(180, 50, 50))
-                                .rounding(egui::Rounding::same(4.0))
-                                .min_size(egui::vec2(100.0, 22.0))
-                        ).clicked() {
-                            delete_wire_idx = Some(wi);
-                        }
                     });
+                    ui.add_space(4.0);
+                    ui.separator();
+                    ui.add_space(4.0);
+                    ui.label(egui::RichText::new("Delete: key or button").size(10.0).color(TEXT_SECONDARY));
+                    ui.add_space(4.0);
+                    if ui.add(
+                        egui::Button::new(egui::RichText::new("🗑 Delete Wire").size(11.0).color(egui::Color32::WHITE))
+                        .fill(egui::Color32::from_rgb(180, 50, 50))
+                        .rounding(egui::Rounding::same(4.0))
+                        .min_size(egui::vec2(100.0, 22.0))
+                    ).clicked() {
+                        delete_wire_idx = Some(wi);
+                    }
+                });
                 if !is_open {
                     self.schematic.selected_wire = None;
                 }
@@ -1446,19 +1555,19 @@ impl CircuitSimApp {
                 .open(&mut is_open)
                 .frame(
                     egui::Frame::none()
-                        .fill(theme::BG_SURFACE)
-                        .stroke(egui::Stroke::new(1.5, kind_color.gamma_multiply(0.6)))
-                        .rounding(egui::Rounding::same(8.0))
-                        .inner_margin(egui::Margin::same(12.0))
+                    .fill(theme::BG_SURFACE)
+                    .stroke(egui::Stroke::new(1.5, kind_color.gamma_multiply(0.6)))
+                    .rounding(egui::Rounding::same(8.0))
+                    .inner_margin(egui::Margin::same(12.0))
                 )
                 .show(ui.ctx(), |ui| {
                     // Header row with kind badge + close hint
                     ui.horizontal(|ui| {
                         ui.label(
                             egui::RichText::new(kind_label)
-                                .strong()
-                                .size(13.0)
-                                .color(kind_color)
+                            .strong()
+                            .size(13.0)
+                            .color(kind_color)
                         );
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(egui::RichText::new("✕ close").size(10.0).color(TEXT_SECONDARY));
@@ -1660,12 +1769,12 @@ impl CircuitSimApp {
                 ui.add_space(12.0);
                 ui.label(
                     egui::RichText::new("No results yet")
-                        .size(18.0)
-                        .color(TEXT_SECONDARY),
+                    .size(18.0)
+                    .color(TEXT_SECONDARY),
                 );
                 ui.label(
                     egui::RichText::new("Edit the netlist and press Run (F5)")
-                        .color(TEXT_SECONDARY),
+                    .color(TEXT_SECONDARY),
                 );
             });
             return;
@@ -1674,50 +1783,50 @@ impl CircuitSimApp {
         ui.columns(2, |cols| {
             cols[0].vertical(|ui| {
                 card_frame().show(ui, |ui| {
-                        section_heading(ui, "Circuit");
-                        if let Some(s) = &self.circuit_summary {
-                            ui.label(s);
+                    section_heading(ui, "Circuit");
+                    if let Some(s) = &self.circuit_summary {
+                        ui.label(s);
+                    }
+                    if let Some(dc) = &self.dc {
+                        ui.add_space(8.0);
+                        ui.label(
+                            egui::RichText::new("DC operating point")
+                            .color(STATUS_OK)
+                            .strong(),
+                        );
+                        for (i, v) in dc.node_voltages.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(format!("N({i})"));
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        ui.label(
+                                            egui::RichText::new(format!("{v:.4e} V"))
+                                            .family(egui::FontFamily::Monospace),
+                                        );
+                                    },
+                                );
+                            });
                         }
-                        if let Some(dc) = &self.dc {
-                            ui.add_space(8.0);
-                            ui.label(
-                                egui::RichText::new("DC operating point")
-                                    .color(STATUS_OK)
-                                    .strong(),
-                            );
-                            for (i, v) in dc.node_voltages.iter().enumerate() {
-                                ui.horizontal(|ui| {
-                                    ui.label(format!("V({i})"));
-                                    ui.with_layout(
-                                        egui::Layout::right_to_left(egui::Align::Center),
-                                        |ui| {
-                                            ui.label(
-                                                egui::RichText::new(format!("{v:.4e} V"))
-                                                    .family(egui::FontFamily::Monospace),
-                                            );
-                                        },
-                                    );
-                                });
-                            }
-                        }
-                    });
+                    }
+                });
             });
 
             cols[1].vertical(|ui| {
                 if let Some(tran) = &self.tran {
                     card_frame().show(ui, |ui| {
-                            section_heading(ui, "Transient preview");
-                            ui.label(
-                                egui::RichText::new(format!(
-                                    "{} points · open Waveforms for full plot",
-                                    tran.points.len()
-                                ))
-                                .color(TEXT_SECONDARY)
-                                .size(12.0),
-                            );
-                            ui.add_space(6.0);
-                            self.mini_plot(ui, tran);
-                        });
+                        section_heading(ui, "Transient preview");
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "{} points · open Waveforms for full plot",
+                                tran.points.len()
+                            ))
+                            .color(TEXT_SECONDARY)
+                            .size(12.0),
+                        );
+                        ui.add_space(6.0);
+                        self.mini_plot(ui, tran);
+                    });
                 }
             });
         });
@@ -1725,12 +1834,12 @@ impl CircuitSimApp {
 
     fn mini_plot(&self, ui: &mut egui::Ui, tran: &TranResult) {
         let plot = Plot::new("mini")
-            .height(200.0)
-            .allow_drag(false)
-            .allow_zoom(false)
-            .allow_scroll(false)
-            .show_axes([true, true])
-            .show_background(true);
+        .height(200.0)
+        .allow_drag(false)
+        .allow_zoom(false)
+        .allow_scroll(false)
+        .show_axes([true, true])
+        .show_background(true);
 
         plot.show(ui, |plot_ui| {
             for (node, &enabled) in self.plot_nodes.iter().enumerate() {
@@ -1738,21 +1847,21 @@ impl CircuitSimApp {
                     continue;
                 }
                 let points: PlotPoints = tran
-                    .points
-                    .iter()
-                    .map(|p| {
-                        [
-                            p.time as f64,
-                            p.node_voltages.get(node).copied().unwrap_or(0.0) as f64,
-                        ]
-                    })
-                    .collect();
+                .points
+                .iter()
+                .map(|p| {
+                    [
+                        p.time as f64,
+                        p.node_voltages.get(node).copied().unwrap_or(0.0) as f64,
+                    ]
+                })
+                .collect();
                 let color = PLOT_COLORS[node % PLOT_COLORS.len()];
                 plot_ui.line(
                     Line::new(points)
-                        .name(format!("V({node})"))
-                        .color(color)
-                        .width(1.5),
+                    .name(format!("V({node})"))
+                    .color(color)
+                    .width(1.5),
                 );
             }
         });
@@ -1765,50 +1874,95 @@ impl CircuitSimApp {
         };
 
         card_frame().show(ui, |ui| {
-                egui::Grid::new("dc_grid")
-                    .num_columns(2)
-                    .spacing([24.0, 8.0])
-                    .striped(true)
-                    .show(ui, |ui| {
-                        ui.label(egui::RichText::new("Node").strong());
-                        ui.label(egui::RichText::new("Voltage").strong());
-                        ui.end_row();
-                        for (i, v) in dc.node_voltages.iter().enumerate() {
-                            ui.label(format!("V({i})"));
-                            ui.label(
-                                egui::RichText::new(format!("{v:.6e} V"))
-                                    .family(egui::FontFamily::Monospace)
-                                    .color(ACCENT),
-                            );
-                            ui.end_row();
-                        }
-                    });
-
-                if !dc.source_currents.is_empty() {
-                    ui.add_space(16.0);
-                    section_heading(ui, "Source currents");
-                    egui::Grid::new("src_grid")
-                        .num_columns(2)
-                        .spacing([24.0, 8.0])
-                        .show(ui, |ui| {
-                            for (i, &amp) in dc.source_currents.iter().enumerate() {
-                                ui.label(format!("I(V{i})"));
-                                ui.label(
-                                    egui::RichText::new(format!("{amp:.6e} A"))
-                                        .family(egui::FontFamily::Monospace),
-                                );
-                                ui.end_row();
-                            }
-                        });
+            // ── Node voltages ────────────────────────────────────────────
+            section_heading(ui, "Node voltages");
+            egui::Grid::new("dc_node_grid")
+            .num_columns(2)
+            .spacing([24.0, 8.0])
+            .striped(true)
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new("Node").strong());
+                ui.label(egui::RichText::new("Voltage").strong());
+                ui.end_row();
+                for (i, v) in dc.node_voltages.iter().enumerate() {
+                    ui.label(format!("N({i})"));
+                    ui.label(
+                        egui::RichText::new(format!("{v:.6e} V"))
+                        .family(egui::FontFamily::Monospace)
+                        .color(ACCENT),
+                    );
+                    ui.end_row();
                 }
             });
+
+            // ── Branch currents ──────────────────────────────────────────
+            ui.add_space(16.0);
+            section_heading(ui, "Branch currents");
+            egui::Grid::new("dc_branch_grid")
+            .num_columns(2)
+            .spacing([24.0, 8.0])
+            .striped(true)
+            .show(ui, |ui| {
+                ui.label(egui::RichText::new("Element").strong());
+                ui.label(egui::RichText::new("Current (n1→n2)").strong());
+                ui.end_row();
+
+                let b = &dc.branch_currents;
+
+                for (i, &cur) in b.resistors.iter().enumerate() {
+                    ui.label(format!("R{}", i + 1));
+                    ui.label(
+                        egui::RichText::new(format!("{cur:.6e} A"))
+                        .family(egui::FontFamily::Monospace)
+                        .color(ACCENT),
+                    );
+                    ui.end_row();
+                }
+                for (i, &cur) in b.capacitors.iter().enumerate() {
+                    ui.label(format!("C{}", i + 1));
+                    ui.label(
+                        egui::RichText::new(format!("{cur:.6e} A"))
+                        .family(egui::FontFamily::Monospace)
+                        .color(ACCENT),
+                    );
+                    ui.end_row();
+                }
+                for (i, &cur) in b.inductors.iter().enumerate() {
+                    ui.label(format!("L{}", i + 1));
+                    ui.label(
+                        egui::RichText::new(format!("{cur:.6e} A"))
+                        .family(egui::FontFamily::Monospace)
+                        .color(ACCENT),
+                    );
+                    ui.end_row();
+                }
+                for (i, &cur) in b.voltage_sources.iter().enumerate() {
+                    ui.label(format!("V{}", i + 1));
+                    ui.label(
+                        egui::RichText::new(format!("{cur:.6e} A"))
+                        .family(egui::FontFamily::Monospace)
+                        .color(ACCENT),
+                    );
+                    ui.end_row();
+                }
+                for (i, &cur) in b.diodes.iter().enumerate() {
+                    ui.label(format!("D{}", i + 1));
+                    ui.label(
+                        egui::RichText::new(format!("{cur:.6e} A"))
+                        .family(egui::FontFamily::Monospace)
+                        .color(ACCENT),
+                    );
+                    ui.end_row();
+                }
+            });
+        });
     }
 
     fn waveforms_tab(&mut self, ui: &mut egui::Ui) {
         let Some(tran) = &self.tran else {
             ui.label(
                 egui::RichText::new("No transient analysis (.tran) in netlist")
-                    .color(TEXT_SECONDARY),
+                .color(TEXT_SECONDARY),
             );
             return;
         };
@@ -1826,27 +1980,27 @@ impl CircuitSimApp {
         // NEW: Scaling and Limits Controls
         ui.horizontal_wrapped(|ui| {
             /*ui.label(egui::RichText::new("Mult X:").color(TEXT_SECONDARY));
-            ui.add(egui::TextEdit::singleline(&mut self.plot_x_scale).desired_width(40.0));
-            ui.label(egui::RichText::new("Mult Y:").color(TEXT_SECONDARY));
-            ui.add(egui::TextEdit::singleline(&mut self.plot_y_scale).desired_width(40.0));
-
-            ui.separator();
-
-            ui.label(egui::RichText::new("Limits X [").color(TEXT_SECONDARY));
-            ui.add(egui::TextEdit::singleline(&mut self.plot_x_min).desired_width(40.0));
-            ui.label(",");
-            ui.add(egui::TextEdit::singleline(&mut self.plot_x_max).desired_width(40.0));
-            ui.label("]");
-
-            ui.label(egui::RichText::new("Y [").color(TEXT_SECONDARY));
-            ui.add(egui::TextEdit::singleline(&mut self.plot_y_min).desired_width(40.0));
-            ui.label(",");
-            ui.add(egui::TextEdit::singleline(&mut self.plot_y_max).desired_width(40.0));
-            ui.label("]");
-
-            if ui.button("Apply").clicked() {
-                self.apply_plot_bounds = true;
-            }*/
+             *           ui.add(egui::TextEdit::singleline(&mut self.plot_x_scale).desired_width(40.0));
+             *           ui.label(egui::RichText::new("Mult Y:").color(TEXT_SECONDARY));
+             *           ui.add(egui::TextEdit::singleline(&mut self.plot_y_scale).desired_width(40.0));
+             *
+             *           ui.separator();
+             *
+             *           ui.label(egui::RichText::new("Limits X [").color(TEXT_SECONDARY));
+             *           ui.add(egui::TextEdit::singleline(&mut self.plot_x_min).desired_width(40.0));
+             *           ui.label(",");
+             *           ui.add(egui::TextEdit::singleline(&mut self.plot_x_max).desired_width(40.0));
+             *           ui.label("]");
+             *
+             *           ui.label(egui::RichText::new("Y [").color(TEXT_SECONDARY));
+             *           ui.add(egui::TextEdit::singleline(&mut self.plot_y_min).desired_width(40.0));
+             *           ui.label(",");
+             *           ui.add(egui::TextEdit::singleline(&mut self.plot_y_max).desired_width(40.0));
+             *           ui.label("]");
+             *
+             *           if ui.button("Apply").clicked() {
+             *               self.apply_plot_bounds = true;
+        }*/
             if ui.button("Auto Fit").clicked() {
                 self.plot_x_min.clear();
                 self.plot_x_max.clear();
@@ -1861,81 +2015,155 @@ impl CircuitSimApp {
         let x_mult = self.plot_x_scale.parse::<f64>().unwrap_or(1.0);
         let y_mult = self.plot_y_scale.parse::<f64>().unwrap_or(1.0);
 
+        let half_h = ((ui.available_height() - 24.0) / 2.0).max(120.0);
+
         code_frame()
-            .show(ui, |ui| {
-                let plot = Plot::new("waveforms")
-                    .height(ui.available_height() - 8.0)
-                    .x_axis_label("time (s)")
-                    .y_axis_label("voltage (V)")
-                    .legend(Legend::default().position(egui_plot::Corner::RightTop))
-                    .show_background(true)
-                    .allow_scroll(true)
-                    .allow_drag(true)
-                    .allow_boxed_zoom(true);
+        .show(ui, |ui| {
+            let plot = Plot::new("waveforms")
+            .height(half_h)
+            .x_axis_label("time (s)")
+            .y_axis_label("voltage (V)")
+            .legend(Legend::default().position(egui_plot::Corner::RightTop))
+            .show_background(true)
+            .allow_scroll(true)
+            .allow_drag(true)
+            .allow_boxed_zoom(true);
 
-                plot.show(ui, |plot_ui| {
+            plot.show(ui, |plot_ui| {
 
-                    // NEW: Apply Manual View Bounds
-                    // NEW: Apply Manual View Bounds
-                    if self.apply_plot_bounds {
-                        // Check if user cleared all inputs to trigger an auto-fit reset
-                        if self.plot_x_min.is_empty() && self.plot_x_max.is_empty()
-                            && self.plot_y_min.is_empty() && self.plot_y_max.is_empty() {
-                                plot_ui.set_auto_bounds(egui::Vec2b::new(true, true));
-                            } else {
-                                // TURN OFF AUTO BOUNDS so manual bounds aren't immediately overridden
-                                plot_ui.set_auto_bounds(egui::Vec2b::new(false, false));
+                // NEW: Apply Manual View Bounds
+                // NEW: Apply Manual View Bounds
+                if self.apply_plot_bounds {
+                    // Check if user cleared all inputs to trigger an auto-fit reset
+                    if self.plot_x_min.is_empty() && self.plot_x_max.is_empty()
+                        && self.plot_y_min.is_empty() && self.plot_y_max.is_empty() {
+                            plot_ui.set_auto_bounds(egui::Vec2b::new(true, true));
+                        } else {
+                            // TURN OFF AUTO BOUNDS so manual bounds aren't immediately overridden
+                            plot_ui.set_auto_bounds(egui::Vec2b::new(false, false));
 
-                                let current = plot_ui.plot_bounds();
-                                let mut x_min = current.min()[0];
-                                let mut x_max = current.max()[0];
-                                let mut y_min = current.min()[1];
-                                let mut y_max = current.max()[1];
+                            let current = plot_ui.plot_bounds();
+                            let mut x_min = current.min()[0];
+                            let mut x_max = current.max()[0];
+                            let mut y_min = current.min()[1];
+                            let mut y_max = current.max()[1];
 
-                                // Override only the fields the user has typed into
-                                if let Ok(v) = self.plot_x_min.parse::<f64>() { x_min = v; }
-                                if let Ok(v) = self.plot_x_max.parse::<f64>() { x_max = v; }
-                                if let Ok(v) = self.plot_y_min.parse::<f64>() { y_min = v; }
-                                if let Ok(v) = self.plot_y_max.parse::<f64>() { y_max = v; }
+                            // Override only the fields the user has typed into
+                            if let Ok(v) = self.plot_x_min.parse::<f64>() { x_min = v; }
+                            if let Ok(v) = self.plot_x_max.parse::<f64>() { x_max = v; }
+                            if let Ok(v) = self.plot_y_min.parse::<f64>() { y_min = v; }
+                            if let Ok(v) = self.plot_y_max.parse::<f64>() { y_max = v; }
 
-                                // Prevent panics if the user types min >= max
-                                let safe_x_min = x_min.min(x_max);
-                                let safe_x_max = if x_min == x_max { x_max + 1e-6 } else { x_min.max(x_max) };
-                                let safe_y_min = y_min.min(y_max);
-                                let safe_y_max = if y_min == y_max { y_max + 1e-6 } else { y_min.max(y_max) };
+                            // Prevent panics if the user types min >= max
+                            let safe_x_min = x_min.min(x_max);
+                            let safe_x_max = if x_min == x_max { x_max + 1e-6 } else { x_min.max(x_max) };
+                            let safe_y_min = y_min.min(y_max);
+                            let safe_y_max = if y_min == y_max { y_max + 1e-6 } else { y_min.max(y_max) };
 
-                                plot_ui.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
-                                    [safe_x_min, safe_y_min],
-                                    [safe_x_max, safe_y_max],
-                                ));
-                            }
-                            self.apply_plot_bounds = false; // Execute once per click
-                    }
-
-                    for (node, &enabled) in self.plot_nodes.iter().enumerate() {
-                        if !enabled || node == 0 {
-                            continue;
+                            plot_ui.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
+                                [safe_x_min, safe_y_min],
+                                [safe_x_max, safe_y_max],
+                            ));
                         }
-                        let points: PlotPoints = tran
-                            .points
-                            .iter()
-                            .map(|p| {
-                                [
-                                    (p.time as f64) * x_mult,
-                                 (p.node_voltages.get(node).copied().unwrap_or(0.0) as f64) * y_mult,
-                                ]
-                            })
-                            .collect();
-                        let color = PLOT_COLORS[node % PLOT_COLORS.len()];
-                        plot_ui.line(
-                            Line::new(points)
-                                .name(format!("V({node})"))
-                                .color(color)
-                                .width(2.0),
-                        );
+                        self.apply_plot_bounds = false; // Execute once per click
+                }
+
+                for (node, &enabled) in self.plot_nodes.iter().enumerate() {
+                    if !enabled || node == 0 {
+                        continue;
                     }
-                });
+                    let points: PlotPoints = tran
+                    .points
+                    .iter()
+                    .map(|p| {
+                        [
+                            (p.time as f64) * x_mult,
+                         (p.node_voltages.get(node).copied().unwrap_or(0.0) as f64) * y_mult,
+                        ]
+                    })
+                    .collect();
+                    let color = PLOT_COLORS[node % PLOT_COLORS.len()];
+                    plot_ui.line(
+                        Line::new(points)
+                        .name(format!("V({node})"))
+                        .color(color)
+                        .width(2.0),
+                    );
+                }
             });
+        });
+
+        ui.add_space(8.0);
+
+        // ── Branch current waveforms ──────────────────────────────────────────
+        code_frame().show(ui, |ui| {
+            let plot = Plot::new("waveforms_current")
+            .height(half_h)
+            .x_axis_label("time (s)")
+            .y_axis_label("current (A)")
+            .legend(Legend::default().position(egui_plot::Corner::RightTop))
+            .show_background(true)
+            .allow_scroll(true)
+            .allow_drag(true)
+            .allow_boxed_zoom(true);
+
+            plot.show(ui, |plot_ui| {
+                // Helper: build one line from a per-point extractor closure.
+                // We iterate all element types in order R, C, L, V, D.
+                let mut color_idx = 0usize;
+
+                // Resistors
+                let nr = tran.points.first().map(|p| p.branch_currents.resistors.len()).unwrap_or(0);
+                for i in 0..nr {
+                    let pts: PlotPoints = tran.points.iter().map(|p| {
+                        [p.time * x_mult, p.branch_currents.resistors.get(i).copied().unwrap_or(0.0) * y_mult]
+                    }).collect();
+                    plot_ui.line(Line::new(pts).name(format!("I(R{})", i + 1))
+                        .color(PLOT_COLORS[color_idx % PLOT_COLORS.len()]).width(2.0));
+                    color_idx += 1;
+                }
+                // Capacitors
+                let nc = tran.points.first().map(|p| p.branch_currents.capacitors.len()).unwrap_or(0);
+                for i in 0..nc {
+                    let pts: PlotPoints = tran.points.iter().map(|p| {
+                        [p.time * x_mult, p.branch_currents.capacitors.get(i).copied().unwrap_or(0.0) * y_mult]
+                    }).collect();
+                    plot_ui.line(Line::new(pts).name(format!("I(C{})", i + 1))
+                        .color(PLOT_COLORS[color_idx % PLOT_COLORS.len()]).width(2.0));
+                    color_idx += 1;
+                }
+                // Inductors
+                let nl = tran.points.first().map(|p| p.branch_currents.inductors.len()).unwrap_or(0);
+                for i in 0..nl {
+                    let pts: PlotPoints = tran.points.iter().map(|p| {
+                        [p.time * x_mult, p.branch_currents.inductors.get(i).copied().unwrap_or(0.0) * y_mult]
+                    }).collect();
+                    plot_ui.line(Line::new(pts).name(format!("I(L{})", i + 1))
+                        .color(PLOT_COLORS[color_idx % PLOT_COLORS.len()]).width(2.0));
+                    color_idx += 1;
+                }
+                // Voltage sources
+                let nv = tran.points.first().map(|p| p.branch_currents.voltage_sources.len()).unwrap_or(0);
+                for i in 0..nv {
+                    let pts: PlotPoints = tran.points.iter().map(|p| {
+                        [p.time * x_mult, p.branch_currents.voltage_sources.get(i).copied().unwrap_or(0.0) * y_mult]
+                    }).collect();
+                    plot_ui.line(Line::new(pts).name(format!("I(V{})", i + 1))
+                        .color(PLOT_COLORS[color_idx % PLOT_COLORS.len()]).width(2.0));
+                    color_idx += 1;
+                }
+                // Diodes
+                let nd = tran.points.first().map(|p| p.branch_currents.diodes.len()).unwrap_or(0);
+                for i in 0..nd {
+                    let pts: PlotPoints = tran.points.iter().map(|p| {
+                        [p.time * x_mult, p.branch_currents.diodes.get(i).copied().unwrap_or(0.0) * y_mult]
+                    }).collect();
+                    plot_ui.line(Line::new(pts).name(format!("I(D{})", i + 1))
+                        .color(PLOT_COLORS[color_idx % PLOT_COLORS.len()]).width(2.0));
+                    color_idx += 1;
+                }
+            });
+        });
     }
     fn freq_response_tab(&mut self, ui: &mut egui::Ui) {
         let Some(ac) = &self.ac else {
@@ -1977,35 +2205,35 @@ impl CircuitSimApp {
         // NEW: Scaling and Limits Controls for AC
         ui.horizontal_wrapped(|ui| {
             /*ui.label(egui::RichText::new("Mult X:").color(TEXT_SECONDARY));
-            ui.add(egui::TextEdit::singleline(&mut self.ac_plot_x_scale).desired_width(40.0));
-            ui.label(egui::RichText::new("Mult Y(Mag):").color(TEXT_SECONDARY));
-            ui.add(egui::TextEdit::singleline(&mut self.ac_mag_y_scale).desired_width(40.0));
-            ui.label(egui::RichText::new("Mult Y(Phs):").color(TEXT_SECONDARY));
-            ui.add(egui::TextEdit::singleline(&mut self.ac_phase_y_scale).desired_width(40.0));
-
-            ui.separator();
-
-            ui.label(egui::RichText::new("Limits X [").color(TEXT_SECONDARY));
-            ui.add(egui::TextEdit::singleline(&mut self.ac_plot_x_min).desired_width(40.0));
-            ui.label(",");
-            ui.add(egui::TextEdit::singleline(&mut self.ac_plot_x_max).desired_width(40.0));
-            ui.label("]");
-
-            ui.label(egui::RichText::new("Y(Mag) [").color(TEXT_SECONDARY));
-            ui.add(egui::TextEdit::singleline(&mut self.ac_mag_y_min).desired_width(40.0));
-            ui.label(",");
-            ui.add(egui::TextEdit::singleline(&mut self.ac_mag_y_max).desired_width(40.0));
-            ui.label("]");
-
-            ui.label(egui::RichText::new("Y(Phs) [").color(TEXT_SECONDARY));
-            ui.add(egui::TextEdit::singleline(&mut self.ac_phase_y_min).desired_width(40.0));
-            ui.label(",");
-            ui.add(egui::TextEdit::singleline(&mut self.ac_phase_y_max).desired_width(40.0));
-            ui.label("]");
-
-            if ui.button("Apply").clicked() {
-                self.ac_apply_plot_bounds = true;
-            }*/
+             *           ui.add(egui::TextEdit::singleline(&mut self.ac_plot_x_scale).desired_width(40.0));
+             *           ui.label(egui::RichText::new("Mult Y(Mag):").color(TEXT_SECONDARY));
+             *           ui.add(egui::TextEdit::singleline(&mut self.ac_mag_y_scale).desired_width(40.0));
+             *           ui.label(egui::RichText::new("Mult Y(Phs):").color(TEXT_SECONDARY));
+             *           ui.add(egui::TextEdit::singleline(&mut self.ac_phase_y_scale).desired_width(40.0));
+             *
+             *           ui.separator();
+             *
+             *           ui.label(egui::RichText::new("Limits X [").color(TEXT_SECONDARY));
+             *           ui.add(egui::TextEdit::singleline(&mut self.ac_plot_x_min).desired_width(40.0));
+             *           ui.label(",");
+             *           ui.add(egui::TextEdit::singleline(&mut self.ac_plot_x_max).desired_width(40.0));
+             *           ui.label("]");
+             *
+             *           ui.label(egui::RichText::new("Y(Mag) [").color(TEXT_SECONDARY));
+             *           ui.add(egui::TextEdit::singleline(&mut self.ac_mag_y_min).desired_width(40.0));
+             *           ui.label(",");
+             *           ui.add(egui::TextEdit::singleline(&mut self.ac_mag_y_max).desired_width(40.0));
+             *           ui.label("]");
+             *
+             *           ui.label(egui::RichText::new("Y(Phs) [").color(TEXT_SECONDARY));
+             *           ui.add(egui::TextEdit::singleline(&mut self.ac_phase_y_min).desired_width(40.0));
+             *           ui.label(",");
+             *           ui.add(egui::TextEdit::singleline(&mut self.ac_phase_y_max).desired_width(40.0));
+             *           ui.label("]");
+             *
+             *           if ui.button("Apply").clicked() {
+             *               self.ac_apply_plot_bounds = true;
+        }*/
             if ui.button("Auto Fit").clicked() {
                 self.ac_plot_x_min.clear();
                 self.ac_plot_x_max.clear();
@@ -2019,10 +2247,10 @@ impl CircuitSimApp {
 
         ui.add_space(6.0);
 
-        // Take a snapshot of what we need so we can release the borrow on self.ac
-        // before calling self methods.
+        // Snapshot: capture voltages and branch currents per frequency point.
+        // AcBranchCurrents has separate Vecs per element type; clone them all.
         let points_snapshot: Vec<_> = ac.points.iter().map(|p| {
-            (p.freq, p.node_voltages.clone())
+            (p.freq, p.node_voltages.clone(), p.branch_currents.clone())
         }).collect();
 
         let mag_scale = self.ac_mag_scale;
@@ -2108,7 +2336,7 @@ impl CircuitSimApp {
 
                 for node in 1..n_nodes.min(ac_plot_nodes.len()) {
                     if !ac_plot_nodes[node] { continue; }
-                    let pts: PlotPoints = points_snapshot.iter().map(|(freq, voltages)| {
+                    let pts: PlotPoints = points_snapshot.iter().map(|(freq, voltages, _currents)| {
                         let v = voltages.get(node).copied().unwrap_or_default();
                         let mag = v.norm();
 
@@ -2154,7 +2382,7 @@ impl CircuitSimApp {
                 .x_grid_spacer(egui_plot::log_grid_spacer(10))
                 .label_formatter(|name, val| {
                     if name.is_empty() { return String::new(); }
-                    let f = 10.0_f64.powf(val.x); // convert log10(x) back to real freq for the tooltip
+                    let f = 10.0_f64.powf(val.x);
                     format!("{}\nf = {:.3e} Hz\nphase = {:.2}°", name, f, val.y)
                 }),
                 AcMagScale::Linear => plot
@@ -2166,13 +2394,12 @@ impl CircuitSimApp {
 
             plot.show(ui, |plot_ui| {
 
-                // NEW: Apply bounds to Phase Plot
+                // Apply bounds to Phase Plot
                 if self.ac_apply_plot_bounds {
                     if self.ac_plot_x_min.is_empty() && self.ac_plot_x_max.is_empty()
                         && self.ac_phase_y_min.is_empty() && self.ac_phase_y_max.is_empty() {
                             plot_ui.set_auto_bounds(egui::Vec2b::new(true, true));
                         } else {
-                            // TURN OFF AUTO BOUNDS
                             plot_ui.set_auto_bounds(egui::Vec2b::new(false, false));
 
                             let current = plot_ui.plot_bounds();
@@ -2204,10 +2431,10 @@ impl CircuitSimApp {
 
                 for node in 1..n_nodes.min(ac_plot_nodes.len()) {
                     if !ac_plot_nodes[node] { continue; }
-                    let pts: PlotPoints = points_snapshot.iter().map(|(freq, voltages)| {
+                    let pts: PlotPoints = points_snapshot.iter().map(|(freq, voltages, _currents)| {
                         let v = voltages.get(node).copied().unwrap_or_default();
 
-                        let phase_deg = v.arg().to_degrees() * phase_y_mult; // Scale applied here
+                        let phase_deg = v.arg().to_degrees() * phase_y_mult;
                         let scaled_freq = freq * x_mult;
 
                         let x = match mag_scale {
@@ -2227,7 +2454,198 @@ impl CircuitSimApp {
             });
         });
 
-        // Toggle off the bounds application after both plots have processed it
+        ui.add_space(8.0);
+
+        // ── Branch current magnitude plot ─────────────────────────────────────
+        code_frame().show(ui, |ui| {
+            let cur_mag_label = match mag_scale {
+                AcMagScale::Db     => "current magnitude (dB·A)",
+                AcMagScale::Linear => "current magnitude (A)",
+            };
+            let mut plot = Plot::new("ac_branch_current_mag")
+            .height(half_h.max(120.0))
+            .x_axis_label("frequency (Hz)")
+            .y_axis_label(cur_mag_label)
+            .legend(Legend::default().position(egui_plot::Corner::RightTop))
+            .show_background(true)
+            .allow_scroll(true)
+            .allow_drag(true)
+            .allow_boxed_zoom(true);
+
+            plot = match mag_scale {
+                AcMagScale::Db => plot
+                    .x_grid_spacer(egui_plot::log_grid_spacer(10))
+                    .label_formatter(move |name, val| {
+                        if name.is_empty() { return String::new(); }
+                        let f = 10.0_f64.powf(val.x);
+                        format!("{}\nf = {:.3e} Hz\n{} = {:.3e}", name, f, cur_mag_label, val.y)
+                    }),
+                AcMagScale::Linear => plot
+                    .label_formatter(move |name, val| {
+                        if name.is_empty() { return String::new(); }
+                        format!("{}\nf = {:.3e} Hz\n{} = {:.3e}", name, val.x, cur_mag_label, val.y)
+                    }),
+            };
+
+            plot.show(ui, |plot_ui| {
+                let mut color_idx = 0usize;
+                // Determine element counts from first point
+                let (nr, nc, nl, nv, nd) = points_snapshot.first().map(|(_, _, b)| {
+                    (b.resistors.len(), b.capacitors.len(), b.inductors.len(),
+                     b.voltage_sources.len(), b.diodes.len())
+                }).unwrap_or((0,0,0,0,0));
+
+                let plot_branch_current_mag = |plot_ui: &mut egui_plot::PlotUi,
+                                               name: String,
+                                               data: Vec<[f64;2]>,
+                                               color: egui::Color32| {
+                    plot_ui.line(Line::new(PlotPoints::new(data)).name(name).color(color).width(2.0));
+                };
+
+                for i in 0..nr {
+                    let data: Vec<[f64;2]> = points_snapshot.iter().map(|(freq, _, b)| {
+                        let mag = b.resistors.get(i).map(|c| c.norm()).unwrap_or(0.0);
+                        let y = match mag_scale { AcMagScale::Db => if mag > 0.0 { 20.0*mag.log10() } else { -200.0 }, AcMagScale::Linear => mag } * mag_y_mult;
+                        let x = if matches!(mag_scale, AcMagScale::Db) { (freq * x_mult).log10() } else { freq * x_mult };
+                        [x, y]
+                    }).collect();
+                    plot_branch_current_mag(plot_ui, format!("I(R{})", i+1), data, PLOT_COLORS[color_idx % PLOT_COLORS.len()]);
+                    color_idx += 1;
+                }
+                for i in 0..nc {
+                    let data: Vec<[f64;2]> = points_snapshot.iter().map(|(freq, _, b)| {
+                        let mag = b.capacitors.get(i).map(|c| c.norm()).unwrap_or(0.0);
+                        let y = match mag_scale { AcMagScale::Db => if mag > 0.0 { 20.0*mag.log10() } else { -200.0 }, AcMagScale::Linear => mag } * mag_y_mult;
+                        let x = if matches!(mag_scale, AcMagScale::Db) { (freq * x_mult).log10() } else { freq * x_mult };
+                        [x, y]
+                    }).collect();
+                    plot_branch_current_mag(plot_ui, format!("I(C{})", i+1), data, PLOT_COLORS[color_idx % PLOT_COLORS.len()]);
+                    color_idx += 1;
+                }
+                for i in 0..nl {
+                    let data: Vec<[f64;2]> = points_snapshot.iter().map(|(freq, _, b)| {
+                        let mag = b.inductors.get(i).map(|c| c.norm()).unwrap_or(0.0);
+                        let y = match mag_scale { AcMagScale::Db => if mag > 0.0 { 20.0*mag.log10() } else { -200.0 }, AcMagScale::Linear => mag } * mag_y_mult;
+                        let x = if matches!(mag_scale, AcMagScale::Db) { (freq * x_mult).log10() } else { freq * x_mult };
+                        [x, y]
+                    }).collect();
+                    plot_branch_current_mag(plot_ui, format!("I(L{})", i+1), data, PLOT_COLORS[color_idx % PLOT_COLORS.len()]);
+                    color_idx += 1;
+                }
+                for i in 0..nv {
+                    let data: Vec<[f64;2]> = points_snapshot.iter().map(|(freq, _, b)| {
+                        let mag = b.voltage_sources.get(i).map(|c| c.norm()).unwrap_or(0.0);
+                        let y = match mag_scale { AcMagScale::Db => if mag > 0.0 { 20.0*mag.log10() } else { -200.0 }, AcMagScale::Linear => mag } * mag_y_mult;
+                        let x = if matches!(mag_scale, AcMagScale::Db) { (freq * x_mult).log10() } else { freq * x_mult };
+                        [x, y]
+                    }).collect();
+                    plot_branch_current_mag(plot_ui, format!("I(V{})", i+1), data, PLOT_COLORS[color_idx % PLOT_COLORS.len()]);
+                    color_idx += 1;
+                }
+                for i in 0..nd {
+                    let data: Vec<[f64;2]> = points_snapshot.iter().map(|(freq, _, b)| {
+                        let mag = b.diodes.get(i).map(|c| c.norm()).unwrap_or(0.0);
+                        let y = match mag_scale { AcMagScale::Db => if mag > 0.0 { 20.0*mag.log10() } else { -200.0 }, AcMagScale::Linear => mag } * mag_y_mult;
+                        let x = if matches!(mag_scale, AcMagScale::Db) { (freq * x_mult).log10() } else { freq * x_mult };
+                        [x, y]
+                    }).collect();
+                    plot_branch_current_mag(plot_ui, format!("I(D{})", i+1), data, PLOT_COLORS[color_idx % PLOT_COLORS.len()]);
+                    color_idx += 1;
+                }
+                let _ = color_idx;
+            });
+        });
+
+        ui.add_space(8.0);
+
+        // ── Branch current phase plot ─────────────────────────────────────────
+        code_frame().show(ui, |ui| {
+            let mut plot = Plot::new("ac_branch_current_phase")
+            .height(half_h.max(120.0))
+            .x_axis_label("frequency (Hz)")
+            .y_axis_label("current phase (°)")
+            .legend(Legend::default().position(egui_plot::Corner::RightTop))
+            .show_background(true)
+            .allow_scroll(true)
+            .allow_drag(true)
+            .allow_boxed_zoom(true);
+
+            plot = match mag_scale {
+                AcMagScale::Db => plot
+                    .x_grid_spacer(egui_plot::log_grid_spacer(10))
+                    .label_formatter(|name, val| {
+                        if name.is_empty() { return String::new(); }
+                        let f = 10.0_f64.powf(val.x);
+                        format!("{}\nf = {:.3e} Hz\nphase = {:.2}°", name, f, val.y)
+                    }),
+                AcMagScale::Linear => plot
+                    .label_formatter(|name, val| {
+                        if name.is_empty() { return String::new(); }
+                        format!("{}\nf = {:.3e} Hz\nphase = {:.2}°", name, val.x, val.y)
+                    }),
+            };
+
+            plot.show(ui, |plot_ui| {
+                let mut color_idx = 0usize;
+                let (nr, nc, nl, nv, nd) = points_snapshot.first().map(|(_, _, b)| {
+                    (b.resistors.len(), b.capacitors.len(), b.inductors.len(),
+                     b.voltage_sources.len(), b.diodes.len())
+                }).unwrap_or((0,0,0,0,0));
+
+                let plot_phase = |plot_ui: &mut egui_plot::PlotUi, name: String, data: Vec<[f64;2]>, color: egui::Color32| {
+                    plot_ui.line(Line::new(PlotPoints::new(data)).name(name).color(color).width(2.0));
+                };
+
+                for i in 0..nr {
+                    let data: Vec<[f64;2]> = points_snapshot.iter().map(|(freq, _, b)| {
+                        let phase = b.resistors.get(i).map(|c| c.arg().to_degrees()).unwrap_or(0.0) * phase_y_mult;
+                        let x = if matches!(mag_scale, AcMagScale::Db) { (freq * x_mult).log10() } else { freq * x_mult };
+                        [x, phase]
+                    }).collect();
+                    plot_phase(plot_ui, format!("I(R{}) phase", i+1), data, PLOT_COLORS[color_idx % PLOT_COLORS.len()]);
+                    color_idx += 1;
+                }
+                for i in 0..nc {
+                    let data: Vec<[f64;2]> = points_snapshot.iter().map(|(freq, _, b)| {
+                        let phase = b.capacitors.get(i).map(|c| c.arg().to_degrees()).unwrap_or(0.0) * phase_y_mult;
+                        let x = if matches!(mag_scale, AcMagScale::Db) { (freq * x_mult).log10() } else { freq * x_mult };
+                        [x, phase]
+                    }).collect();
+                    plot_phase(plot_ui, format!("I(C{}) phase", i+1), data, PLOT_COLORS[color_idx % PLOT_COLORS.len()]);
+                    color_idx += 1;
+                }
+                for i in 0..nl {
+                    let data: Vec<[f64;2]> = points_snapshot.iter().map(|(freq, _, b)| {
+                        let phase = b.inductors.get(i).map(|c| c.arg().to_degrees()).unwrap_or(0.0) * phase_y_mult;
+                        let x = if matches!(mag_scale, AcMagScale::Db) { (freq * x_mult).log10() } else { freq * x_mult };
+                        [x, phase]
+                    }).collect();
+                    plot_phase(plot_ui, format!("I(L{}) phase", i+1), data, PLOT_COLORS[color_idx % PLOT_COLORS.len()]);
+                    color_idx += 1;
+                }
+                for i in 0..nv {
+                    let data: Vec<[f64;2]> = points_snapshot.iter().map(|(freq, _, b)| {
+                        let phase = b.voltage_sources.get(i).map(|c| c.arg().to_degrees()).unwrap_or(0.0) * phase_y_mult;
+                        let x = if matches!(mag_scale, AcMagScale::Db) { (freq * x_mult).log10() } else { freq * x_mult };
+                        [x, phase]
+                    }).collect();
+                    plot_phase(plot_ui, format!("I(V{}) phase", i+1), data, PLOT_COLORS[color_idx % PLOT_COLORS.len()]);
+                    color_idx += 1;
+                }
+                for i in 0..nd {
+                    let data: Vec<[f64;2]> = points_snapshot.iter().map(|(freq, _, b)| {
+                        let phase = b.diodes.get(i).map(|c| c.arg().to_degrees()).unwrap_or(0.0) * phase_y_mult;
+                        let x = if matches!(mag_scale, AcMagScale::Db) { (freq * x_mult).log10() } else { freq * x_mult };
+                        [x, phase]
+                    }).collect();
+                    plot_phase(plot_ui, format!("I(D{}) phase", i+1), data, PLOT_COLORS[color_idx % PLOT_COLORS.len()]);
+                    color_idx += 1;
+                }
+                let _ = color_idx;
+            });
+        });
+
+        // Toggle off the bounds application after all plots have processed it
         self.ac_apply_plot_bounds = false;
     }
 

@@ -351,7 +351,8 @@ impl CircuitSimApp {
             points.insert(w.p2);
         }
 
-        let pt_list: Vec<GridPt> = points.into_iter().collect();
+        let mut pt_list: Vec<GridPt> = points.into_iter().collect();
+        pt_list.sort_by_key(|p| (p.0, p.1));
         let mut pt_to_idx: HashMap<GridPt, usize> = HashMap::new();
         for (i, &pt) in pt_list.iter().enumerate() {
             pt_to_idx.insert(pt, i);

@@ -1,22 +1,27 @@
-use crate::ac_mna::{build_ac, node_voltage_complex};
+use crate::ac_mna::{build_ac, compute_ac_branch_currents, node_voltage_complex, AcBranchCurrents};
 use crate::circuit::Circuit;
 use crate::error::{Result, SimError};
 use crate::mna::{
-    build_dc, build_transient, node_voltage, update_transient_state, TransientState,
+    build_dc, build_transient, compute_branch_currents, node_voltage, update_transient_state,
+    BranchCurrents, TransientState,
 };
 use crate::netlist::AnalysisCommands;
 use num_complex::Complex64;
 
 #[derive(Debug, Clone)]
 pub struct DcResult {
-    pub node_voltages: Vec<f64>,
+    pub node_voltages:   Vec<f64>,
     pub source_currents: Vec<f64>,
+    /// Branch current through every circuit element (n1→n2 convention).
+    pub branch_currents: BranchCurrents,
 }
 
 #[derive(Debug, Clone)]
 pub struct TranPoint {
-    pub time: f64,
-    pub node_voltages: Vec<f64>,
+    pub time:            f64,
+    pub node_voltages:   Vec<f64>,
+    /// Branch current through every circuit element at this time point.
+    pub branch_currents: BranchCurrents,
 }
 
 #[derive(Debug, Clone)]
@@ -27,10 +32,11 @@ pub struct TranResult {
 /// One frequency point in an AC sweep.
 #[derive(Debug, Clone)]
 pub struct AcPoint {
-    /// Frequency in Hz.
-    pub freq: f64,
-    /// Complex phasor voltage at each node (index matches circuit.nodes; node 0 = ground = 0+0j).
-    pub node_voltages: Vec<Complex64>,
+    pub freq:            f64,
+    /// Complex phasor voltage at each node.
+    pub node_voltages:   Vec<Complex64>,
+    /// Complex phasor branch currents through every circuit element.
+    pub branch_currents: AcBranchCurrents,
 }
 
 /// Result of a small-signal AC (frequency sweep) analysis.
@@ -143,15 +149,14 @@ fn extract_dc(circuit: &Circuit, x: &nalgebra::DVector<f64>) -> DcResult {
     }
     let n_nodes = circuit.nodes.saturating_sub(1);
     let source_currents = circuit
-    .voltage_sources
-    .iter()
-    .enumerate()
-    .map(|(i, _)| x[n_nodes + i])
-    .collect();
-    DcResult {
-        node_voltages,
-        source_currents,
-    }
+        .voltage_sources
+        .iter()
+        .enumerate()
+        .map(|(i, _)| x[n_nodes + i])
+        .collect();
+    // DC: no capacitor current (steady state), so pass None for dt/prev.
+    let branch_currents = compute_branch_currents(circuit, x, None, None);
+    DcResult { node_voltages, source_currents, branch_currents }
 }
 
 pub fn run_transient(
@@ -181,6 +186,8 @@ pub fn run_transient(
     points.push(TranPoint {
         time: t_start,
         node_voltages: initial_voltages,
+        // DC steady-state: capacitor current is zero.
+        branch_currents: compute_branch_currents(circuit, &dc_x, None, None),
     });
 
     let mut t = t_start + dt;
@@ -212,13 +219,19 @@ pub fn run_transient(
             return Err(SimError::Analysis(format!("Transient failed to converge at t={}", t)));
         }
 
+        // Capture previous cap voltages before updating state, needed for I_C.
+        let prev_cap_voltages = state.capacitor_voltages.clone();
         update_transient_state(circuit, &x, &mut state);
+
+        let branch_currents = compute_branch_currents(
+            circuit, &x, Some(dt), Some(&prev_cap_voltages),
+        );
 
         let mut node_voltages = vec![0.0; circuit.nodes];
         for i in 1..circuit.nodes {
             node_voltages[i] = node_voltage(&x, crate::circuit::NodeId(i));
         }
-        points.push(TranPoint { time: t, node_voltages });
+        points.push(TranPoint { time: t, node_voltages, branch_currents });
 
         t += dt;
         step += 1;
@@ -263,26 +276,26 @@ pub fn ac_frequencies(cmd: &AcCommand) -> Vec<f64> {
         AcScale::Lin => {
             let n = cmd.points.max(2);
             (0..n)
-                .map(|i| cmd.f_start + (cmd.f_stop - cmd.f_start) * i as f64 / (n - 1) as f64)
-                .collect()
+            .map(|i| cmd.f_start + (cmd.f_stop - cmd.f_start) * i as f64 / (n - 1) as f64)
+            .collect()
         }
         AcScale::Dec => {
             let decades = (cmd.f_stop / cmd.f_start).log10();
             let total = (decades * cmd.points as f64).round() as usize + 1;
             (0..total)
-                .map(|i| {
-                    cmd.f_start * 10f64.powf(decades * i as f64 / (total - 1) as f64)
-                })
-                .collect()
+            .map(|i| {
+                cmd.f_start * 10f64.powf(decades * i as f64 / (total - 1) as f64)
+            })
+            .collect()
         }
         AcScale::Oct => {
             let octaves = (cmd.f_stop / cmd.f_start).log2();
             let total = (octaves * cmd.points as f64).round() as usize + 1;
             (0..total)
-                .map(|i| {
-                    cmd.f_start * 2f64.powf(octaves * i as f64 / (total - 1) as f64)
-                })
-                .collect()
+            .map(|i| {
+                cmd.f_start * 2f64.powf(octaves * i as f64 / (total - 1) as f64)
+            })
+            .collect()
         }
     }
 }
@@ -314,8 +327,8 @@ pub fn run_ac_sweep(circuit: &Circuit, cmd: &AcCommand, dc_x: &nalgebra::DVector
     if stim_idx >= circuit.voltage_sources.len() {
         return Err(SimError::Analysis(format!(
             "stimulus source index {} out of range (circuit has {} voltage sources)",
-            stim_idx,
-            circuit.voltage_sources.len()
+                                              stim_idx,
+                                              circuit.voltage_sources.len()
         )));
     }
     let stim_branch = circuit.nodes.saturating_sub(1) + stim_idx;
@@ -334,16 +347,17 @@ pub fn run_ac_sweep(circuit: &Circuit, cmd: &AcCommand, dc_x: &nalgebra::DVector
 
         let x = sys.solve()?;
 
-        let mut node_voltages = vec![num_complex::Complex64::new(0.0, 0.0); circuit.nodes];
+        let mut node_voltages = vec![Complex64::new(0.0, 0.0); circuit.nodes];
         for i in 1..circuit.nodes {
             node_voltages[i] = node_voltage_complex(&x, crate::circuit::NodeId(i));
         }
+        let branch_currents = compute_ac_branch_currents(circuit, &x, freq, dc_x);
 
-        points.push(AcPoint { freq, node_voltages });
+        points.push(AcPoint { freq, node_voltages, branch_currents });
     }
 
     Ok(AcResult {
         points,
-        stimulus_node: stim_node.0,
+       stimulus_node: stim_node.0,
     })
 }

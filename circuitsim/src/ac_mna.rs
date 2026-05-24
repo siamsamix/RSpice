@@ -154,3 +154,75 @@ pub fn node_voltage_real(solution: &DVector<f64>, node: NodeId) -> f64 {
 pub fn node_voltage_complex(solution: &DVector<Complex64>, node: NodeId) -> Complex64 {
     node_index(node).map(|i| solution[i]).unwrap_or(Complex64::new(0.0, 0.0))
 }
+
+/// Complex branch currents for every element in the circuit (AC small-signal).
+/// Each Vec is parallel to the corresponding Vec in `Circuit`.
+/// Positive convention: phasor current flows from n1 to n2 through the element.
+#[derive(Debug, Clone, Default)]
+pub struct AcBranchCurrents {
+    pub resistors:       Vec<Complex64>,
+    pub capacitors:      Vec<Complex64>,
+    pub inductors:       Vec<Complex64>,
+    pub voltage_sources: Vec<Complex64>,
+    pub diodes:          Vec<Complex64>,
+}
+
+/// Compute small-signal AC branch currents from a solved AC system.
+///
+/// * `solution`    — solved complex MNA unknown vector at this frequency.
+/// * `freq`        — frequency in Hz (used to compute ωC for capacitors).
+/// * `dc_solution` — DC operating-point vector (linearises diode conductance).
+///
+/// Positive convention: phasor current flows n1 → n2 through the element.
+pub fn compute_ac_branch_currents(
+    circuit: &Circuit,
+    solution: &DVector<Complex64>,
+    freq: f64,
+    dc_solution: &DVector<f64>,
+) -> AcBranchCurrents {
+    let omega   = 2.0 * std::f64::consts::PI * freq;
+    let n_nodes = circuit.nodes.saturating_sub(1);
+    let one     = Complex64::new(1.0, 0.0);
+
+    // ── Resistors: I = (V_n1 - V_n2) / R ────────────────────────────────
+    let resistors = circuit.resistors.iter().map(|r| {
+        let v1 = node_voltage_complex(solution, r.n1);
+        let v2 = node_voltage_complex(solution, r.n2);
+        (v1 - v2) * (one / r.resistance)
+    }).collect();
+
+    // ── Capacitors: I = jωC * (V_n1 - V_n2) ─────────────────────────────
+    let capacitors = circuit.capacitors.iter().map(|c| {
+        let v1 = node_voltage_complex(solution, c.n1);
+        let v2 = node_voltage_complex(solution, c.n2);
+        Complex64::new(0.0, omega * c.capacitance) * (v1 - v2)
+    }).collect();
+
+    // ── Inductors: branch unknown in solution vector ──────────────────────
+    let inductor_branch_base = n_nodes + circuit.voltage_sources.len();
+    let inductors = circuit.inductors.iter().enumerate().map(|(i, _)| {
+        solution[inductor_branch_base + i]
+    }).collect();
+
+    // ── Voltage sources: branch unknown in solution vector ────────────────
+    // Negated to match n1→n2 passive convention (see mna.rs note).
+    let voltage_sources = circuit.voltage_sources.iter().enumerate().map(|(i, _)| {
+        -solution[n_nodes + i]
+    }).collect();
+
+    // ── Diodes: linearised small-signal conductance gd * (V_a - V_c) ─────
+    let diodes = circuit.diodes.iter().map(|d| {
+        let model = circuit.diode_models.get(&d.model)
+            .expect("diode model not found in compute_ac_branch_currents");
+        let v_a_dc = node_voltage_real(dc_solution, d.anode);
+        let v_c_dc = node_voltage_real(dc_solution, d.cathode);
+        let vd     = (v_a_dc - v_c_dc).clamp(-100.0, 0.8);
+        let vt_n   = model.n * 0.02585;
+        let gd     = (model.is / vt_n) * (vd / vt_n).exp();
+        let va_ac  = node_voltage_complex(solution, d.anode);
+        let vc_ac  = node_voltage_complex(solution, d.cathode);
+        Complex64::new(gd, 0.0) * (va_ac - vc_ac)
+    }).collect();
+
+    AcBranchCurrents { resistors, capacitors, inductors, voltage_sources, diodes }
+}

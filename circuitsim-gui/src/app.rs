@@ -229,6 +229,13 @@ enum ResultTab {
     FreqResponse,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq, Default)]
+enum TranSubTab {
+    #[default]
+    Voltage,
+    Current,
+}
+
 /// Which quantity to show on the frequency-response magnitude plot.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum AcMagScale { Db, Linear }
@@ -249,6 +256,7 @@ pub struct CircuitSimApp {
     ac_plot_nodes: Vec<bool>,
     ac_mag_scale: AcMagScale,
     result_tab: ResultTab,
+    tran_sub_tab: TranSubTab,
     editor_mode: EditorMode,
     schematic: SchematicState,
     plot_x_scale: String,
@@ -285,6 +293,7 @@ impl Default for CircuitSimApp {
             ac_plot_nodes: vec![false; 16],
             ac_mag_scale: AcMagScale::default(),
             result_tab: ResultTab::Overview,
+            tran_sub_tab: TranSubTab::default(),
             editor_mode: EditorMode::Text,
             schematic: SchematicState::default(),
             plot_x_scale: "1.0".to_string(),
@@ -1968,203 +1977,154 @@ impl CircuitSimApp {
             return;
         };
 
-        ui.horizontal_wrapped(|ui| {
-            ui.label(egui::RichText::new("Plot nodes:").color(TEXT_SECONDARY));
-            for i in 1..self.plot_nodes.len() {
-                let mut on = self.plot_nodes[i];
-                if ui.checkbox(&mut on, format!("V({i})")).changed() {
-                    self.plot_nodes[i] = on;
-                }
-            }
+        // ── Sub-tab bar ───────────────────────────────────────────────────────
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut self.tran_sub_tab, TranSubTab::Voltage, "Voltage");
+            ui.selectable_value(&mut self.tran_sub_tab, TranSubTab::Current, "Current");
         });
-
-        // NEW: Scaling and Limits Controls
-        ui.horizontal_wrapped(|ui| {
-            /*ui.label(egui::RichText::new("Mult X:").color(TEXT_SECONDARY));
-             *           ui.add(egui::TextEdit::singleline(&mut self.plot_x_scale).desired_width(40.0));
-             *           ui.label(egui::RichText::new("Mult Y:").color(TEXT_SECONDARY));
-             *           ui.add(egui::TextEdit::singleline(&mut self.plot_y_scale).desired_width(40.0));
-             *
-             *           ui.separator();
-             *
-             *           ui.label(egui::RichText::new("Limits X [").color(TEXT_SECONDARY));
-             *           ui.add(egui::TextEdit::singleline(&mut self.plot_x_min).desired_width(40.0));
-             *           ui.label(",");
-             *           ui.add(egui::TextEdit::singleline(&mut self.plot_x_max).desired_width(40.0));
-             *           ui.label("]");
-             *
-             *           ui.label(egui::RichText::new("Y [").color(TEXT_SECONDARY));
-             *           ui.add(egui::TextEdit::singleline(&mut self.plot_y_min).desired_width(40.0));
-             *           ui.label(",");
-             *           ui.add(egui::TextEdit::singleline(&mut self.plot_y_max).desired_width(40.0));
-             *           ui.label("]");
-             *
-             *           if ui.button("Apply").clicked() {
-             *               self.apply_plot_bounds = true;
-        }*/
-            if ui.button("Auto Fit").clicked() {
-                self.plot_x_min.clear();
-                self.plot_x_max.clear();
-                self.plot_y_min.clear();
-                self.plot_y_max.clear();
-                self.apply_plot_bounds = true;
-            }
-        });
-
-        ui.add_space(8.0);
+        ui.separator();
 
         let x_mult = self.plot_x_scale.parse::<f64>().unwrap_or(1.0);
         let y_mult = self.plot_y_scale.parse::<f64>().unwrap_or(1.0);
+        let plot_h = (ui.available_height() - 8.0).max(120.0);
 
-        let half_h = ((ui.available_height() - 24.0) / 2.0).max(120.0);
-
-        code_frame()
-        .show(ui, |ui| {
-            let plot = Plot::new("waveforms")
-            .height(half_h)
-            .x_axis_label("time (s)")
-            .y_axis_label("voltage (V)")
-            .legend(Legend::default().position(egui_plot::Corner::RightTop))
-            .show_background(true)
-            .allow_scroll(true)
-            .allow_drag(true)
-            .allow_boxed_zoom(true);
-
-            plot.show(ui, |plot_ui| {
-
-                // NEW: Apply Manual View Bounds
-                // NEW: Apply Manual View Bounds
-                if self.apply_plot_bounds {
-                    // Check if user cleared all inputs to trigger an auto-fit reset
-                    if self.plot_x_min.is_empty() && self.plot_x_max.is_empty()
-                        && self.plot_y_min.is_empty() && self.plot_y_max.is_empty() {
-                            plot_ui.set_auto_bounds(egui::Vec2b::new(true, true));
-                        } else {
-                            // TURN OFF AUTO BOUNDS so manual bounds aren't immediately overridden
-                            plot_ui.set_auto_bounds(egui::Vec2b::new(false, false));
-
-                            let current = plot_ui.plot_bounds();
-                            let mut x_min = current.min()[0];
-                            let mut x_max = current.max()[0];
-                            let mut y_min = current.min()[1];
-                            let mut y_max = current.max()[1];
-
-                            // Override only the fields the user has typed into
-                            if let Ok(v) = self.plot_x_min.parse::<f64>() { x_min = v; }
-                            if let Ok(v) = self.plot_x_max.parse::<f64>() { x_max = v; }
-                            if let Ok(v) = self.plot_y_min.parse::<f64>() { y_min = v; }
-                            if let Ok(v) = self.plot_y_max.parse::<f64>() { y_max = v; }
-
-                            // Prevent panics if the user types min >= max
-                            let safe_x_min = x_min.min(x_max);
-                            let safe_x_max = if x_min == x_max { x_max + 1e-6 } else { x_min.max(x_max) };
-                            let safe_y_min = y_min.min(y_max);
-                            let safe_y_max = if y_min == y_max { y_max + 1e-6 } else { y_min.max(y_max) };
-
-                            plot_ui.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
-                                [safe_x_min, safe_y_min],
-                                [safe_x_max, safe_y_max],
-                            ));
+        match self.tran_sub_tab {
+            TranSubTab::Voltage => {
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("Plot nodes:").color(TEXT_SECONDARY));
+                    for i in 1..self.plot_nodes.len() {
+                        let mut on = self.plot_nodes[i];
+                        if ui.checkbox(&mut on, format!("V({i})")).changed() {
+                            self.plot_nodes[i] = on;
                         }
-                        self.apply_plot_bounds = false; // Execute once per click
-                }
-
-                for (node, &enabled) in self.plot_nodes.iter().enumerate() {
-                    if !enabled || node == 0 {
-                        continue;
                     }
-                    let points: PlotPoints = tran
-                    .points
-                    .iter()
-                    .map(|p| {
-                        [
-                            (p.time as f64) * x_mult,
-                         (p.node_voltages.get(node).copied().unwrap_or(0.0) as f64) * y_mult,
-                        ]
-                    })
-                    .collect();
-                    let color = PLOT_COLORS[node % PLOT_COLORS.len()];
-                    plot_ui.line(
-                        Line::new(points)
-                        .name(format!("V({node})"))
-                        .color(color)
-                        .width(2.0),
-                    );
-                }
-            });
-        });
+                });
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Auto Fit").clicked() {
+                        self.plot_x_min.clear();
+                        self.plot_x_max.clear();
+                        self.plot_y_min.clear();
+                        self.plot_y_max.clear();
+                        self.apply_plot_bounds = true;
+                    }
+                });
+                ui.add_space(8.0);
 
-        ui.add_space(8.0);
+                code_frame().show(ui, |ui| {
+                    let plot = Plot::new("waveforms")
+                    .height(plot_h)
+                    .x_axis_label("time (s)")
+                    .y_axis_label("voltage (V)")
+                    .legend(Legend::default().position(egui_plot::Corner::RightTop))
+                    .show_background(true)
+                    .allow_scroll(true)
+                    .allow_drag(true)
+                    .allow_boxed_zoom(true);
 
-        // ── Branch current waveforms ──────────────────────────────────────────
-        code_frame().show(ui, |ui| {
-            let plot = Plot::new("waveforms_current")
-            .height(half_h)
-            .x_axis_label("time (s)")
-            .y_axis_label("current (A)")
-            .legend(Legend::default().position(egui_plot::Corner::RightTop))
-            .show_background(true)
-            .allow_scroll(true)
-            .allow_drag(true)
-            .allow_boxed_zoom(true);
+                    plot.show(ui, |plot_ui| {
+                        if self.apply_plot_bounds {
+                            if self.plot_x_min.is_empty() && self.plot_x_max.is_empty()
+                                && self.plot_y_min.is_empty() && self.plot_y_max.is_empty() {
+                                plot_ui.set_auto_bounds(egui::Vec2b::new(true, true));
+                            } else {
+                                plot_ui.set_auto_bounds(egui::Vec2b::new(false, false));
+                                let cur = plot_ui.plot_bounds();
+                                let mut x_min = cur.min()[0]; let mut x_max = cur.max()[0];
+                                let mut y_min = cur.min()[1]; let mut y_max = cur.max()[1];
+                                if let Ok(v) = self.plot_x_min.parse::<f64>() { x_min = v; }
+                                if let Ok(v) = self.plot_x_max.parse::<f64>() { x_max = v; }
+                                if let Ok(v) = self.plot_y_min.parse::<f64>() { y_min = v; }
+                                if let Ok(v) = self.plot_y_max.parse::<f64>() { y_max = v; }
+                                let safe_x_min = x_min.min(x_max);
+                                let safe_x_max = if x_min == x_max { x_max + 1e-6 } else { x_min.max(x_max) };
+                                let safe_y_min = y_min.min(y_max);
+                                let safe_y_max = if y_min == y_max { y_max + 1e-6 } else { y_min.max(y_max) };
+                                plot_ui.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
+                                    [safe_x_min, safe_y_min], [safe_x_max, safe_y_max],
+                                ));
+                            }
+                            self.apply_plot_bounds = false;
+                        }
 
-            plot.show(ui, |plot_ui| {
-                // Helper: build one line from a per-point extractor closure.
-                // We iterate all element types in order R, C, L, V, D.
-                let mut color_idx = 0usize;
+                        for (node, &enabled) in self.plot_nodes.iter().enumerate() {
+                            if !enabled || node == 0 { continue; }
+                            let points: PlotPoints = tran.points.iter().map(|p| {
+                                [p.time * x_mult,
+                                 p.node_voltages.get(node).copied().unwrap_or(0.0) * y_mult]
+                            }).collect();
+                            let color = PLOT_COLORS[node % PLOT_COLORS.len()];
+                            plot_ui.line(Line::new(points).name(format!("V({node})")).color(color).width(2.0));
+                        }
+                    });
+                });
+            }
 
-                // Resistors
-                let nr = tran.points.first().map(|p| p.branch_currents.resistors.len()).unwrap_or(0);
-                for i in 0..nr {
-                    let pts: PlotPoints = tran.points.iter().map(|p| {
-                        [p.time * x_mult, p.branch_currents.resistors.get(i).copied().unwrap_or(0.0) * y_mult]
-                    }).collect();
-                    plot_ui.line(Line::new(pts).name(format!("I(R{})", i + 1))
-                        .color(PLOT_COLORS[color_idx % PLOT_COLORS.len()]).width(2.0));
-                    color_idx += 1;
-                }
-                // Capacitors
-                let nc = tran.points.first().map(|p| p.branch_currents.capacitors.len()).unwrap_or(0);
-                for i in 0..nc {
-                    let pts: PlotPoints = tran.points.iter().map(|p| {
-                        [p.time * x_mult, p.branch_currents.capacitors.get(i).copied().unwrap_or(0.0) * y_mult]
-                    }).collect();
-                    plot_ui.line(Line::new(pts).name(format!("I(C{})", i + 1))
-                        .color(PLOT_COLORS[color_idx % PLOT_COLORS.len()]).width(2.0));
-                    color_idx += 1;
-                }
-                // Inductors
-                let nl = tran.points.first().map(|p| p.branch_currents.inductors.len()).unwrap_or(0);
-                for i in 0..nl {
-                    let pts: PlotPoints = tran.points.iter().map(|p| {
-                        [p.time * x_mult, p.branch_currents.inductors.get(i).copied().unwrap_or(0.0) * y_mult]
-                    }).collect();
-                    plot_ui.line(Line::new(pts).name(format!("I(L{})", i + 1))
-                        .color(PLOT_COLORS[color_idx % PLOT_COLORS.len()]).width(2.0));
-                    color_idx += 1;
-                }
-                // Voltage sources
-                let nv = tran.points.first().map(|p| p.branch_currents.voltage_sources.len()).unwrap_or(0);
-                for i in 0..nv {
-                    let pts: PlotPoints = tran.points.iter().map(|p| {
-                        [p.time * x_mult, p.branch_currents.voltage_sources.get(i).copied().unwrap_or(0.0) * y_mult]
-                    }).collect();
-                    plot_ui.line(Line::new(pts).name(format!("I(V{})", i + 1))
-                        .color(PLOT_COLORS[color_idx % PLOT_COLORS.len()]).width(2.0));
-                    color_idx += 1;
-                }
-                // Diodes
-                let nd = tran.points.first().map(|p| p.branch_currents.diodes.len()).unwrap_or(0);
-                for i in 0..nd {
-                    let pts: PlotPoints = tran.points.iter().map(|p| {
-                        [p.time * x_mult, p.branch_currents.diodes.get(i).copied().unwrap_or(0.0) * y_mult]
-                    }).collect();
-                    plot_ui.line(Line::new(pts).name(format!("I(D{})", i + 1))
-                        .color(PLOT_COLORS[color_idx % PLOT_COLORS.len()]).width(2.0));
-                    color_idx += 1;
-                }
-            });
-        });
+            TranSubTab::Current => {
+                ui.add_space(8.0);
+                code_frame().show(ui, |ui| {
+                    let plot = Plot::new("waveforms_current")
+                    .height(plot_h)
+                    .x_axis_label("time (s)")
+                    .y_axis_label("current (A)")
+                    .legend(Legend::default().position(egui_plot::Corner::RightTop))
+                    .show_background(true)
+                    .allow_scroll(true)
+                    .allow_drag(true)
+                    .allow_boxed_zoom(true);
+
+                    plot.show(ui, |plot_ui| {
+                        let mut color_idx = 0usize;
+
+                        let nr = tran.points.first().map(|p| p.branch_currents.resistors.len()).unwrap_or(0);
+                        for i in 0..nr {
+                            let pts: PlotPoints = tran.points.iter().map(|p| {
+                                [p.time * x_mult, p.branch_currents.resistors.get(i).copied().unwrap_or(0.0) * y_mult]
+                            }).collect();
+                            plot_ui.line(Line::new(pts).name(format!("I(R{})", i + 1))
+                                .color(PLOT_COLORS[color_idx % PLOT_COLORS.len()]).width(2.0));
+                            color_idx += 1;
+                        }
+                        let nc = tran.points.first().map(|p| p.branch_currents.capacitors.len()).unwrap_or(0);
+                        for i in 0..nc {
+                            let pts: PlotPoints = tran.points.iter().map(|p| {
+                                [p.time * x_mult, p.branch_currents.capacitors.get(i).copied().unwrap_or(0.0) * y_mult]
+                            }).collect();
+                            plot_ui.line(Line::new(pts).name(format!("I(C{})", i + 1))
+                                .color(PLOT_COLORS[color_idx % PLOT_COLORS.len()]).width(2.0));
+                            color_idx += 1;
+                        }
+                        let nl = tran.points.first().map(|p| p.branch_currents.inductors.len()).unwrap_or(0);
+                        for i in 0..nl {
+                            let pts: PlotPoints = tran.points.iter().map(|p| {
+                                [p.time * x_mult, p.branch_currents.inductors.get(i).copied().unwrap_or(0.0) * y_mult]
+                            }).collect();
+                            plot_ui.line(Line::new(pts).name(format!("I(L{})", i + 1))
+                                .color(PLOT_COLORS[color_idx % PLOT_COLORS.len()]).width(2.0));
+                            color_idx += 1;
+                        }
+                        let nv = tran.points.first().map(|p| p.branch_currents.voltage_sources.len()).unwrap_or(0);
+                        for i in 0..nv {
+                            let pts: PlotPoints = tran.points.iter().map(|p| {
+                                [p.time * x_mult, p.branch_currents.voltage_sources.get(i).copied().unwrap_or(0.0) * y_mult]
+                            }).collect();
+                            plot_ui.line(Line::new(pts).name(format!("I(V{})", i + 1))
+                                .color(PLOT_COLORS[color_idx % PLOT_COLORS.len()]).width(2.0));
+                            color_idx += 1;
+                        }
+                        let nd = tran.points.first().map(|p| p.branch_currents.diodes.len()).unwrap_or(0);
+                        for i in 0..nd {
+                            let pts: PlotPoints = tran.points.iter().map(|p| {
+                                [p.time * x_mult, p.branch_currents.diodes.get(i).copied().unwrap_or(0.0) * y_mult]
+                            }).collect();
+                            plot_ui.line(Line::new(pts).name(format!("I(D{})", i + 1))
+                                .color(PLOT_COLORS[color_idx % PLOT_COLORS.len()]).width(2.0));
+                            color_idx += 1;
+                        }
+                        let _ = color_idx;
+                    });
+                });
+            }
+        }
     }
     fn freq_response_tab(&mut self, ui: &mut egui::Ui) {
         let Some(ac) = &self.ac else {

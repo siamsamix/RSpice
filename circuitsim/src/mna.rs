@@ -215,6 +215,87 @@ pub fn node_voltage(solution: &DVector<f64>, node: NodeId) -> f64 {
     .unwrap_or(0.0)
 }
 
+/// Branch currents for every element in the circuit.
+/// Each Vec is parallel to the corresponding Vec in `Circuit`
+/// (e.g. `resistors[i]` is the current through `circuit.resistors[i]`).
+/// Positive convention: current flows from the element's n1 to n2.
+#[derive(Debug, Clone, Default)]
+pub struct BranchCurrents {
+    pub resistors:       Vec<f64>,
+    pub capacitors:      Vec<f64>,
+    pub inductors:       Vec<f64>,
+    pub voltage_sources: Vec<f64>,
+    pub diodes:          Vec<f64>,
+}
+
+/// Compute branch currents for a converged DC or transient solution.
+///
+/// * `solution`          — the solved MNA unknown vector.
+/// * `dt` / `prev_cap_voltages` — supply both for transient (backward-Euler
+///   capacitor current).  Pass `None`/`None` for the DC case (capacitor
+///   current is zero at steady state).
+///
+/// Positive current means conventional current flows from n1 → n2 through
+/// the element.
+pub fn compute_branch_currents(
+    circuit: &Circuit,
+    solution: &DVector<f64>,
+    dt: Option<f64>,
+    prev_cap_voltages: Option<&[f64]>,
+) -> BranchCurrents {
+    let n_nodes = circuit.nodes.saturating_sub(1);
+
+    // ── Resistors: I = (V_n1 - V_n2) / R ────────────────────────────────
+    let resistors = circuit.resistors.iter().map(|r| {
+        let v1 = node_voltage(solution, r.n1);
+        let v2 = node_voltage(solution, r.n2);
+        (v1 - v2) / r.resistance
+    }).collect();
+
+    // ── Capacitors: I = C * (V_now - V_prev) / dt (backward Euler) ───────
+    // Zero at DC steady state.
+    let capacitors = circuit.capacitors.iter().enumerate().map(|(i, c)| {
+        match (dt, prev_cap_voltages) {
+            (Some(dt_val), Some(prev)) => {
+                let v1 = node_voltage(solution, c.n1);
+                let v2 = node_voltage(solution, c.n2);
+                let v_now  = v1 - v2;
+                let v_prev = prev.get(i).copied().unwrap_or(0.0);
+                c.capacitance * (v_now - v_prev) / dt_val
+            }
+            _ => 0.0,
+        }
+    }).collect();
+
+    // ── Inductors: branch unknown directly in solution vector ─────────────
+    let inductor_branch_base = n_nodes + circuit.voltage_sources.len();
+    let inductors = circuit.inductors.iter().enumerate().map(|(i, _)| {
+        solution[inductor_branch_base + i]
+    }).collect();
+
+    // ── Voltage sources: branch unknown directly in solution vector ───────
+    // MNA convention: I_branch flows from n2 → through source → n1
+    // i.e. into the + terminal (n1).  We negate so that positive means n1→n2
+    // through the external circuit, which is the usual "delivered current"
+    // convention matching Ohm's law for passive elements.
+    let voltage_sources = circuit.voltage_sources.iter().enumerate().map(|(i, _)| {
+        -solution[n_nodes + i]
+    }).collect();
+
+    // ── Diodes: Shockley equation at converged voltages ───────────────────
+    let diodes = circuit.diodes.iter().map(|d| {
+        let model = circuit.diode_models.get(&d.model)
+            .expect("diode model not found in compute_branch_currents");
+        let v_a = node_voltage(solution, d.anode);
+        let v_c = node_voltage(solution, d.cathode);
+        let vd = (v_a - v_c).clamp(-100.0, 0.8);
+        let vt_n = model.n * 0.02585;
+        model.is * ((vd / vt_n).exp() - 1.0)
+    }).collect();
+
+    BranchCurrents { resistors, capacitors, inductors, voltage_sources, diodes }
+}
+
 pub fn update_transient_state(
     circuit: &Circuit,
     solution: &DVector<f64>,

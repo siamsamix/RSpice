@@ -19,7 +19,7 @@ Analog circuit simulator in Rust, inspired by LTspice and PSpice. It uses **modi
 
 To try it on your browser, visit https://siamsamix.github.io/rspice.web/
 
-Alternatively, you can compile it and run on your desktop with the following command,
+Alternatively, you can compile it and run on your desktop with the following commands,
 
 ```bash
 git clone https://github.com/siamsamix/RSpice.git

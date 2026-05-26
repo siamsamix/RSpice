@@ -151,7 +151,7 @@ pub fn apply(ctx: &egui::Context) {
     // Monospace: SPICE netlists, expression editor, node names.
     style.text_styles.insert(
         TextStyle::Monospace,
-        FontId::new(11.5, FontFamily::Monospace),
+        FontId::new(11.0, FontFamily::Monospace),
     );
     // Button: toolbar actions, dialog buttons.
     style.text_styles.insert(

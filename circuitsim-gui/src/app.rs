@@ -446,6 +446,221 @@ impl CircuitSimApp {
         self.netlist = out;
         self.status = Some((true, "Generated netlist from schematic".into()));
     }
+
+    /// Parse the current netlist text and build a schematic layout from it.
+    ///
+    /// Layout strategy:
+    ///   • Each unique non-ground node gets a vertical column (x = col * COL_W).
+    ///   • Components are placed vertically between their two node columns at
+    ///     increasing y positions (one slot per column pair).
+    ///   • Horizontal wires connect component pins to the node column spine.
+    ///   • A vertical wire runs along each node spine connecting all the pins.
+    ///   • Node 0 (ground) gets a Ground symbol instead of a spine wire.
+    fn generate_schematic_from_netlist(&mut self) {
+        // ── 1. Parse component lines ──────────────────────────────────────────
+        #[derive(Clone)]
+        struct ParsedComp {
+            kind:   CompKind,
+            node_a: usize,
+            node_b: usize,
+            val:    String,
+        }
+
+        let mut parsed: Vec<ParsedComp> = vec![];
+
+        for raw_line in self.netlist.lines() {
+            let line = raw_line.trim();
+            if line.is_empty() || line.starts_with('*') || line.starts_with('.') {
+                continue;
+            }
+            let tokens: Vec<&str> = line.split_whitespace().collect();
+            if tokens.len() < 4 { continue; }
+
+            let kind = match tokens[0].to_ascii_uppercase().chars().next() {
+                Some('R') => CompKind::Resistor,
+                Some('C') => CompKind::Capacitor,
+                Some('L') => CompKind::Inductor,
+                Some('V') => CompKind::Voltage,
+                _ => continue,
+            };
+
+            let node_a = match tokens[1].parse::<usize>() { Ok(n) => n, Err(_) => continue };
+            let node_b = match tokens[2].parse::<usize>() { Ok(n) => n, Err(_) => continue };
+            let val    = tokens[3..].join(" ");
+
+            parsed.push(ParsedComp { kind, node_a, node_b, val });
+        }
+
+        if parsed.is_empty() {
+            self.status = Some((false, "No recognised components found in netlist".into()));
+            return;
+        }
+
+        // ── 2. Collect all non-ground node numbers and assign columns ─────────
+        let mut node_set: Vec<usize> = vec![];
+        for c in &parsed {
+            for &n in &[c.node_a, c.node_b] {
+                if n != 0 && !node_set.contains(&n) {
+                    node_set.push(n);
+                }
+            }
+        }
+        node_set.sort_unstable();
+
+        let node_to_col: HashMap<usize, i32> = node_set
+        .iter()
+        .enumerate()
+        .map(|(i, &n)| (n, i as i32))
+        .collect();
+
+        // ── 3. Lay out components ─────────────────────────────────────────────
+        const COL_W:    i32 = 6;
+        const COMP_LEN: i32 = 4;
+        const ROW_GAP:  i32 = 6;
+        const ORIGIN_X: i32 = 3;
+        const ORIGIN_Y: i32 = 3;
+
+        let mut new_components: Vec<Component> = vec![];
+        let mut new_wires:      Vec<Wire>      = vec![];
+        let mut spine_pins: HashMap<usize, Vec<i32>> = HashMap::new();
+
+        // Tracker for packing parallel components efficiently into rows
+        struct Interval { start: i32, end: i32 }
+        let mut row_intervals: Vec<Vec<Interval>> = vec![];
+
+        for comp in &parsed {
+            let col_a = node_to_col.get(&comp.node_a).copied().unwrap_or(-1);
+            let col_b = node_to_col.get(&comp.node_b).copied().unwrap_or(-1);
+
+            // Ignore malformed ground-to-ground components
+            if col_a < 0 && col_b < 0 { continue; }
+
+            let start_half: i32;
+            let end_half: i32;
+            let mut mid_half: i32;
+
+            // Calculate "half-column" intervals to map out the X-axis territory
+            if col_a >= 0 && col_b >= 0 {
+                start_half = col_a.min(col_b) * 2;
+                end_half = col_a.max(col_b) * 2;
+                mid_half = start_half + (end_half - start_half) / 2;
+
+                // If midpoint lands exactly on a spine (even), push it to the right channel
+                if mid_half % 2 == 0 { mid_half += 1; }
+            } else {
+                let c = col_a.max(col_b); // The non-ground column
+                start_half = c * 2;
+                end_half = c * 2 + 1;
+                mid_half = end_half; // Push ground components into the right-side channel
+            }
+
+            // Interval Packer: Find the lowest Y-row where this X-interval doesn't collide
+            let mut row = 0;
+            loop {
+                if row >= row_intervals.len() {
+                    row_intervals.push(vec![]);
+                }
+                // Overlap check (they collide if they share any X-territory)
+                let overlaps = row_intervals[row].iter().any(|i| {
+                    !(end_half < i.start || start_half > i.end)
+                });
+
+                if !overlaps {
+                    row_intervals[row].push(Interval { start: start_half, end: end_half });
+                    break;
+                }
+                row += 1;
+            }
+
+            let y_top = ORIGIN_Y + (row as i32) * (COMP_LEN + ROW_GAP);
+            let comp_x = ORIGIN_X + mid_half * (COL_W / 2);
+
+            let p1 = GridPt(comp_x, y_top);
+            let p2 = GridPt(comp_x, y_top + COMP_LEN);
+
+            new_components.push(Component {
+                kind: comp.kind,
+                p1,
+                p2,
+                val: comp.val.clone(),
+            });
+
+            // Horizontal wire: p1 -> spine of pin1_node
+            if comp.node_a != 0 {
+                let spine_x = ORIGIN_X + col_a * COL_W;
+                if spine_x != comp_x {
+                    new_wires.push(Wire { p1: GridPt(comp_x, y_top), p2: GridPt(spine_x, y_top) });
+                }
+                spine_pins.entry(comp.node_a).or_default().push(y_top);
+            } else {
+                // Ground pin for node A
+                new_components.push(Component {
+                    kind: CompKind::Ground,
+                    p1: GridPt(comp_x, y_top),
+                                    p2: GridPt(comp_x, y_top),
+                                    val: "".into(),
+                });
+            }
+
+            // Horizontal wire: p2 -> spine of pin2_node
+            if comp.node_b != 0 {
+                let spine_x = ORIGIN_X + col_b * COL_W;
+                if spine_x != comp_x {
+                    new_wires.push(Wire { p1: GridPt(comp_x, y_top + COMP_LEN), p2: GridPt(spine_x, y_top + COMP_LEN) });
+                }
+                spine_pins.entry(comp.node_b).or_default().push(y_top + COMP_LEN);
+            } else {
+                // Ground pin for node B
+                new_components.push(Component {
+                    kind: CompKind::Ground,
+                    p1: GridPt(comp_x, y_top + COMP_LEN),
+                                    p2: GridPt(comp_x, y_top + COMP_LEN),
+                                    val: "".into(),
+                });
+            }
+        }
+
+        // ── 4. Vertical spine wires for each non-ground node ─────────────────
+        for (&node, pins) in &spine_pins {
+            let y_min = *pins.iter().min().unwrap();
+            let y_max = *pins.iter().max().unwrap();
+            // Only draw the vertical spine if the node connects across multiple Y levels
+            if y_min != y_max {
+                let spine_x = ORIGIN_X + node_to_col[&node] * COL_W;
+                new_wires.push(Wire { p1: GridPt(spine_x, y_min), p2: GridPt(spine_x, y_max) });
+            }
+        }
+
+        // ── 5. Parse .tran / .ac directives ──────────────────────────────────
+        for raw_line in self.netlist.lines() {
+            let line = raw_line.trim().to_ascii_lowercase();
+            if line.starts_with(".tran") {
+                let toks: Vec<&str> = line.split_whitespace().collect();
+                self.schematic.analysis_type = AnalysisType::Tran;
+                if toks.len() > 1 { self.schematic.tran_step = toks[1].to_string(); }
+                if toks.len() > 2 { self.schematic.tran_stop = toks[2].to_string(); }
+            } else if line.starts_with(".ac") {
+                let toks: Vec<&str> = line.split_whitespace().collect();
+                self.schematic.analysis_type = AnalysisType::Ac;
+                if toks.len() > 1 { self.schematic.ac_variation = toks[1].to_string(); }
+                if toks.len() > 2 { self.schematic.ac_points    = toks[2].to_string(); }
+                if toks.len() > 3 { self.schematic.ac_fstart    = toks[3].to_string(); }
+                if toks.len() > 4 { self.schematic.ac_fstop     = toks[4].to_string(); }
+            }
+        }
+
+        // ── 6. Commit ─────────────────────────────────────────────────────────
+        self.schematic.components         = new_components;
+        self.schematic.wires              = new_wires;
+        self.schematic.selected_component = None;
+        self.schematic.selected_wire      = None;
+        self.schematic.pan                = Vec2::ZERO;
+        self.schematic.zoom               = 1.0;
+
+        let n = parsed.len();
+        self.status = Some((true, format!("Imported {} component(s) from netlist", n)));
+    }
+
     fn run_simulation(&mut self) {
         match parse(&self.netlist) {
             Ok(netlist) => {
@@ -520,6 +735,7 @@ impl CircuitSimApp {
         self.netlist = ex.netlist().to_string();
         self.file_label = format!("{}.cir", ex.label().to_lowercase().replace(' ', "_"));
         self.status = Some((true, format!("Loaded example: {}", ex.label())));
+        self.generate_schematic_from_netlist();
         self.clear_results();
     }
 
@@ -709,7 +925,21 @@ impl CircuitSimApp {
         ui.add_space(6.0);
 
         if self.editor_mode == EditorMode::Text {
-            ui.label(egui::RichText::new("R · C · L · V  —  .op  .tran  .ac").color(TEXT_SECONDARY).size(12.0));
+            ui.horizontal(|ui| {
+                ui.label(egui::RichText::new("R · C · L · V  —  .op  .tran  .ac").color(TEXT_SECONDARY).size(12.0));
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    let import_btn = egui::Button::new(
+                        egui::RichText::new("⟶ Import to Schematic").size(12.0).color(egui::Color32::WHITE)
+                    )
+                    .fill(egui::Color32::from_rgb(60, 100, 160))
+                    .rounding(egui::Rounding::same(4.0))
+                    .min_size(egui::vec2(0.0, 22.0));
+                    if ui.add(import_btn).on_hover_text("Parse the netlist and render it as a schematic").clicked() {
+                        self.generate_schematic_from_netlist();
+                        self.editor_mode = EditorMode::Schematic;
+                    }
+                });
+            });
             editor_frame().show(ui, |ui| {
                 ui.add(
                     egui::TextEdit::multiline(&mut self.netlist)

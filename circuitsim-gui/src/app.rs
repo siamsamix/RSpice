@@ -516,6 +516,7 @@ impl CircuitSimApp {
     }
 
     fn open_file(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))] {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("Netlist", &["cir", "sp", "cir", "txt"])
             .pick_file()
@@ -533,9 +534,11 @@ impl CircuitSimApp {
                     Err(e) => self.status = Some((false, e.to_string())),
                 }
             }
+        }
     }
 
     fn save_file(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))] {
         if let Some(path) = rfd::FileDialog::new()
             .add_filter("Netlist", &["cir"])
             .set_file_name(&self.file_label)
@@ -552,6 +555,7 @@ impl CircuitSimApp {
                     Err(e) => self.status = Some((false, e.to_string())),
                 }
             }
+        }
     }
 
 
@@ -1991,15 +1995,6 @@ impl CircuitSimApp {
         match self.tran_sub_tab {
             TranSubTab::Voltage => {
                 ui.horizontal_wrapped(|ui| {
-                    ui.label(egui::RichText::new("Plot nodes:").color(TEXT_SECONDARY));
-                    for i in 1..self.plot_nodes.len() {
-                        let mut on = self.plot_nodes[i];
-                        if ui.checkbox(&mut on, format!("V({i})")).changed() {
-                            self.plot_nodes[i] = on;
-                        }
-                    }
-                });
-                ui.horizontal_wrapped(|ui| {
                     if ui.button("Auto Fit").clicked() {
                         self.plot_x_min.clear();
                         self.plot_x_max.clear();
@@ -2011,10 +2006,12 @@ impl CircuitSimApp {
                 ui.add_space(8.0);
 
                 code_frame().show(ui, |ui| {
+                    let adjusted_height = ui.available_height();
                     let plot = Plot::new("waveforms")
-                    .height(plot_h)
+                    .height(adjusted_height)
                     .x_axis_label("time (s)")
-                    .y_axis_label("voltage (V)")
+                    .y_axis_label("Voltage (V)")
+                    .y_axis_min_width(50.0)
                     .legend(Legend::default().position(egui_plot::Corner::RightTop))
                     .show_background(true)
                     .allow_scroll(true)
@@ -2060,12 +2057,23 @@ impl CircuitSimApp {
             }
 
             TranSubTab::Current => {
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Auto Fit").clicked() {
+                        self.plot_x_min.clear();
+                        self.plot_x_max.clear();
+                        self.plot_y_min.clear();
+                        self.plot_y_max.clear();
+                        self.apply_plot_bounds = true;
+                    }
+                });
                 ui.add_space(8.0);
                 code_frame().show(ui, |ui| {
+                    let adjusted_height = ui.available_height();
                     let plot = Plot::new("waveforms_current")
-                    .height(plot_h)
+                    .height(adjusted_height)
                     .x_axis_label("time (s)")
-                    .y_axis_label("current (A)")
+                    .y_axis_label("Current (A)")
+                    .y_axis_min_width(50.0)
                     .legend(Legend::default().position(egui_plot::Corner::RightTop))
                     .show_background(true)
                     .allow_scroll(true)
@@ -2073,6 +2081,31 @@ impl CircuitSimApp {
                     .allow_boxed_zoom(true);
 
                     plot.show(ui, |plot_ui| {
+                        if self.apply_plot_bounds {
+                            if self.plot_x_min.is_empty() && self.plot_x_max.is_empty()
+                                && self.plot_y_min.is_empty() && self.plot_y_max.is_empty() {
+                                    plot_ui.set_auto_bounds(egui::Vec2b::new(true, true));
+                                } else {
+                                    plot_ui.set_auto_bounds(egui::Vec2b::new(false, false));
+                                    let cur = plot_ui.plot_bounds();
+                                    let mut x_min = cur.min()[0]; let mut x_max = cur.max()[0];
+                                    let mut y_min = cur.min()[1]; let mut y_max = cur.max()[1];
+                                    if let Ok(v) = self.plot_x_min.parse::<f64>() { x_min = v; }
+                                    if let Ok(v) = self.plot_x_max.parse::<f64>() { x_max = v; }
+                                    if let Ok(v) = self.plot_y_min.parse::<f64>() { y_min = v; }
+                                    if let Ok(v) = self.plot_y_max.parse::<f64>() { y_max = v; }
+                                    let safe_x_min = x_min.min(x_max);
+                                    let safe_x_max = if x_min == x_max { x_max + 1e-6 } else { x_min.max(x_max) };
+                                    let safe_y_min = y_min.min(y_max);
+                                    let safe_y_max = if y_min == y_max { y_max + 1e-6 } else { y_min.max(y_max) };
+                                    plot_ui.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
+                                        [safe_x_min, safe_y_min], [safe_x_max, safe_y_max],
+                                    ));
+                                }
+                                self.apply_plot_bounds = false;
+                        }
+                        // ----------------------------------------
+
                         let mut color_idx = 0usize;
 
                         let nr = tran.points.first().map(|p| p.branch_currents.resistors.len()).unwrap_or(0);
@@ -2081,7 +2114,7 @@ impl CircuitSimApp {
                                 [p.time * x_mult, p.branch_currents.resistors.get(i).copied().unwrap_or(0.0) * y_mult]
                             }).collect();
                             plot_ui.line(Line::new(pts).name(format!("I(R{})", i + 1))
-                                .color(PLOT_COLORS[color_idx % PLOT_COLORS.len()]).width(2.0));
+                            .color(PLOT_COLORS[color_idx % PLOT_COLORS.len()]).width(2.0));
                             color_idx += 1;
                         }
                         let nc = tran.points.first().map(|p| p.branch_currents.capacitors.len()).unwrap_or(0);
@@ -2090,7 +2123,7 @@ impl CircuitSimApp {
                                 [p.time * x_mult, p.branch_currents.capacitors.get(i).copied().unwrap_or(0.0) * y_mult]
                             }).collect();
                             plot_ui.line(Line::new(pts).name(format!("I(C{})", i + 1))
-                                .color(PLOT_COLORS[color_idx % PLOT_COLORS.len()]).width(2.0));
+                            .color(PLOT_COLORS[color_idx % PLOT_COLORS.len()]).width(2.0));
                             color_idx += 1;
                         }
                         let nl = tran.points.first().map(|p| p.branch_currents.inductors.len()).unwrap_or(0);
@@ -2099,7 +2132,7 @@ impl CircuitSimApp {
                                 [p.time * x_mult, p.branch_currents.inductors.get(i).copied().unwrap_or(0.0) * y_mult]
                             }).collect();
                             plot_ui.line(Line::new(pts).name(format!("I(L{})", i + 1))
-                                .color(PLOT_COLORS[color_idx % PLOT_COLORS.len()]).width(2.0));
+                            .color(PLOT_COLORS[color_idx % PLOT_COLORS.len()]).width(2.0));
                             color_idx += 1;
                         }
                         let nv = tran.points.first().map(|p| p.branch_currents.voltage_sources.len()).unwrap_or(0);
@@ -2108,7 +2141,7 @@ impl CircuitSimApp {
                                 [p.time * x_mult, p.branch_currents.voltage_sources.get(i).copied().unwrap_or(0.0) * y_mult]
                             }).collect();
                             plot_ui.line(Line::new(pts).name(format!("I(V{})", i + 1))
-                                .color(PLOT_COLORS[color_idx % PLOT_COLORS.len()]).width(2.0));
+                            .color(PLOT_COLORS[color_idx % PLOT_COLORS.len()]).width(2.0));
                             color_idx += 1;
                         }
                         let nd = tran.points.first().map(|p| p.branch_currents.diodes.len()).unwrap_or(0);
@@ -2117,7 +2150,7 @@ impl CircuitSimApp {
                                 [p.time * x_mult, p.branch_currents.diodes.get(i).copied().unwrap_or(0.0) * y_mult]
                             }).collect();
                             plot_ui.line(Line::new(pts).name(format!("I(D{})", i + 1))
-                                .color(PLOT_COLORS[color_idx % PLOT_COLORS.len()]).width(2.0));
+                            .color(PLOT_COLORS[color_idx % PLOT_COLORS.len()]).width(2.0));
                             color_idx += 1;
                         }
                         let _ = color_idx;

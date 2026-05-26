@@ -19,7 +19,7 @@ Analog circuit simulator in Rust, inspired by LTspice and PSpice. It uses **modi
 
 ```bash
 cargo build --release
-cargo run --release -p circuitsim-gui    # graphical app
+cargo run --release -p rspice    # graphical app
 cargo run --release -p circuitsim-cli -- examples/voltage_divider.cir
 cargo test
 ```

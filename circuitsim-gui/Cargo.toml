@@ -1,5 +1,5 @@
 [package]
-name = "circuitsim-gui"
+name = "rspice"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -7,13 +7,17 @@ authors.workspace = true
 description = "Graphical interface for RSpice"
 
 [[bin]]
-name = "circuitsim-gui"
+name = "rspice"
 path = "src/main.rs"
 
 [dependencies]
 circuitsim = { path = "../circuitsim" }
-eframe = { version = "0.29", default-features = true }
+eframe = { version = "0.29", default-features = true, features = ["glow"] }
 egui = "0.29"
 egui_plot = "0.29"
 rfd = "0.15"
 egui_extras = { version = "0.29", features = ["image", "svg"] }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+log = "0.4"
+wasm-bindgen-futures = "0.4"

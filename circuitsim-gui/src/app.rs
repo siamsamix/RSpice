@@ -234,6 +234,7 @@ enum TranSubTab {
     #[default]
     Voltage,
     Current,
+    Differential,
 }
 
 /// Which quantity to show on the frequency-response magnitude plot.
@@ -277,6 +278,10 @@ pub struct CircuitSimApp {
     ac_phase_y_min: String,
     ac_phase_y_max: String,
     ac_apply_plot_bounds: bool,
+
+    // Differential voltage plot node selectors
+    diff_node_a: usize,
+    diff_node_b: usize,
 }
 
 impl Default for CircuitSimApp {
@@ -314,6 +319,9 @@ impl Default for CircuitSimApp {
             ac_phase_y_min: "".to_string(),
             ac_phase_y_max: "".to_string(),
             ac_apply_plot_bounds: false,
+
+            diff_node_a: 1,
+            diff_node_b: 2,
         }
     }
 }
@@ -1985,6 +1993,7 @@ impl CircuitSimApp {
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.tran_sub_tab, TranSubTab::Voltage, "Voltage");
             ui.selectable_value(&mut self.tran_sub_tab, TranSubTab::Current, "Current");
+            ui.selectable_value(&mut self.tran_sub_tab, TranSubTab::Differential, "Differential");
         });
         ui.separator();
 
@@ -2154,6 +2163,113 @@ impl CircuitSimApp {
                             color_idx += 1;
                         }
                         let _ = color_idx;
+                    });
+                });
+            }
+
+            TranSubTab::Differential => {
+                // ── Node selector controls ────────────────────────────────────
+                let n_nodes = tran.points.first()
+                    .map(|p| p.node_voltages.len())
+                    .unwrap_or(1);
+
+                // Clamp stored indices to valid range whenever n_nodes changes
+                self.diff_node_a = self.diff_node_a.clamp(0, n_nodes.saturating_sub(1));
+                self.diff_node_b = self.diff_node_b.clamp(0, n_nodes.saturating_sub(1));
+
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Auto Fit").clicked() {
+                        self.plot_x_min.clear();
+                        self.plot_x_max.clear();
+                        self.plot_y_min.clear();
+                        self.plot_y_max.clear();
+                        self.apply_plot_bounds = true;
+                    }
+
+                    ui.separator();
+
+                    ui.label(egui::RichText::new("V(A) − V(B)  →  A:").color(TEXT_SECONDARY));
+
+                    egui::ComboBox::from_id_salt("diff_node_a")
+                        .selected_text(format!("Node {}", self.diff_node_a))
+                        .width(80.0)
+                        .show_ui(ui, |ui| {
+                            for n in 0..n_nodes {
+                                ui.selectable_value(&mut self.diff_node_a, n, format!("Node {n}"));
+                            }
+                        });
+
+                    ui.label(egui::RichText::new("B:").color(TEXT_SECONDARY));
+
+                    egui::ComboBox::from_id_salt("diff_node_b")
+                        .selected_text(format!("Node {}", self.diff_node_b))
+                        .width(80.0)
+                        .show_ui(ui, |ui| {
+                            for n in 0..n_nodes {
+                                ui.selectable_value(&mut self.diff_node_b, n, format!("Node {n}"));
+                            }
+                        });
+                });
+
+                ui.add_space(8.0);
+
+                let node_a = self.diff_node_a;
+                let node_b = self.diff_node_b;
+                let x_mult = self.plot_x_scale.parse::<f64>().unwrap_or(1.0);
+                let y_mult = self.plot_y_scale.parse::<f64>().unwrap_or(1.0);
+
+                code_frame().show(ui, |ui| {
+                    let adjusted_height = ui.available_height();
+                    let plot = Plot::new("waveforms_diff")
+                        .height(adjusted_height)
+                        .x_axis_label("time (s)")
+                        .y_axis_label(format!("V({node_a}) − V({node_b})  (V)"))
+                        .y_axis_min_width(50.0)
+                        .legend(Legend::default().position(egui_plot::Corner::RightTop))
+                        .show_background(true)
+                        .allow_scroll(true)
+                        .allow_drag(true)
+                        .allow_boxed_zoom(true);
+
+                    plot.show(ui, |plot_ui| {
+                        if self.apply_plot_bounds {
+                            if self.plot_x_min.is_empty() && self.plot_x_max.is_empty()
+                                && self.plot_y_min.is_empty() && self.plot_y_max.is_empty()
+                            {
+                                plot_ui.set_auto_bounds(egui::Vec2b::new(true, true));
+                            } else {
+                                plot_ui.set_auto_bounds(egui::Vec2b::new(false, false));
+                                let cur = plot_ui.plot_bounds();
+                                let mut x_min = cur.min()[0]; let mut x_max = cur.max()[0];
+                                let mut y_min = cur.min()[1]; let mut y_max = cur.max()[1];
+                                if let Ok(v) = self.plot_x_min.parse::<f64>() { x_min = v; }
+                                if let Ok(v) = self.plot_x_max.parse::<f64>() { x_max = v; }
+                                if let Ok(v) = self.plot_y_min.parse::<f64>() { y_min = v; }
+                                if let Ok(v) = self.plot_y_max.parse::<f64>() { y_max = v; }
+                                let safe_x_min = x_min.min(x_max);
+                                let safe_x_max = if x_min == x_max { x_max + 1e-6 } else { x_min.max(x_max) };
+                                let safe_y_min = y_min.min(y_max);
+                                let safe_y_max = if y_min == y_max { y_max + 1e-6 } else { y_min.max(y_max) };
+                                plot_ui.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
+                                    [safe_x_min, safe_y_min], [safe_x_max, safe_y_max],
+                                ));
+                            }
+                            self.apply_plot_bounds = false;
+                        }
+
+                        let diff_pts: PlotPoints = tran.points.iter().map(|p| {
+                            let va = p.node_voltages.get(node_a).copied().unwrap_or(0.0);
+                            let vb = p.node_voltages.get(node_b).copied().unwrap_or(0.0);
+                            [p.time * x_mult, (va - vb) * y_mult]
+                        }).collect();
+
+                        let color = PLOT_COLORS[1 % PLOT_COLORS.len()];
+                        plot_ui.line(
+                            Line::new(diff_pts)
+                                .name(format!("V({node_a})−V({node_b})"))
+                                .color(color)
+                                .width(2.0),
+                        );
                     });
                 });
             }

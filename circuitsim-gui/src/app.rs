@@ -2196,38 +2196,8 @@ impl CircuitSimApp {
 
         ui.add_space(4.0);
 
-        // NEW: Scaling and Limits Controls for AC
         ui.horizontal_wrapped(|ui| {
-            /*ui.label(egui::RichText::new("Mult X:").color(TEXT_SECONDARY));
-             *           ui.add(egui::TextEdit::singleline(&mut self.ac_plot_x_scale).desired_width(40.0));
-             *           ui.label(egui::RichText::new("Mult Y(Mag):").color(TEXT_SECONDARY));
-             *           ui.add(egui::TextEdit::singleline(&mut self.ac_mag_y_scale).desired_width(40.0));
-             *           ui.label(egui::RichText::new("Mult Y(Phs):").color(TEXT_SECONDARY));
-             *           ui.add(egui::TextEdit::singleline(&mut self.ac_phase_y_scale).desired_width(40.0));
-             *
-             *           ui.separator();
-             *
-             *           ui.label(egui::RichText::new("Limits X [").color(TEXT_SECONDARY));
-             *           ui.add(egui::TextEdit::singleline(&mut self.ac_plot_x_min).desired_width(40.0));
-             *           ui.label(",");
-             *           ui.add(egui::TextEdit::singleline(&mut self.ac_plot_x_max).desired_width(40.0));
-             *           ui.label("]");
-             *
-             *           ui.label(egui::RichText::new("Y(Mag) [").color(TEXT_SECONDARY));
-             *           ui.add(egui::TextEdit::singleline(&mut self.ac_mag_y_min).desired_width(40.0));
-             *           ui.label(",");
-             *           ui.add(egui::TextEdit::singleline(&mut self.ac_mag_y_max).desired_width(40.0));
-             *           ui.label("]");
-             *
-             *           ui.label(egui::RichText::new("Y(Phs) [").color(TEXT_SECONDARY));
-             *           ui.add(egui::TextEdit::singleline(&mut self.ac_phase_y_min).desired_width(40.0));
-             *           ui.label(",");
-             *           ui.add(egui::TextEdit::singleline(&mut self.ac_phase_y_max).desired_width(40.0));
-             *           ui.label("]");
-             *
-             *           if ui.button("Apply").clicked() {
-             *               self.ac_apply_plot_bounds = true;
-        }*/
+
             if ui.button("Auto Fit").clicked() {
                 self.ac_plot_x_min.clear();
                 self.ac_plot_x_max.clear();
@@ -2268,6 +2238,7 @@ impl CircuitSimApp {
             .height(half_h.max(120.0))
             .x_axis_label("frequency (Hz)")
             .y_axis_label(mag_label)
+            .y_axis_min_width(50.0)
             .legend(Legend::default().position(egui_plot::Corner::RightTop))
             .show_background(true)
             .allow_scroll(true)
@@ -2365,6 +2336,7 @@ impl CircuitSimApp {
             .height(half_h.max(120.0))
             .x_axis_label("frequency (Hz)")
             .y_axis_label("phase (°)")
+            .y_axis_min_width(50.0)
             .legend(Legend::default().position(egui_plot::Corner::RightTop))
             .show_background(true)
             .allow_scroll(true)

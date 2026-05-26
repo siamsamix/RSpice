@@ -17,11 +17,14 @@ Analog circuit simulator in Rust, inspired by LTspice and PSpice. It uses **modi
 
 ## Quick start
 
+To try it on your browser, visit https://siamsamix.github.io/rspice.web/
+
+Alternatively, you can compile it and run on your desktop with the following command,
+
 ```bash
-cargo build --release
+git clone https://github.com/siamsamix/RSpice.git
+cd RSpice
 cargo run --release -p rspice    # graphical app
-cargo run --release -p circuitsim-cli -- examples/voltage_divider.cir
-cargo test
 ```
 
 ### GUI (`circuitsim-gui`)

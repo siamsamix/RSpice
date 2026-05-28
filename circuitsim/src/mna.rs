@@ -1,6 +1,6 @@
 use nalgebra::{DMatrix, DVector};
 
-use crate::circuit::{Circuit, NodeId};
+use crate::circuit::{Circuit, MosfetType, NodeId};
 use crate::error::{Result, SimError};
 
 #[derive(Debug, Clone, Default)]
@@ -31,32 +31,29 @@ impl MnaSystem {
 
     pub fn solve(&self) -> Result<DVector<f64>> {
         let lu = self
-        .a
-        .clone()
-        .lu()
-        .solve(&self.z)
-        .ok_or_else(|| SimError::Algebra("singular MNA matrix".into()))?;
+            .a
+            .clone()
+            .lu()
+            .solve(&self.z)
+            .ok_or_else(|| SimError::Algebra("singular MNA matrix".into()))?;
         Ok(lu)
     }
 }
 
 fn node_index(node: NodeId) -> Option<usize> {
-    if node.0 == 0 {
-        None
-    } else {
-        Some(node.0 - 1)
-    }
+    if node.0 == 0 { None } else { Some(node.0 - 1) }
 }
 
-pub fn build_dc(circuit: &Circuit, guess: &DVector<f64>) -> Result<MnaSystem> {    // FIX: Use the full transient matrix size so inductors get their own branch current rows
+pub fn build_dc(circuit: &Circuit, guess: &DVector<f64>) -> Result<MnaSystem> {
     let size = circuit.tran_matrix_size();
     let mut sys = MnaSystem::new(size);
     let n_nodes = circuit.nodes.saturating_sub(1);
 
     stamp_resistors(circuit, &mut sys);
     stamp_diodes(circuit, &mut sys, guess);
-    // FIX: Inductors are shorts at DC. We stamp them as 0V voltage sources
-    // to cleanly solve for their exact steady-state DC current without precision loss.
+    stamp_mosfets(circuit, &mut sys, guess);
+
+    // Inductors are shorts at DC — stamp as 0 V voltage sources.
     for (i, l) in circuit.inductors.iter().enumerate() {
         let branch = n_nodes + circuit.voltage_sources.len() + i;
         if let Some(i1) = node_index(l.n1) {
@@ -67,7 +64,6 @@ pub fn build_dc(circuit: &Circuit, guess: &DVector<f64>) -> Result<MnaSystem> { 
             sys.a[(i2, branch)] -= 1.0;
             sys.a[(branch, i2)] -= 1.0;
         }
-        // z[branch] remains 0.0 (acting as a 0V short circuit)
     }
 
     stamp_voltage_sources(circuit, &mut sys, n_nodes, None);
@@ -90,6 +86,7 @@ pub fn build_transient(
 
     stamp_resistors(circuit, &mut sys);
     stamp_diodes(circuit, &mut sys, guess);
+    stamp_mosfets(circuit, &mut sys, guess);
     stamp_capacitors(circuit, &mut sys, dt, state);
     stamp_inductors(circuit, &mut sys, dt, state, n_nodes, circuit.voltage_sources.len());
     stamp_voltage_sources(circuit, &mut sys, n_nodes, Some(t));
@@ -106,36 +103,171 @@ fn stamp_resistors(circuit: &Circuit, sys: &mut MnaSystem) {
 
 fn stamp_diodes(circuit: &Circuit, sys: &mut MnaSystem, guess: &DVector<f64>) {
     for d in &circuit.diodes {
-        let model = circuit.diode_models.get(&d.model)
-        .expect("Diode model not found");
-        let v_anode = node_voltage(guess, d.anode);
+        let model = circuit.diode_models.get(&d.model).expect("Diode model not found");
+        let v_anode   = node_voltage(guess, d.anode);
         let v_cathode = node_voltage(guess, d.cathode);
         let vd = v_anode - v_cathode;
 
-        // Clamping is critical for Newton-Raphson stability in exponentials.
-        // Without this, a bad initial guess will cause f64 overflow.
         let vt = 0.02585;
         let vd_clamped = vd.clamp(-100.0, 0.8);
         let vt_n = model.n * vt;
         let exp_term = (vd_clamped / vt_n).exp();
 
-        let id = model.is * (exp_term - 1.0);
-        let gd = (model.is / vt_n) * exp_term;
+        let id  = model.is * (exp_term - 1.0);
+        let gd  = (model.is / vt_n) * exp_term;
         let ieq = id - gd * vd_clamped;
 
-        // Stamp dynamic conductance (acts like a resistor)
         stamp_conductance(sys, d.anode, d.cathode, gd);
-
-        // Stamp equivalent current (flowing from anode to cathode)
         stamp_current_source(sys, d.anode, d.cathode, ieq);
+    }
+}
+
+/// Stamp a single MOSFET using the level-1 Shichman-Hodges model.
+///
+/// The Newton-Raphson companion model consists of:
+///   - A drain-source conductance  `gds`
+///   - A transconductance current  `gm * Vgs`  (modelled as a controlled source)
+///   - A body-effect corrected threshold `Vth`
+///   - A DC equivalent current    `Ids_eq`
+///
+/// For a PMOS all terminal voltages are negated before applying the NMOS
+/// equations, and the resulting current is negated back.
+fn stamp_mosfets(circuit: &Circuit, sys: &mut MnaSystem, guess: &DVector<f64>) {
+    for m in &circuit.mosfets {
+        let model = circuit.mosfet_models.get(&m.model).expect("MOSFET model not found");
+
+        // Raw node voltages from the current Newton-Raphson guess.
+        let vd_raw = node_voltage(guess, m.nd);
+        let vg_raw = node_voltage(guess, m.ng);
+        let vs_raw = node_voltage(guess, m.ns);
+        let vb_raw = node_voltage(guess, m.nb);
+
+        // For PMOS, mirror all voltages so the standard NMOS equations apply.
+        let sign = if model.kind == MosfetType::Pmos { -1.0 } else { 1.0 };
+        let vd = sign * vd_raw;
+        let vg = sign * vg_raw;
+        let vs = sign * vs_raw;
+        let vb = sign * vb_raw;
+
+        // Effective width-over-length ratio times KP gives β (A/V²).
+        let beta = model.kp * (m.w / m.l);
+
+        // Body-effect: Vth = Vth0 + γ*(sqrt(|2φF - Vbs|) - sqrt(|2φF|))
+        let vsb = vs - vb;
+        let phi = model.phi;
+        let vth = model.vth0
+            + model.gamma * ((phi + vsb).abs().sqrt() - phi.abs().sqrt());
+
+        let vgs = vg - vs;
+        let vds = (vd - vs).max(0.0); // clamp: negative Vds → treat as Vds=0 (boundary of cut-off)
+        let vov = vgs - vth; // overdrive voltage
+
+        // Determine operating region and compute drain current + linearisation.
+        let (ids, gm, gds, gbs) = if vov <= 0.0 {
+            // ── Cut-off: device is OFF ────────────────────────────────────
+            // Use a tiny leakage conductance for numerical stability.
+            let g_leak = 1e-12;
+            (0.0, g_leak, g_leak, 0.0)
+        } else {
+            let vds_sat = vov; // Vds at saturation boundary
+
+            if vds < vds_sat {
+                // ── Linear (triode) region ───────────────────────────────
+                // Ids = β * [(Vgs - Vth)*Vds - Vds²/2] * (1 + λ·Vds)
+                let ids_lin = beta * ((vov * vds) - 0.5 * vds * vds)
+                    * (1.0 + model.lambda * vds);
+                let gm_lin  = beta * vds * (1.0 + model.lambda * vds);
+                let gds_lin = beta * (vov - vds)
+                    * (1.0 + model.lambda * vds)
+                    + beta * ((vov * vds) - 0.5 * vds * vds) * model.lambda;
+                // Body effect: d(Ids)/d(Vbs) ≈ -d(Ids)/d(Vth) * d(Vth)/d(Vbs)
+                let dvth_dvsb = model.gamma / (2.0 * (phi + vsb).abs().sqrt().max(1e-9));
+                let gbs_lin = gm_lin * dvth_dvsb;
+                (ids_lin, gm_lin.max(0.0), gds_lin.max(1e-12), gbs_lin)
+            } else {
+                // ── Saturation region ────────────────────────────────────
+                // Ids = (β/2) * (Vgs - Vth)² * (1 + λ·Vds)
+                let ids_sat = 0.5 * beta * vov * vov * (1.0 + model.lambda * vds);
+                let gm_sat  = beta * vov * (1.0 + model.lambda * vds);
+                let gds_sat = 0.5 * beta * vov * vov * model.lambda;
+                let dvth_dvsb = model.gamma / (2.0 * (phi + vsb).abs().sqrt().max(1e-9));
+                let gbs_sat = gm_sat * dvth_dvsb;
+                (ids_sat, gm_sat.max(0.0), gds_sat.max(1e-12), gbs_sat)
+            }
+        };
+
+        // ── Linearised companion model (Newton-Raphson stamp) ─────────────
+        //
+        // The terminal current into drain: Ids_lin = gds*Vds + gm*Vgs + gbs*Vbs + Ieq
+        //
+        // where: Ieq = Ids - gds*Vds_op - gm*Vgs_op - gbs*Vbs_op
+        //
+        // We apply sign to account for PMOS polarity.
+
+        let vgs_op = vgs;
+        let vds_op = vds;
+        let vbs_op = vb - vs;
+        let ids_eq = ids - gds * vds_op - gm * vgs_op - gbs * vbs_op;
+
+        // Helper: determine actual node pairs, honouring PMOS polarity.
+        // For PMOS the stamped sense of current is reversed.
+        let (drain, source, gate, bulk) = (m.nd, m.ns, m.ng, m.nb);
+
+        // -- gds: drain-source conductance (stamp between nd and ns) --
+        stamp_conductance(sys, drain, source, gds);
+
+        // -- gm: transconductance controlled by Vgs --
+        //   Current gm*Vgs flows from drain to source.
+        //   In MNA: stamp as voltage-controlled current source.
+        //   Contribution to G matrix: sign convention
+        //     +gm at (nd, ng), -gm at (nd, ns), -gm at (ns, ng), +gm at (ns, ns)
+        let s = sign; // +1 for NMOS, -1 for PMOS
+        if let Some(id_idx) = node_index(drain) {
+            if let Some(ig_idx) = node_index(gate) {
+                sys.a[(id_idx, ig_idx)] += s * gm;
+            }
+            if let Some(is_idx) = node_index(source) {
+                sys.a[(id_idx, is_idx)] -= s * gm;
+            }
+        }
+        if let Some(is_idx) = node_index(source) {
+            if let Some(ig_idx) = node_index(gate) {
+                sys.a[(is_idx, ig_idx)] -= s * gm;
+            }
+            if let Some(is2_idx) = node_index(source) {
+                sys.a[(is_idx, is2_idx)] += s * gm;
+            }
+        }
+
+        // -- gbs: bulk transconductance controlled by Vbs --
+        //   Current gbs*Vbs flows from drain to source.
+        if let Some(id_idx) = node_index(drain) {
+            if let Some(ib_idx) = node_index(bulk) {
+                sys.a[(id_idx, ib_idx)] += s * gbs;
+            }
+            if let Some(is_idx) = node_index(source) {
+                sys.a[(id_idx, is_idx)] -= s * gbs;
+            }
+        }
+        if let Some(is_idx) = node_index(source) {
+            if let Some(ib_idx) = node_index(bulk) {
+                sys.a[(is_idx, ib_idx)] -= s * gbs;
+            }
+            if let Some(is2_idx) = node_index(source) {
+                sys.a[(is_idx, is2_idx)] += s * gbs;
+            }
+        }
+
+        // -- Ieq: DC equivalent current injected at drain / extracted at source --
+        stamp_current_source(sys, drain, source, s * ids_eq);
     }
 }
 
 fn stamp_capacitors(circuit: &Circuit, sys: &mut MnaSystem, dt: f64, state: &TransientState) {
     for (i, c) in circuit.capacitors.iter().enumerate() {
-        let g_eq = c.capacitance / dt;
+        let g_eq   = c.capacitance / dt;
         let v_prev = state.capacitor_voltages.get(i).copied().unwrap_or(0.0);
-        let i_eq = g_eq * v_prev;
+        let i_eq   = g_eq * v_prev;
         stamp_conductance(sys, c.n1, c.n2, g_eq);
         stamp_current_source(sys, c.n2, c.n1, i_eq);
     }
@@ -150,7 +282,7 @@ fn stamp_inductors(
     n_vsources: usize,
 ) {
     for (i, l) in circuit.inductors.iter().enumerate() {
-        let r_eq = l.inductance / dt;
+        let r_eq   = l.inductance / dt;
         let i_prev = state.inductor_currents.get(i).copied().unwrap_or(0.0);
         let branch = n_nodes + n_vsources + i;
 
@@ -162,13 +294,17 @@ fn stamp_inductors(
             sys.a[(i2, branch)] -= 1.0;
             sys.a[(branch, i2)] -= 1.0;
         }
-
         sys.a[(branch, branch)] -= r_eq;
         sys.z[branch] = -r_eq * i_prev;
     }
 }
 
-fn stamp_voltage_sources(circuit: &Circuit, sys: &mut MnaSystem, n_nodes: usize, t: Option<f64>) {
+fn stamp_voltage_sources(
+    circuit: &Circuit,
+    sys: &mut MnaSystem,
+    n_nodes: usize,
+    t: Option<f64>,
+) {
     for (i, v) in circuit.voltage_sources.iter().enumerate() {
         let branch = n_nodes + i;
         if let Some(i1) = node_index(v.n1) {
@@ -179,7 +315,6 @@ fn stamp_voltage_sources(circuit: &Circuit, sys: &mut MnaSystem, n_nodes: usize,
             sys.a[(i2, branch)] -= 1.0;
             sys.a[(branch, i2)] -= 1.0;
         }
-
         sys.z[branch] = match t {
             Some(time) => v.value_at(time),
             None => v.voltage,
@@ -210,15 +345,11 @@ fn stamp_current_source(sys: &mut MnaSystem, n1: NodeId, n2: NodeId, current: f6
 }
 
 pub fn node_voltage(solution: &DVector<f64>, node: NodeId) -> f64 {
-    node_index(node)
-    .map(|i| solution[i])
-    .unwrap_or(0.0)
+    node_index(node).map(|i| solution[i]).unwrap_or(0.0)
 }
 
-/// Branch currents for every element in the circuit.
-/// Each Vec is parallel to the corresponding Vec in `Circuit`
-/// (e.g. `resistors[i]` is the current through `circuit.resistors[i]`).
-/// Positive convention: current flows from the element's n1 to n2.
+// ─── Branch currents ─────────────────────────────────────────────────────────
+
 #[derive(Debug, Clone, Default)]
 pub struct BranchCurrents {
     pub resistors:       Vec<f64>,
@@ -226,17 +357,10 @@ pub struct BranchCurrents {
     pub inductors:       Vec<f64>,
     pub voltage_sources: Vec<f64>,
     pub diodes:          Vec<f64>,
+    /// Drain current (from drain to source) for each MOSFET.
+    pub mosfets:         Vec<f64>,
 }
 
-/// Compute branch currents for a converged DC or transient solution.
-///
-/// * `solution`          — the solved MNA unknown vector.
-/// * `dt` / `prev_cap_voltages` — supply both for transient (backward-Euler
-///   capacitor current).  Pass `None`/`None` for the DC case (capacitor
-///   current is zero at steady state).
-///
-/// Positive current means conventional current flows from n1 → n2 through
-/// the element.
 pub fn compute_branch_currents(
     circuit: &Circuit,
     solution: &DVector<f64>,
@@ -245,15 +369,12 @@ pub fn compute_branch_currents(
 ) -> BranchCurrents {
     let n_nodes = circuit.nodes.saturating_sub(1);
 
-    // ── Resistors: I = (V_n1 - V_n2) / R ────────────────────────────────
     let resistors = circuit.resistors.iter().map(|r| {
         let v1 = node_voltage(solution, r.n1);
         let v2 = node_voltage(solution, r.n2);
         (v1 - v2) / r.resistance
     }).collect();
 
-    // ── Capacitors: I = C * (V_now - V_prev) / dt (backward Euler) ───────
-    // Zero at DC steady state.
     let capacitors = circuit.capacitors.iter().enumerate().map(|(i, c)| {
         match (dt, prev_cap_voltages) {
             (Some(dt_val), Some(prev)) => {
@@ -267,22 +388,15 @@ pub fn compute_branch_currents(
         }
     }).collect();
 
-    // ── Inductors: branch unknown directly in solution vector ─────────────
     let inductor_branch_base = n_nodes + circuit.voltage_sources.len();
     let inductors = circuit.inductors.iter().enumerate().map(|(i, _)| {
         solution[inductor_branch_base + i]
     }).collect();
 
-    // ── Voltage sources: branch unknown directly in solution vector ───────
-    // MNA convention: I_branch flows from n2 → through source → n1
-    // i.e. into the + terminal (n1).  We negate so that positive means n1→n2
-    // through the external circuit, which is the usual "delivered current"
-    // convention matching Ohm's law for passive elements.
     let voltage_sources = circuit.voltage_sources.iter().enumerate().map(|(i, _)| {
         -solution[n_nodes + i]
     }).collect();
 
-    // ── Diodes: Shockley equation at converged voltages ───────────────────
     let diodes = circuit.diodes.iter().map(|d| {
         let model = circuit.diode_models.get(&d.model)
             .expect("diode model not found in compute_branch_currents");
@@ -293,7 +407,35 @@ pub fn compute_branch_currents(
         model.is * ((vd / vt_n).exp() - 1.0)
     }).collect();
 
-    BranchCurrents { resistors, capacitors, inductors, voltage_sources, diodes }
+    // MOSFET: re-evaluate Ids at the converged solution.
+    let mosfets = circuit.mosfets.iter().map(|m| {
+        let model = circuit.mosfet_models.get(&m.model)
+            .expect("MOSFET model not found in compute_branch_currents");
+        let sign = if model.kind == MosfetType::Pmos { -1.0 } else { 1.0 };
+        let vd = sign * node_voltage(solution, m.nd);
+        let vg = sign * node_voltage(solution, m.ng);
+        let vs = sign * node_voltage(solution, m.ns);
+        let vb = sign * node_voltage(solution, m.nb);
+
+        let beta = model.kp * (m.w / m.l);
+        let vsb  = vs - vb;
+        let vth  = model.vth0
+            + model.gamma * ((model.phi + vsb).abs().sqrt() - model.phi.abs().sqrt());
+        let vgs  = vg - vs;
+        let vds  = vd - vs;
+        let vov  = vgs - vth;
+
+        let ids = if vov <= 0.0 {
+            0.0
+        } else if vds < vov {
+            beta * ((vov * vds) - 0.5 * vds * vds) * (1.0 + model.lambda * vds)
+        } else {
+            0.5 * beta * vov * vov * (1.0 + model.lambda * vds)
+        };
+        sign * ids
+    }).collect();
+
+    BranchCurrents { resistors, capacitors, inductors, voltage_sources, diodes, mosfets }
 }
 
 pub fn update_transient_state(
@@ -302,17 +444,31 @@ pub fn update_transient_state(
     state: &mut TransientState,
 ) {
     state.capacitor_voltages = circuit
-    .capacitors
-    .iter()
-    .map(|c| node_voltage(solution, c.n1) - node_voltage(solution, c.n2))
-    .collect();
+        .capacitors
+        .iter()
+        .map(|c| node_voltage(solution, c.n1) - node_voltage(solution, c.n2))
+        .collect();
 
     let n_nodes = circuit.nodes.saturating_sub(1);
     let branch_base = n_nodes + circuit.voltage_sources.len();
     state.inductor_currents = circuit
-    .inductors
-    .iter()
-    .enumerate()
-    .map(|(i, _)| solution[branch_base + i])
-    .collect();
+        .inductors
+        .iter()
+        .enumerate()
+        .map(|(i, _)| solution[branch_base + i])
+        .collect();
+}
+
+// ─── Public helpers used by analysis::seed_initial_guess ─────────────────────
+
+/// Public wrapper around the private `node_index` — maps NodeId → MNA row index.
+#[inline]
+pub fn node_index_pub(node: NodeId) -> Option<usize> {
+    node_index(node)
+}
+
+/// Public wrapper around the private `stamp_conductance`.
+#[inline]
+pub fn stamp_conductance_pub(sys: &mut MnaSystem, n1: NodeId, n2: NodeId, g: f64) {
+    stamp_conductance(sys, n1, n2, g);
 }

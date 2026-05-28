@@ -116,8 +116,11 @@ pub fn run(circuit: &Circuit, analysis: &AnalysisCommands) -> Result<SimulationR
 /// raw solution vector. The raw vector is needed by AC analysis (linearisation)
 /// and can seed transient initial conditions.
 pub fn solve_dc_op(circuit: &Circuit) -> Result<(DcResult, nalgebra::DVector<f64>)> {
-    let size = circuit.tran_matrix_size();
-    let mut x = nalgebra::DVector::zeros(size);
+    // Seed from linear solve (resistors + V sources + small stubs for nonlinear devices).
+    // This gives the NR loop a starting point close to the real answer, avoiding
+    // cut-off initialisation issues with MOSFETs.
+    let mut x = seed_initial_guess(circuit)?;
+
     let tol = 1e-6;
     let mut converged = false;
     for _ in 0..100 {
@@ -135,6 +138,72 @@ pub fn solve_dc_op(circuit: &Circuit) -> Result<(DcResult, nalgebra::DVector<f64
     }
     let result = extract_dc(circuit, &x);
     Ok((result, x))
+}
+
+/// Build a reasonable initial guess for the NR iteration.
+///
+/// We stamp only the linear elements (resistors + voltage sources) plus a
+/// small conductance stub for every nonlinear device, then solve once.  This
+/// gives a voltage profile close to the final answer without any nonlinear
+/// maths.
+fn seed_initial_guess(circuit: &Circuit) -> Result<nalgebra::DVector<f64>> {
+    use crate::mna::MnaSystem;
+
+    let size  = circuit.tran_matrix_size();
+    let mut sys = MnaSystem::new(size);
+    let n_nodes = circuit.nodes.saturating_sub(1);
+
+    // Resistors.
+    for r in &circuit.resistors {
+        let g = 1.0 / r.resistance;
+        crate::mna::stamp_conductance_pub(&mut sys, r.n1, r.n2, g);
+    }
+
+    // Voltage sources at their DC value.
+    for (i, v) in circuit.voltage_sources.iter().enumerate() {
+        let branch = n_nodes + i;
+        use crate::mna::node_index_pub;
+        if let Some(i1) = node_index_pub(v.n1) {
+            sys.a[(i1, branch)] += 1.0;
+            sys.a[(branch, i1)] += 1.0;
+        }
+        if let Some(i2) = node_index_pub(v.n2) {
+            sys.a[(i2, branch)] -= 1.0;
+            sys.a[(branch, i2)] -= 1.0;
+        }
+        sys.z[branch] = v.voltage;
+    }
+
+    // Inductors as 0 V shorts (same as build_dc).
+    for (i, l) in circuit.inductors.iter().enumerate() {
+        let branch = n_nodes + circuit.voltage_sources.len() + i;
+        use crate::mna::node_index_pub;
+        if let Some(i1) = node_index_pub(l.n1) {
+            sys.a[(i1, branch)] += 1.0;
+            sys.a[(branch, i1)] += 1.0;
+        }
+        if let Some(i2) = node_index_pub(l.n2) {
+            sys.a[(i2, branch)] -= 1.0;
+            sys.a[(branch, i2)] -= 1.0;
+        }
+    }
+
+    // Diodes and MOSFETs: small-conductance stub so every node has a path.
+    let g_stub = 1e-6;
+    for d in &circuit.diodes {
+        crate::mna::stamp_conductance_pub(&mut sys, d.anode, d.cathode, g_stub);
+    }
+    for m in &circuit.mosfets {
+        // Stub between drain and source keeps the drain node from floating.
+        crate::mna::stamp_conductance_pub(&mut sys, m.nd, m.ns, g_stub);
+    }
+
+    // If the matrix is still singular (e.g. all-floating island), fall back
+    // to zero rather than crashing.
+    match sys.solve() {
+        Ok(x0) => Ok(x0),
+        Err(_)  => Ok(nalgebra::DVector::zeros(size)),
+    }
 }
 
 /// Public convenience wrapper that discards the raw vector.

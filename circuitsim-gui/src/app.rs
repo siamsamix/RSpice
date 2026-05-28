@@ -2647,7 +2647,7 @@ impl CircuitSimApp {
 
                 for node in 1..n_nodes.min(ac_plot_nodes.len()) {
                     if !ac_plot_nodes[node] { continue; }
-                    let pts: PlotPoints = points_snapshot.iter().map(|(freq, voltages, _currents)| {
+                    let pts: PlotPoints = points_snapshot.iter().map(|(freq, ref voltages, ref _currents)| {
                         let v = voltages.get(node).copied().unwrap_or_default();
                         let mag = v.norm();
 
@@ -2656,7 +2656,7 @@ impl CircuitSimApp {
                                                                      AcMagScale::Linear => mag,
                         } * mag_y_mult; // Scale applied here
 
-                        let scaled_freq = freq * x_mult;
+                        let scaled_freq = *freq * x_mult;
                         let x = match mag_scale {
                             AcMagScale::Db     => scaled_freq.log10(),
                                                                      AcMagScale::Linear => scaled_freq,
@@ -2743,11 +2743,11 @@ impl CircuitSimApp {
 
                 for node in 1..n_nodes.min(ac_plot_nodes.len()) {
                     if !ac_plot_nodes[node] { continue; }
-                    let pts: PlotPoints = points_snapshot.iter().map(|(freq, voltages, _currents)| {
+                    let pts: PlotPoints = points_snapshot.iter().map(|(freq, ref voltages, ref _currents)| {
                         let v = voltages.get(node).copied().unwrap_or_default();
 
                         let phase_deg = v.arg().to_degrees() * phase_y_mult;
-                        let scaled_freq = freq * x_mult;
+                        let scaled_freq = *freq * x_mult;
 
                         let x = match mag_scale {
                             AcMagScale::Db     => scaled_freq.log10(),
@@ -2818,7 +2818,7 @@ impl CircuitSimApp {
                     let data: Vec<[f64;2]> = points_snapshot.iter().map(|(freq, _, b)| {
                         let mag = b.resistors.get(i).map(|c| c.norm()).unwrap_or(0.0);
                         let y = match mag_scale { AcMagScale::Db => if mag > 0.0 { 20.0*mag.log10() } else { -200.0 }, AcMagScale::Linear => mag } * mag_y_mult;
-                        let x = if matches!(mag_scale, AcMagScale::Db) { (freq * x_mult).log10() } else { freq * x_mult };
+                        let x = if matches!(mag_scale, AcMagScale::Db) { (*freq * x_mult).log10() } else { *freq * x_mult };
                         [x, y]
                     }).collect();
                     plot_branch_current_mag(plot_ui, format!("I(R{})", i+1), data, PLOT_COLORS[color_idx % PLOT_COLORS.len()]);
@@ -2828,7 +2828,7 @@ impl CircuitSimApp {
                     let data: Vec<[f64;2]> = points_snapshot.iter().map(|(freq, _, b)| {
                         let mag = b.capacitors.get(i).map(|c| c.norm()).unwrap_or(0.0);
                         let y = match mag_scale { AcMagScale::Db => if mag > 0.0 { 20.0*mag.log10() } else { -200.0 }, AcMagScale::Linear => mag } * mag_y_mult;
-                        let x = if matches!(mag_scale, AcMagScale::Db) { (freq * x_mult).log10() } else { freq * x_mult };
+                        let x = if matches!(mag_scale, AcMagScale::Db) { (*freq * x_mult).log10() } else { *freq * x_mult };
                         [x, y]
                     }).collect();
                     plot_branch_current_mag(plot_ui, format!("I(C{})", i+1), data, PLOT_COLORS[color_idx % PLOT_COLORS.len()]);
@@ -2838,7 +2838,7 @@ impl CircuitSimApp {
                     let data: Vec<[f64;2]> = points_snapshot.iter().map(|(freq, _, b)| {
                         let mag = b.inductors.get(i).map(|c| c.norm()).unwrap_or(0.0);
                         let y = match mag_scale { AcMagScale::Db => if mag > 0.0 { 20.0*mag.log10() } else { -200.0 }, AcMagScale::Linear => mag } * mag_y_mult;
-                        let x = if matches!(mag_scale, AcMagScale::Db) { (freq * x_mult).log10() } else { freq * x_mult };
+                        let x = if matches!(mag_scale, AcMagScale::Db) { (*freq * x_mult).log10() } else { *freq * x_mult };
                         [x, y]
                     }).collect();
                     plot_branch_current_mag(plot_ui, format!("I(L{})", i+1), data, PLOT_COLORS[color_idx % PLOT_COLORS.len()]);
@@ -2848,7 +2848,7 @@ impl CircuitSimApp {
                     let data: Vec<[f64;2]> = points_snapshot.iter().map(|(freq, _, b)| {
                         let mag = b.voltage_sources.get(i).map(|c| c.norm()).unwrap_or(0.0);
                         let y = match mag_scale { AcMagScale::Db => if mag > 0.0 { 20.0*mag.log10() } else { -200.0 }, AcMagScale::Linear => mag } * mag_y_mult;
-                        let x = if matches!(mag_scale, AcMagScale::Db) { (freq * x_mult).log10() } else { freq * x_mult };
+                        let x = if matches!(mag_scale, AcMagScale::Db) { (*freq * x_mult).log10() } else { *freq * x_mult };
                         [x, y]
                     }).collect();
                     plot_branch_current_mag(plot_ui, format!("I(V{})", i+1), data, PLOT_COLORS[color_idx % PLOT_COLORS.len()]);
@@ -2858,7 +2858,7 @@ impl CircuitSimApp {
                     let data: Vec<[f64;2]> = points_snapshot.iter().map(|(freq, _, b)| {
                         let mag = b.diodes.get(i).map(|c| c.norm()).unwrap_or(0.0);
                         let y = match mag_scale { AcMagScale::Db => if mag > 0.0 { 20.0*mag.log10() } else { -200.0 }, AcMagScale::Linear => mag } * mag_y_mult;
-                        let x = if matches!(mag_scale, AcMagScale::Db) { (freq * x_mult).log10() } else { freq * x_mult };
+                        let x = if matches!(mag_scale, AcMagScale::Db) { (*freq * x_mult).log10() } else { *freq * x_mult };
                         [x, y]
                     }).collect();
                     plot_branch_current_mag(plot_ui, format!("I(D{})", i+1), data, PLOT_COLORS[color_idx % PLOT_COLORS.len()]);
@@ -2911,7 +2911,7 @@ impl CircuitSimApp {
                 for i in 0..nr {
                     let data: Vec<[f64;2]> = points_snapshot.iter().map(|(freq, _, b)| {
                         let phase = b.resistors.get(i).map(|c| c.arg().to_degrees()).unwrap_or(0.0) * phase_y_mult;
-                        let x = if matches!(mag_scale, AcMagScale::Db) { (freq * x_mult).log10() } else { freq * x_mult };
+                        let x = if matches!(mag_scale, AcMagScale::Db) { (*freq * x_mult).log10() } else { *freq * x_mult };
                         [x, phase]
                     }).collect();
                     plot_phase(plot_ui, format!("I(R{}) phase", i+1), data, PLOT_COLORS[color_idx % PLOT_COLORS.len()]);
@@ -2920,7 +2920,7 @@ impl CircuitSimApp {
                 for i in 0..nc {
                     let data: Vec<[f64;2]> = points_snapshot.iter().map(|(freq, _, b)| {
                         let phase = b.capacitors.get(i).map(|c| c.arg().to_degrees()).unwrap_or(0.0) * phase_y_mult;
-                        let x = if matches!(mag_scale, AcMagScale::Db) { (freq * x_mult).log10() } else { freq * x_mult };
+                        let x = if matches!(mag_scale, AcMagScale::Db) { (*freq * x_mult).log10() } else { *freq * x_mult };
                         [x, phase]
                     }).collect();
                     plot_phase(plot_ui, format!("I(C{}) phase", i+1), data, PLOT_COLORS[color_idx % PLOT_COLORS.len()]);
@@ -2929,7 +2929,7 @@ impl CircuitSimApp {
                 for i in 0..nl {
                     let data: Vec<[f64;2]> = points_snapshot.iter().map(|(freq, _, b)| {
                         let phase = b.inductors.get(i).map(|c| c.arg().to_degrees()).unwrap_or(0.0) * phase_y_mult;
-                        let x = if matches!(mag_scale, AcMagScale::Db) { (freq * x_mult).log10() } else { freq * x_mult };
+                        let x = if matches!(mag_scale, AcMagScale::Db) { (*freq * x_mult).log10() } else { *freq * x_mult };
                         [x, phase]
                     }).collect();
                     plot_phase(plot_ui, format!("I(L{}) phase", i+1), data, PLOT_COLORS[color_idx % PLOT_COLORS.len()]);
@@ -2938,7 +2938,7 @@ impl CircuitSimApp {
                 for i in 0..nv {
                     let data: Vec<[f64;2]> = points_snapshot.iter().map(|(freq, _, b)| {
                         let phase = b.voltage_sources.get(i).map(|c| c.arg().to_degrees()).unwrap_or(0.0) * phase_y_mult;
-                        let x = if matches!(mag_scale, AcMagScale::Db) { (freq * x_mult).log10() } else { freq * x_mult };
+                        let x = if matches!(mag_scale, AcMagScale::Db) { (*freq * x_mult).log10() } else { *freq * x_mult };
                         [x, phase]
                     }).collect();
                     plot_phase(plot_ui, format!("I(V{}) phase", i+1), data, PLOT_COLORS[color_idx % PLOT_COLORS.len()]);
@@ -2947,7 +2947,7 @@ impl CircuitSimApp {
                 for i in 0..nd {
                     let data: Vec<[f64;2]> = points_snapshot.iter().map(|(freq, _, b)| {
                         let phase = b.diodes.get(i).map(|c| c.arg().to_degrees()).unwrap_or(0.0) * phase_y_mult;
-                        let x = if matches!(mag_scale, AcMagScale::Db) { (freq * x_mult).log10() } else { freq * x_mult };
+                        let x = if matches!(mag_scale, AcMagScale::Db) { (*freq * x_mult).log10() } else { *freq * x_mult };
                         [x, phase]
                     }).collect();
                     plot_phase(plot_ui, format!("I(D{}) phase", i+1), data, PLOT_COLORS[color_idx % PLOT_COLORS.len()]);

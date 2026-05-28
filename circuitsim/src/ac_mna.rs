@@ -91,6 +91,83 @@ pub fn build_ac(
         // z[branch] = 0  (no independent source in the inductor branch)
     }
 
+    // ── MOSFETs (small-signal, linearised at DC OP) ──────────────────────────
+    //
+    // Level-1 small-signal model has three real conductances — no reactive
+    // elements at this model level, so all stamps are purely real at every ω:
+    //
+    //   gds  : drain-source output conductance  → admittance between nd and ns
+    //   gm   : transconductance (Vgs-controlled) → VCCS stamped into G matrix
+    //   gbs  : body-effect transconductance (Vbs-controlled) → VCCS
+    //
+    // For PMOS, terminal voltages are negated before evaluation and the
+    // controlled-source directions are reversed (sign = -1).
+    for m in &circuit.mosfets {
+        let model = circuit.mosfet_models.get(&m.model)
+            .expect("MOSFET model not found during AC build");
+
+        use crate::circuit::MosfetType;
+        let sign = if model.kind == MosfetType::Pmos { -1.0 } else { 1.0 };
+
+        let vd = sign * node_voltage_real(dc_solution, m.nd);
+        let vg = sign * node_voltage_real(dc_solution, m.ng);
+        let vs = sign * node_voltage_real(dc_solution, m.ns);
+        let vb = sign * node_voltage_real(dc_solution, m.nb);
+
+        let beta = model.kp * (m.w / m.l);
+        let vsb  = vs - vb;
+        let vth  = model.vth0
+            + model.gamma * ((model.phi + vsb).abs().sqrt() - model.phi.abs().sqrt());
+        let vgs  = vg - vs;
+        let vds  = vd - vs;
+        let vov  = vgs - vth;
+
+        let (gm, gds, gbs) = if vov <= 0.0 {
+            (1e-12_f64, 1e-12_f64, 0.0_f64)
+        } else if vds < vov {
+            // Linear (triode) region.
+            let gm_l  = beta * vds * (1.0 + model.lambda * vds);
+            let gds_l = beta * (vov - vds) * (1.0 + model.lambda * vds)
+                + beta * ((vov * vds) - 0.5 * vds * vds) * model.lambda;
+            let dvth_dvsb = model.gamma / (2.0 * (model.phi + vsb).abs().sqrt().max(1e-9));
+            (gm_l.max(0.0), gds_l.max(1e-12), gm_l * dvth_dvsb)
+        } else {
+            // Saturation region.
+            let gm_s  = beta * vov * (1.0 + model.lambda * vds);
+            let gds_s = 0.5 * beta * vov * vov * model.lambda;
+            let dvth_dvsb = model.gamma / (2.0 * (model.phi + vsb).abs().sqrt().max(1e-9));
+            (gm_s.max(0.0), gds_s.max(1e-12), gm_s * dvth_dvsb)
+        };
+
+        // gds: output conductance — real admittance between drain and source.
+        stamp_admittance(&mut sys, m.nd, m.ns, Complex64::new(gds, 0.0));
+
+        // gm: transconductance VCCS  Id = sign·gm·Vgs  (Vgs = Vg − Vs)
+        //   +gm at (nd,ng), −gm at (nd,ns), −gm at (ns,ng), +gm at (ns,ns)
+        let gm_c  = Complex64::new(sign * gm,  0.0);
+        let gbs_c = Complex64::new(sign * gbs, 0.0);
+
+        if let Some(id) = node_index(m.nd) {
+            if let Some(ig) = node_index(m.ng) { sys.a[(id, ig)] += gm_c; }
+            if let Some(is) = node_index(m.ns) { sys.a[(id, is)] -= gm_c; }
+        }
+        if let Some(is) = node_index(m.ns) {
+            if let Some(ig) = node_index(m.ng) { sys.a[(is, ig)] -= gm_c; }
+            // Note: (ns,ns) diagonal — use a fresh lookup to satisfy borrow checker.
+            if let Some(is2) = node_index(m.ns) { sys.a[(is, is2)] += gm_c; }
+        }
+
+        // gbs: body-effect VCCS  Id = sign·gbs·Vbs  (Vbs = Vb − Vs)
+        if let Some(id) = node_index(m.nd) {
+            if let Some(ib) = node_index(m.nb) { sys.a[(id, ib)] += gbs_c; }
+            if let Some(is) = node_index(m.ns) { sys.a[(id, is)] -= gbs_c; }
+        }
+        if let Some(is) = node_index(m.ns) {
+            if let Some(ib) = node_index(m.nb) { sys.a[(is, ib)] -= gbs_c; }
+            if let Some(is2) = node_index(m.ns) { sys.a[(is, is2)] += gbs_c; }
+        }
+    }
+
     // ── Diodes (linearised at DC OP) ─────────────────────────────────────────
     for d in &circuit.diodes {
         let model = circuit.diode_models.get(&d.model)
@@ -165,6 +242,8 @@ pub struct AcBranchCurrents {
     pub inductors:       Vec<Complex64>,
     pub voltage_sources: Vec<Complex64>,
     pub diodes:          Vec<Complex64>,
+    /// Small-signal drain current phasor for each MOSFET: Id = gm·Vgs + gds·Vds + gbs·Vbs
+    pub mosfets:         Vec<Complex64>,
 }
 
 /// Compute small-signal AC branch currents from a solved AC system.
@@ -224,5 +303,66 @@ pub fn compute_ac_branch_currents(
         Complex64::new(gd, 0.0) * (va_ac - vc_ac)
     }).collect();
 
-    AcBranchCurrents { resistors, capacitors, inductors, voltage_sources, diodes }
+    // ── MOSFETs: small-signal drain current phasor ────────────────────────
+    //
+    // Id = gm·Vgs + gds·Vds + gbs·Vbs   (all conductances real at level-1)
+    //
+    // Conductances are re-derived from the DC bias point (same calculation as
+    // in build_ac) so this function is self-contained and can be called without
+    // needing to store the intermediate gm/gds/gbs values.
+    let mosfets = circuit.mosfets.iter().map(|m| {
+        let model = circuit.mosfet_models.get(&m.model)
+            .expect("MOSFET model not found in compute_ac_branch_currents");
+
+        use crate::circuit::MosfetType;
+        let sign = if model.kind == MosfetType::Pmos { -1.0 } else { 1.0 };
+
+        // DC bias voltages (real).
+        let vd_dc = sign * node_voltage_real(dc_solution, m.nd);
+        let vg_dc = sign * node_voltage_real(dc_solution, m.ng);
+        let vs_dc = sign * node_voltage_real(dc_solution, m.ns);
+        let vb_dc = sign * node_voltage_real(dc_solution, m.nb);
+
+        let beta  = model.kp * (m.w / m.l);
+        let vsb   = vs_dc - vb_dc;
+        let vth   = model.vth0
+            + model.gamma * ((model.phi + vsb).abs().sqrt() - model.phi.abs().sqrt());
+        let vgs_dc = vg_dc - vs_dc;
+        let vds_dc = vd_dc - vs_dc;
+        let vov    = vgs_dc - vth;
+
+        let (gm, gds, gbs) = if vov <= 0.0 {
+            (1e-12_f64, 1e-12_f64, 0.0_f64)
+        } else if vds_dc < vov {
+            let gm_l  = beta * vds_dc * (1.0 + model.lambda * vds_dc);
+            let gds_l = beta * (vov - vds_dc) * (1.0 + model.lambda * vds_dc)
+                + beta * ((vov * vds_dc) - 0.5 * vds_dc * vds_dc) * model.lambda;
+            let dvth_dvsb = model.gamma / (2.0 * (model.phi + vsb).abs().sqrt().max(1e-9));
+            (gm_l.max(0.0), gds_l.max(1e-12), gm_l * dvth_dvsb)
+        } else {
+            let gm_s  = beta * vov * (1.0 + model.lambda * vds_dc);
+            let gds_s = 0.5 * beta * vov * vov * model.lambda;
+            let dvth_dvsb = model.gamma / (2.0 * (model.phi + vsb).abs().sqrt().max(1e-9));
+            (gm_s.max(0.0), gds_s.max(1e-12), gm_s * dvth_dvsb)
+        };
+
+        // AC (small-signal) terminal voltages.
+        let vd_ac = node_voltage_complex(solution, m.nd);
+        let vg_ac = node_voltage_complex(solution, m.ng);
+        let vs_ac = node_voltage_complex(solution, m.ns);
+        let vb_ac = node_voltage_complex(solution, m.nb);
+
+        let vgs_ac = vg_ac - vs_ac;
+        let vds_ac = vd_ac - vs_ac;
+        let vbs_ac = vb_ac - vs_ac;
+
+        // Id = gm·Vgs + gds·Vds + gbs·Vbs, scaled by sign for PMOS.
+        let id = Complex64::new(sign, 0.0)
+            * (Complex64::new(gm,  0.0) * vgs_ac
+             + Complex64::new(gds, 0.0) * vds_ac
+             + Complex64::new(gbs, 0.0) * vbs_ac);
+        id
+    }).collect();
+
+    AcBranchCurrents { resistors, capacitors, inductors, voltage_sources, diodes, mosfets }
 }

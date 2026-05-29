@@ -36,10 +36,6 @@ Desktop app built with **egui** — dark theme, netlist editor, DC tables, and i
 - **Open / Save** — netlist files (`.cir`)  
 - Tabs: **Overview**, **DC**, **Waveforms** (zoomable plot)
 
-```bash
-cargo run --release -p circuitsim-gui
-```
-
 ## Netlist format
 
 SPICE-style text netlists:

@@ -2593,17 +2593,38 @@ impl CircuitSimApp {
 
             plot = match mag_scale {
                 AcMagScale::Db => plot
-                .x_grid_spacer(egui_plot::log_grid_spacer(10))
-                .label_formatter(move |name, val| {
-                    if name.is_empty() { return String::new(); }
-                    let f = 10.0_f64.powf(val.x); // convert log10(x) back to real freq for the tooltip
-                    format!("{}\nf = {:.3e} Hz\n{} = {:.3e}", name, f, mag_label, val.y)
-                }),
+                    .x_grid_spacer(egui_plot::log_grid_spacer(10))
+                    // NEW: Format the X-axis ticks so they display actual frequencies, not log10 exponents
+                    .x_axis_formatter(|mark, _range| {
+                        // Note: If you are using an older egui version where `mark` is an f64, remove `.value`
+                        let f = 10.0_f64.powf(mark.value);
+
+                        if f >= 1e9 { format!("{:.1} G", f / 1e9) }
+                        else if f >= 1e6 { format!("{:.1} M", f / 1e6) }
+                        else if f >= 1e3 { format!("{:.1} k", f / 1e3) }
+                        else { format!("{:.1}", f) }
+                    })
+                    .label_formatter(move |name, val| {
+                        if name.is_empty() { return String::new(); }
+                        let f = 10.0_f64.powf(val.x);
+                        // FIXED: Using `f` instead of `val.x`
+                        format!("{}\nf = {:.3e} Hz\n{} = {:.3e}", name, f, mag_label, val.y)
+                    }),
+
                 AcMagScale::Linear => plot
-                .label_formatter(move |name, val| {
-                    if name.is_empty() { return String::new(); }
-                    format!("{}\nf = {:.3e} Hz\n{} = {:.3e}", name, val.x, mag_label, val.y)
-                }),
+                    // NEW: Added formatter here too for visual consistency if they use Linear mode
+                    .x_axis_formatter(|mark, _range| {
+                        let f = mark.value; // No 10^x transform needed in linear mode
+
+                        if f >= 1e9 { format!("{:.1} G", f / 1e9) }
+                        else if f >= 1e6 { format!("{:.1} M", f / 1e6) }
+                        else if f >= 1e3 { format!("{:.1} k", f / 1e3) }
+                        else { format!("{:.1}", f) }
+                    })
+                    .label_formatter(move |name, val| {
+                        if name.is_empty() { return String::new(); }
+                        format!("{}\nf = {:.3e} Hz\n{} = {:.3e}", name, val.x, mag_label, val.y)
+                    }),
             };
 
             plot.show(ui, |plot_ui| {
@@ -2653,13 +2674,13 @@ impl CircuitSimApp {
 
                         let y = match mag_scale {
                             AcMagScale::Db     => if mag > 0.0 { 20.0 * mag.log10() } else { -200.0 },
-                                                                     AcMagScale::Linear => mag,
+                            AcMagScale::Linear => mag,
                         } * mag_y_mult; // Scale applied here
 
                         let scaled_freq = *freq * x_mult;
                         let x = match mag_scale {
                             AcMagScale::Db     => scaled_freq.log10(),
-                                                                     AcMagScale::Linear => scaled_freq,
+                            AcMagScale::Linear => scaled_freq,
                         };
                         [x, y]
                     }).collect();

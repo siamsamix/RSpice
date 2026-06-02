@@ -104,6 +104,12 @@ pub struct Diode {
     pub model: String,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct Ac {
+    pub mag: f64,
+    pub phase: f64,
+}
+
 #[derive(Debug, Clone)]
 pub struct Pulse {
     pub v1: f64,
@@ -177,6 +183,7 @@ pub struct VoltageSource {
     pub voltage: f64,
     pub pulse: Option<Pulse>,
     pub sine: Option<Sine>,
+    pub ac: Option<Ac>,
 }
 
 impl VoltageSource {

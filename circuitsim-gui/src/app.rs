@@ -200,7 +200,7 @@ impl Example {
             Example::RcLowPass => {
                 r#"* RC low-pass filter — frequency sweep
                 * Corner frequency: fc = 1/(2π·R·C) ≈ 1.59 kHz
-                V1 1 0 DC 0
+                V1 1 0 AC 1
                 R1 1 2 1k
                 C1 2 0 100n
                 .ac dec 200 10 100k
@@ -2576,7 +2576,7 @@ impl CircuitSimApp {
         // ── Magnitude plot ───────────────────────────────────────────────────
         let mag_label = match mag_scale {
             AcMagScale::Db     => "magnitude (dB)",
-            AcMagScale::Linear => "magnitude (V/V)",
+            AcMagScale::Linear => "magnitude (V)",
         };
 
         code_frame().show(ui, |ui| {

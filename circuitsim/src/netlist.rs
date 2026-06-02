@@ -1,8 +1,5 @@
 use crate::analysis::{AcCommand, AcScale};
-use crate::circuit::{
-    Capacitor, Circuit, Inductor, Mosfet, MosfetModel, MosfetType, NodeId, Pulse, Resistor,
-    VoltageSource, Sine, Diode,
-};
+use crate::circuit::{Capacitor, Circuit, Inductor, Mosfet, MosfetModel, MosfetType, NodeId, Pulse, Resistor, VoltageSource, Sine, Diode, Ac};
 use crate::error::{Result, SimError};
 use crate::units::parse_value;
 use crate::circuit::DiodeModel;
@@ -284,6 +281,7 @@ fn parse_voltage_source(tokens: &[&str], circuit: &mut Circuit) -> Result<()> {
     let mut dc_voltage = None;
     let mut pulse = None;
     let mut sine = None;
+    let mut ac = None;
     let mut i = 3;
 
     while i < tokens.len() {
@@ -295,6 +293,23 @@ fn parse_voltage_source(tokens: &[&str], circuit: &mut Circuit) -> Result<()> {
             }
             dc_voltage = Some(parse_value(tokens[i]).map_err(SimError::Parse)?);
             i += 1;
+        }else if token_lower == "ac" {
+            i += 1;
+            if i >= tokens.len() {
+                return Err(SimError::Parse("voltage source missing AC magnitude".into()));
+            }
+            let mag = parse_value(tokens[i]).map_err(SimError::Parse)?;
+            i += 1;
+
+            let mut phase = 0.0;
+            // Phase is optional. If the next token is a valid value, parse it as phase.
+            if i < tokens.len() {
+                if let Ok(p) = parse_value(tokens[i]) {
+                    phase = p;
+                    i += 1;
+                }
+            }
+            ac = Some(Ac { mag, phase });
         } else if token_lower.starts_with("pulse") {
             let remainder = tokens[i..].join(" ");
             let cleaned = remainder
@@ -362,6 +377,7 @@ fn parse_voltage_source(tokens: &[&str], circuit: &mut Circuit) -> Result<()> {
         voltage: final_voltage,
         pulse,
         sine,
+        ac,
     });
     Ok(())
 }

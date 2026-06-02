@@ -409,10 +409,10 @@ pub fn run_ac_sweep(circuit: &Circuit, cmd: &AcCommand, dc_x: &nalgebra::DVector
 
     for &freq in &freqs {
         let mut sys = build_ac(circuit, freq, &dc_x)?;
-
+        let amp = circuit.voltage_sources[stim_idx].ac.unwrap().mag;
         // Drive the stimulus source with the AC amplitude.
         // All other sources remain at 0 V (short circuit in small-signal model).
-        sys.z[stim_branch] = num_complex::Complex64::new(cmd.stimulus_amplitude, 0.0);
+        sys.z[stim_branch] = num_complex::Complex64::new(amp, 0.0);
 
         let x = sys.solve()?;
 

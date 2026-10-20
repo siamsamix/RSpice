@@ -1,51 +1,9 @@
 use crate::error::{Result, SimError};
 use std::collections::HashMap;
 
-
-#[derive(Debug, Clone)]
-pub struct DiodeModel {
-    pub is: f64,
-    pub n: f64,
-}
-
-// ─── MOSFET ──────────────────────────────────────────────────────────────────
-
-#[derive(Debug, Clone, PartialEq)]
-pub enum MosfetType {
-    Nmos,
-    Pmos,
-}
-
-/// Level-1 (Shichman-Hodges) MOSFET model parameters.
-/// Mirrors standard SPICE .MODEL NMOS/PMOS card syntax.
-#[derive(Debug, Clone)]
-pub struct MosfetModel {
-    pub kind: MosfetType,
-    /// Transconductance parameter KP = µ·Cox (A/V²).
-    pub kp: f64,
-    /// Zero-bias threshold voltage Vth0 (V).
-    pub vth0: f64,
-    /// Channel-length modulation coefficient λ (1/V). 0 = ideal.
-    pub lambda: f64,
-    /// Bulk threshold modulation γ (V^0.5).
-    pub gamma: f64,
-    /// Strong-inversion surface potential 2·φF (V).
-    pub phi: f64,
-}
-
-impl Default for MosfetModel {
-    /// Reasonable level-1 NMOS defaults (matches SPICE internal defaults).
-    fn default() -> Self {
-        Self {
-            kind: MosfetType::Nmos,
-            kp: 20e-6,
-            vth0: 0.7,
-            lambda: 0.0,
-            gamma: 0.0,
-            phi: 0.6,
-        }
-    }
-}
+// Device model cards live in `model.rs` together with the device equations —
+// one module owns the physics. Re-exported here for the historical paths.
+pub use crate::model::{DiodeModel, MosfetModel, MosfetType};
 
 #[derive(Debug, Clone)]
 pub struct Mosfet {

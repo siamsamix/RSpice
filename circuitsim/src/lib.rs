@@ -7,6 +7,7 @@ pub mod analysis;
 pub mod circuit;
 pub mod error;
 pub mod mna;
+pub mod model;
 pub mod netlist;
 pub mod units;
 pub mod ac_mna;

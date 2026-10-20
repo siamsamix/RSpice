@@ -114,30 +114,13 @@ pub fn build_ac(
         let vs = sign * node_voltage_real(dc_solution, m.ns);
         let vb = sign * node_voltage_real(dc_solution, m.nb);
 
+        // Small-signal linearization at the DC OP — one copy, in model.rs.
+        // Raw Vds here (no stamp-side clamp), as in the pre-consolidation path.
         let beta = model.kp * (m.w / m.l);
-        let vsb  = vs - vb;
-        let vth  = model.vth0
-            + model.gamma * ((model.phi + vsb).abs().sqrt() - model.phi.abs().sqrt());
-        let vgs  = vg - vs;
-        let vds  = vd - vs;
-        let vov  = vgs - vth;
-
-        let (gm, gds, gbs) = if vov <= 0.0 {
-            (1e-12_f64, 1e-12_f64, 0.0_f64)
-        } else if vds < vov {
-            // Linear (triode) region.
-            let gm_l  = beta * vds * (1.0 + model.lambda * vds);
-            let gds_l = beta * (vov - vds) * (1.0 + model.lambda * vds)
-                + beta * ((vov * vds) - 0.5 * vds * vds) * model.lambda;
-            let dvth_dvsb = model.gamma / (2.0 * (model.phi + vsb).abs().sqrt().max(1e-9));
-            (gm_l.max(0.0), gds_l.max(1e-12), gm_l * dvth_dvsb)
-        } else {
-            // Saturation region.
-            let gm_s  = beta * vov * (1.0 + model.lambda * vds);
-            let gds_s = 0.5 * beta * vov * vov * model.lambda;
-            let dvth_dvsb = model.gamma / (2.0 * (model.phi + vsb).abs().sqrt().max(1e-9));
-            (gm_s.max(0.0), gds_s.max(1e-12), gm_s * dvth_dvsb)
-        };
+        let ev = model.eval(beta, vg - vs, vd - vs, vb - vs);
+        let gm = ev.gm;
+        let gds = ev.gds;
+        let gbs = ev.gbs;
 
         // gds: output conductance — real admittance between drain and source.
         stamp_admittance(&mut sys, m.nd, m.ns, Complex64::new(gds, 0.0));
@@ -174,10 +157,8 @@ pub fn build_ac(
             .expect("diode model not found during AC build");
         let v_a = node_voltage_real(dc_solution, d.anode);
         let v_c = node_voltage_real(dc_solution, d.cathode);
-        let vd = (v_a - v_c).clamp(-100.0, 0.8);
-        let vt_n = model.n * 0.02585;
-        let gd = (model.is / vt_n) * (vd / vt_n).exp();
-        stamp_admittance(&mut sys, d.anode, d.cathode, Complex64::new(gd, 0.0));
+        let ev = model.eval(v_a - v_c);
+        stamp_admittance(&mut sys, d.anode, d.cathode, Complex64::new(ev.gd, 0.0));
     }
 
     // ── Voltage sources ───────────────────────────────────────────────────────
@@ -292,11 +273,10 @@ pub fn compute_ac_branch_currents(
     let diodes = circuit.diodes.iter().map(|d| {
         let model = circuit.diode_models.get(&d.model)
             .expect("diode model not found in compute_ac_branch_currents");
-        let v_a_dc = node_voltage_real(dc_solution, d.anode);
-        let v_c_dc = node_voltage_real(dc_solution, d.cathode);
-        let vd     = (v_a_dc - v_c_dc).clamp(-100.0, 0.8);
-        let vt_n   = model.n * 0.02585;
-        let gd     = (model.is / vt_n) * (vd / vt_n).exp();
+        let gd = model
+            .eval(node_voltage_real(dc_solution, d.anode)
+                - node_voltage_real(dc_solution, d.cathode))
+            .gd;
         let va_ac  = node_voltage_complex(solution, d.anode);
         let vc_ac  = node_voltage_complex(solution, d.cathode);
         Complex64::new(gd, 0.0) * (va_ac - vc_ac)
@@ -306,9 +286,8 @@ pub fn compute_ac_branch_currents(
     //
     // Id = gm·Vgs + gds·Vds + gbs·Vbs   (all conductances real at level-1)
     //
-    // Conductances are re-derived from the DC bias point (same calculation as
-    // in build_ac) so this function is self-contained and can be called without
-    // needing to store the intermediate gm/gds/gbs values.
+    // Conductances come from model.rs's single copy of the level-1 equations,
+    // linearised at the DC bias point, so this stays self-contained.
     let mosfets = circuit.mosfets.iter().map(|m| {
         let model = circuit.mosfet_models.get(&m.model)
             .expect("MOSFET model not found in compute_ac_branch_currents");
@@ -316,34 +295,17 @@ pub fn compute_ac_branch_currents(
         use crate::circuit::MosfetType;
         let sign = if model.kind == MosfetType::Pmos { -1.0 } else { 1.0 };
 
-        // DC bias voltages (real).
+        // DC bias voltages (real) — mirroring as in build_ac.
         let vd_dc = sign * node_voltage_real(dc_solution, m.nd);
         let vg_dc = sign * node_voltage_real(dc_solution, m.ng);
         let vs_dc = sign * node_voltage_real(dc_solution, m.ns);
         let vb_dc = sign * node_voltage_real(dc_solution, m.nb);
 
         let beta  = model.kp * (m.w / m.l);
-        let vsb   = vs_dc - vb_dc;
-        let vth   = model.vth0
-            + model.gamma * ((model.phi + vsb).abs().sqrt() - model.phi.abs().sqrt());
-        let vgs_dc = vg_dc - vs_dc;
-        let vds_dc = vd_dc - vs_dc;
-        let vov    = vgs_dc - vth;
-
-        let (gm, gds, gbs) = if vov <= 0.0 {
-            (1e-12_f64, 1e-12_f64, 0.0_f64)
-        } else if vds_dc < vov {
-            let gm_l  = beta * vds_dc * (1.0 + model.lambda * vds_dc);
-            let gds_l = beta * (vov - vds_dc) * (1.0 + model.lambda * vds_dc)
-                + beta * ((vov * vds_dc) - 0.5 * vds_dc * vds_dc) * model.lambda;
-            let dvth_dvsb = model.gamma / (2.0 * (model.phi + vsb).abs().sqrt().max(1e-9));
-            (gm_l.max(0.0), gds_l.max(1e-12), gm_l * dvth_dvsb)
-        } else {
-            let gm_s  = beta * vov * (1.0 + model.lambda * vds_dc);
-            let gds_s = 0.5 * beta * vov * vov * model.lambda;
-            let dvth_dvsb = model.gamma / (2.0 * (model.phi + vsb).abs().sqrt().max(1e-9));
-            (gm_s.max(0.0), gds_s.max(1e-12), gm_s * dvth_dvsb)
-        };
+        let ev    = model.eval(beta, vg_dc - vs_dc, vd_dc - vs_dc, vb_dc - vs_dc);
+        let gm    = ev.gm;
+        let gds   = ev.gds;
+        let gbs   = ev.gbs;
 
         // AC (small-signal) terminal voltages.
         let vd_ac = node_voltage_complex(solution, m.nd);

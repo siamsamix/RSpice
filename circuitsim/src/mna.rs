@@ -106,19 +106,12 @@ fn stamp_diodes(circuit: &Circuit, sys: &mut MnaSystem, guess: &DVector<f64>) {
         let model = circuit.diode_models.get(&d.model).expect("Diode model not found");
         let v_anode   = node_voltage(guess, d.anode);
         let v_cathode = node_voltage(guess, d.cathode);
-        let vd = v_anode - v_cathode;
+        // Linearization, clamp, and companion current all come from the model —
+        // the physics lives in one place (model.rs).
+        let ev = model.eval(v_anode - v_cathode);
 
-        let vt = 0.02585;
-        let vd_clamped = vd.clamp(-100.0, 0.8);
-        let vt_n = model.n * vt;
-        let exp_term = (vd_clamped / vt_n).exp();
-
-        let id  = model.is * (exp_term - 1.0);
-        let gd  = (model.is / vt_n) * exp_term;
-        let ieq = id - gd * vd_clamped;
-
-        stamp_conductance(sys, d.anode, d.cathode, gd);
-        stamp_current_source(sys, d.anode, d.cathode, ieq);
+        stamp_conductance(sys, d.anode, d.cathode, ev.gd);
+        stamp_current_source(sys, d.anode, d.cathode, ev.i_eq);
     }
 }
 
@@ -149,65 +142,21 @@ fn stamp_mosfets(circuit: &Circuit, sys: &mut MnaSystem, guess: &DVector<f64>) {
         let vs = sign * vs_raw;
         let vb = sign * vb_raw;
 
-        // Effective width-over-length ratio times KP gives β (A/V²).
+        // β = KP·(W/L). The DC stamp linearizes at Vds ≥ 0 — the clamp belongs
+        // to this stamp's companion-model convention, not to the model itself.
         let beta = model.kp * (m.w / m.l);
-
-        // Body-effect: Vth = Vth0 + γ*(sqrt(|2φF - Vbs|) - sqrt(|2φF|))
-        let vsb = vs - vb;
-        let phi = model.phi;
-        let vth = model.vth0
-            + model.gamma * ((phi + vsb).abs().sqrt() - phi.abs().sqrt());
-
-        let vgs = vg - vs;
-        let vds = (vd - vs).max(0.0); // clamp: negative Vds → treat as Vds=0 (boundary of cut-off)
-        let vov = vgs - vth; // overdrive voltage
-
-        // Determine operating region and compute drain current + linearisation.
-        let (ids, gm, gds, gbs) = if vov <= 0.0 {
-            // ── Cut-off: device is OFF ────────────────────────────────────
-            // Use a tiny leakage conductance for numerical stability.
-            let g_leak = 1e-12;
-            (0.0, g_leak, g_leak, 0.0)
-        } else {
-            let vds_sat = vov; // Vds at saturation boundary
-
-            if vds < vds_sat {
-                // ── Linear (triode) region ───────────────────────────────
-                // Ids = β * [(Vgs - Vth)*Vds - Vds²/2] * (1 + λ·Vds)
-                let ids_lin = beta * ((vov * vds) - 0.5 * vds * vds)
-                    * (1.0 + model.lambda * vds);
-                let gm_lin  = beta * vds * (1.0 + model.lambda * vds);
-                let gds_lin = beta * (vov - vds)
-                    * (1.0 + model.lambda * vds)
-                    + beta * ((vov * vds) - 0.5 * vds * vds) * model.lambda;
-                // Body effect: d(Ids)/d(Vbs) ≈ -d(Ids)/d(Vth) * d(Vth)/d(Vbs)
-                let dvth_dvsb = model.gamma / (2.0 * (phi + vsb).abs().sqrt().max(1e-9));
-                let gbs_lin = gm_lin * dvth_dvsb;
-                (ids_lin, gm_lin.max(0.0), gds_lin.max(1e-12), gbs_lin)
-            } else {
-                // ── Saturation region ────────────────────────────────────
-                // Ids = (β/2) * (Vgs - Vth)² * (1 + λ·Vds)
-                let ids_sat = 0.5 * beta * vov * vov * (1.0 + model.lambda * vds);
-                let gm_sat  = beta * vov * (1.0 + model.lambda * vds);
-                let gds_sat = 0.5 * beta * vov * vov * model.lambda;
-                let dvth_dvsb = model.gamma / (2.0 * (phi + vsb).abs().sqrt().max(1e-9));
-                let gbs_sat = gm_sat * dvth_dvsb;
-                (ids_sat, gm_sat.max(0.0), gds_sat.max(1e-12), gbs_sat)
-            }
-        };
+        let ev = model.eval(beta, vg - vs, (vd - vs).max(0.0), vb - vs);
 
         // ── Linearised companion model (Newton-Raphson stamp) ─────────────
         //
-        // The terminal current into drain: Ids_lin = gds*Vds + gm*Vgs + gbs*Vbs + Ieq
-        //
-        // where: Ieq = Ids - gds*Vds_op - gm*Vgs_op - gbs*Vbs_op
+        // The terminal current into drain: Ids_lin = gds*Vds + gm*Vgs + gbs*Vbs + Ieq,
+        // where all coefficients and Ieq come from model.rs at the same
+        // linearization point.
         //
         // We apply sign to account for PMOS polarity.
-
-        let vgs_op = vgs;
-        let vds_op = vds;
-        let vbs_op = vb - vs;
-        let ids_eq = ids - gds * vds_op - gm * vgs_op - gbs * vbs_op;
+        let gm = ev.gm;
+        let gds = ev.gds;
+        let gbs = ev.gbs;
 
         // Helper: determine actual node pairs, honouring PMOS polarity.
         // For PMOS the stamped sense of current is reversed.
@@ -259,7 +208,7 @@ fn stamp_mosfets(circuit: &Circuit, sys: &mut MnaSystem, guess: &DVector<f64>) {
         }
 
         // -- Ieq: DC equivalent current injected at drain / extracted at source --
-        stamp_current_source(sys, drain, source, s * ids_eq);
+        stamp_current_source(sys, drain, source, s * ev.i_eq);
     }
 }
 
@@ -402,9 +351,7 @@ pub fn compute_branch_currents(
             .expect("diode model not found in compute_branch_currents");
         let v_a = node_voltage(solution, d.anode);
         let v_c = node_voltage(solution, d.cathode);
-        let vd = (v_a - v_c).clamp(-100.0, 0.8);
-        let vt_n = model.n * 0.02585;
-        model.is * ((vd / vt_n).exp() - 1.0)
+        model.eval(v_a - v_c).i_d
     }).collect();
 
     // MOSFET: re-evaluate Ids at the converged solution.
@@ -416,23 +363,9 @@ pub fn compute_branch_currents(
         let vg = sign * node_voltage(solution, m.ng);
         let vs = sign * node_voltage(solution, m.ns);
         let vb = sign * node_voltage(solution, m.nb);
-
         let beta = model.kp * (m.w / m.l);
-        let vsb  = vs - vb;
-        let vth  = model.vth0
-            + model.gamma * ((model.phi + vsb).abs().sqrt() - model.phi.abs().sqrt());
-        let vgs  = vg - vs;
-        let vds  = vd - vs;
-        let vov  = vgs - vth;
-
-        let ids = if vov <= 0.0 {
-            0.0
-        } else if vds < vov {
-            beta * ((vov * vds) - 0.5 * vds * vds) * (1.0 + model.lambda * vds)
-        } else {
-            0.5 * beta * vov * vov * (1.0 + model.lambda * vds)
-        };
-        sign * ids
+        // Raw Vds here: reports the physical model current, as before.
+        sign * model.eval(beta, vg - vs, vd - vs, vb - vs).ids
     }).collect();
 
     BranchCurrents { resistors, capacitors, inductors, voltage_sources, diodes, mosfets }

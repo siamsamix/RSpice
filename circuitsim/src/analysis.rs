@@ -131,9 +131,7 @@ pub fn solve_dc_op(circuit: &Circuit) -> Result<(DcResult, nalgebra::DVector<f64
 fn seed_initial_guess(circuit: &Circuit) -> Result<nalgebra::DVector<f64>> {
     use crate::mna::MnaSystem;
 
-    let size  = circuit.tran_matrix_size();
-    let mut sys = MnaSystem::new(size);
-    let n_nodes = circuit.nodes.saturating_sub(1);
+    let mut sys = MnaSystem::for_circuit(circuit);
 
     // Resistors.
     for r in &circuit.resistors {
@@ -143,7 +141,7 @@ fn seed_initial_guess(circuit: &Circuit) -> Result<nalgebra::DVector<f64>> {
 
     // Voltage sources at their DC value.
     for (i, v) in circuit.voltage_sources.iter().enumerate() {
-        let branch = n_nodes + i;
+        let branch = sys.branch.src_branch(i);
         use crate::mna::node_index_pub;
         if let Some(i1) = node_index_pub(v.n1) {
             sys.a[(i1, branch)] += 1.0;
@@ -158,7 +156,7 @@ fn seed_initial_guess(circuit: &Circuit) -> Result<nalgebra::DVector<f64>> {
 
     // Inductors as 0 V shorts (same as build_dc).
     for (i, l) in circuit.inductors.iter().enumerate() {
-        let branch = n_nodes + circuit.voltage_sources.len() + i;
+        let branch = sys.branch.ind_branch(i);
         use crate::mna::node_index_pub;
         if let Some(i1) = node_index_pub(l.n1) {
             sys.a[(i1, branch)] += 1.0;
@@ -182,6 +180,7 @@ fn seed_initial_guess(circuit: &Circuit) -> Result<nalgebra::DVector<f64>> {
 
     // If the matrix is still singular (e.g. all-floating island), fall back
     // to zero rather than crashing.
+    let size = sys.size;
     match sys.solve() {
         Ok(x0) => Ok(x0),
         Err(_)  => Ok(nalgebra::DVector::zeros(size)),
@@ -193,12 +192,12 @@ fn extract_dc(circuit: &Circuit, x: &nalgebra::DVector<f64>) -> DcResult {
     for i in 1..circuit.nodes {
         node_voltages[i] = node_voltage(x, crate::circuit::NodeId(i));
     }
-    let n_nodes = circuit.nodes.saturating_sub(1);
+    let branch = crate::mna::BranchLayout::for_circuit(circuit);
     let source_currents = circuit
         .voltage_sources
         .iter()
         .enumerate()
-        .map(|(i, _)| x[n_nodes + i])
+        .map(|(i, _)| branch.src_row(x, i))
         .collect();
     // DC: no capacitor current (steady state), so pass None for dt/prev.
     let branch_currents = compute_branch_currents(circuit, x, None, None);
@@ -375,7 +374,7 @@ pub fn run_ac_sweep(circuit: &Circuit, cmd: &AcCommand, dc_x: &nalgebra::DVector
                                               circuit.voltage_sources.len()
         )));
     }
-    let stim_branch = circuit.nodes.saturating_sub(1) + stim_idx;
+    let stim_branch = crate::mna::BranchLayout::for_circuit(circuit).src_branch(stim_idx);
     let stim_node = circuit.voltage_sources[stim_idx].n1;
 
     // Step 2 — sweep.

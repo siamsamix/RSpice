@@ -15,18 +15,21 @@
 /// The solution vector X contains:
 ///   [V₁ … V_{n-1} | I_{vs0} … I_{vs_{k-1}} | I_{L0} … I_{L_{m-1}}]
 ///
-/// which matches the transient matrix layout so index arithmetic is shared.
+/// laid out as [`mna::BranchLayout`], shared with the real-valued system.
 
 use nalgebra::{DMatrix, DVector};
 use num_complex::Complex64;
 
 use crate::circuit::{Circuit, NodeId};
 use crate::error::{Result, SimError};
+use crate::mna::BranchLayout;
 
 pub struct AcSystem {
     pub size: usize,
     pub a: DMatrix<Complex64>,
     pub z: DVector<Complex64>,
+    /// Where the branch rows live in `a`/`z` (same layout as the real system).
+    pub branch: BranchLayout,
 }
 
 impl AcSystem {
@@ -35,6 +38,7 @@ impl AcSystem {
             size,
             a: DMatrix::zeros(size, size),
             z: DVector::zeros(size),
+            branch: BranchLayout { n_nodes: 0, vsrc_base: 0, ind_base: 0 },
         }
     }
 
@@ -58,7 +62,7 @@ pub fn build_ac(
     let omega = 2.0 * std::f64::consts::PI * freq;
     let size = circuit.tran_matrix_size();
     let mut sys = AcSystem::new(size);
-    let n_nodes = circuit.nodes.saturating_sub(1);
+    sys.branch = crate::mna::BranchLayout::for_circuit(circuit);
 
     // ── Resistors ────────────────────────────────────────────────────────────
     for r in &circuit.resistors {
@@ -75,7 +79,7 @@ pub fn build_ac(
 
     // ── Inductors (as branch unknowns, Z_L = jωL) ────────────────────────────
     for (i, l) in circuit.inductors.iter().enumerate() {
-        let branch = n_nodes + circuit.voltage_sources.len() + i;
+        let branch = sys.branch.ind_branch(i);
         let z_l = Complex64::new(0.0, omega * l.inductance);
 
         if let Some(i1) = node_index(l.n1) {
@@ -166,7 +170,7 @@ pub fn build_ac(
     // (0 V).  Only sources that are explicitly the AC stimulus are driven; here
     // we set all to 0 V so the caller can patch the stimulus source afterwards.
     for (i, v) in circuit.voltage_sources.iter().enumerate() {
-        let branch = n_nodes + i;
+        let branch = sys.branch.src_branch(i);
         if let Some(i1) = node_index(v.n1) {
             sys.a[(i1, branch)] += Complex64::new(1.0, 0.0);
             sys.a[(branch, i1)] += Complex64::new(1.0, 0.0);
@@ -240,7 +244,7 @@ pub fn compute_ac_branch_currents(
     dc_solution: &DVector<f64>,
 ) -> AcBranchCurrents {
     let omega   = 2.0 * std::f64::consts::PI * freq;
-    let n_nodes = circuit.nodes.saturating_sub(1);
+    let branch  = crate::mna::BranchLayout::for_circuit(circuit);
     let one     = Complex64::new(1.0, 0.0);
 
     // ── Resistors: I = (V_n1 - V_n2) / R ────────────────────────────────
@@ -258,15 +262,14 @@ pub fn compute_ac_branch_currents(
     }).collect();
 
     // ── Inductors: branch unknown in solution vector ──────────────────────
-    let inductor_branch_base = n_nodes + circuit.voltage_sources.len();
     let inductors = circuit.inductors.iter().enumerate().map(|(i, _)| {
-        solution[inductor_branch_base + i]
+        branch.ind_row(solution, i)
     }).collect();
 
     // ── Voltage sources: branch unknown in solution vector ────────────────
     // Negated to match n1→n2 passive convention (see mna.rs note).
     let voltage_sources = circuit.voltage_sources.iter().enumerate().map(|(i, _)| {
-        -solution[n_nodes + i]
+        -branch.src_row(solution, i)
     }).collect();
 
     // ── Diodes: linearised small-signal conductance gd * (V_a - V_c) ─────

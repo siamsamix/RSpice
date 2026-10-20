@@ -9,10 +9,66 @@ pub struct TransientState {
     pub inductor_currents: Vec<f64>,
 }
 
+/// The layout of the MNA unknown vector: node-voltage rows first, then
+/// voltage-source branch rows, then inductor branch rows.
+///
+/// This knowledge used to be implicit, re-derived by index arithmetic at eight
+/// sites across three modules; `BranchLayout` is its one owner.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BranchLayout {
+    /// Number of node rows (ground excluded — a NodeId of 0 has no row).
+    pub n_nodes: usize,
+    /// First row of the voltage-source branch block.
+    pub vsrc_base: usize,
+    /// First row of the inductor branch block.
+    pub ind_base: usize,
+}
+
+impl BranchLayout {
+    pub fn for_circuit(circuit: &Circuit) -> Self {
+        let n_nodes = circuit.nodes.saturating_sub(1);
+        Self {
+            n_nodes,
+            vsrc_base: n_nodes,
+            ind_base: n_nodes + circuit.voltage_sources.len(),
+        }
+    }
+
+    /// Row index of the current unknown of voltage source `i`.
+    pub fn src_branch(&self, i: usize) -> usize {
+        self.vsrc_base + i
+    }
+
+    /// Row index of the current unknown of inductor `i`.
+    pub fn ind_branch(&self, i: usize) -> usize {
+        self.ind_base + i
+    }
+
+    /// Value of the voltage-source `i` row in a solved unknown vector.
+    /// Signed as the MNA branch unknown; element-convention negation stays
+    /// with the caller.
+    pub fn src_row<T>(&self, solution: &DVector<T>, i: usize) -> T
+    where
+        T: Copy,
+    {
+        solution[self.src_branch(i)]
+    }
+
+    /// Value of the inductor `i` row in a solved unknown vector.
+    pub fn ind_row<T>(&self, solution: &DVector<T>, i: usize) -> T
+    where
+        T: Copy,
+    {
+        solution[self.ind_branch(i)]
+    }
+}
+
 pub struct MnaSystem {
     pub size: usize,
     pub a: DMatrix<f64>,
     pub z: DVector<f64>,
+    /// Where the branch rows live in `a`/`z`.
+    pub branch: BranchLayout,
 }
 
 impl MnaSystem {
@@ -21,7 +77,15 @@ impl MnaSystem {
             size,
             a: DMatrix::zeros(size, size),
             z: DVector::zeros(size),
+            branch: BranchLayout { n_nodes: 0, vsrc_base: 0, ind_base: 0 },
         }
+    }
+
+    /// A fresh system sized for `circuit`, with its branch layout set.
+    pub fn for_circuit(circuit: &Circuit) -> Self {
+        let mut sys = Self::new(circuit.tran_matrix_size());
+        sys.branch = BranchLayout::for_circuit(circuit);
+        sys
     }
 
     pub fn clear(&mut self) {
@@ -45,9 +109,7 @@ fn node_index(node: NodeId) -> Option<usize> {
 }
 
 pub fn build_dc(circuit: &Circuit, guess: &DVector<f64>) -> Result<MnaSystem> {
-    let size = circuit.tran_matrix_size();
-    let mut sys = MnaSystem::new(size);
-    let n_nodes = circuit.nodes.saturating_sub(1);
+    let mut sys = MnaSystem::for_circuit(circuit);
 
     stamp_resistors(circuit, &mut sys);
     stamp_diodes(circuit, &mut sys, guess);
@@ -55,7 +117,7 @@ pub fn build_dc(circuit: &Circuit, guess: &DVector<f64>) -> Result<MnaSystem> {
 
     // Inductors are shorts at DC — stamp as 0 V voltage sources.
     for (i, l) in circuit.inductors.iter().enumerate() {
-        let branch = n_nodes + circuit.voltage_sources.len() + i;
+        let branch = sys.branch.ind_branch(i);
         if let Some(i1) = node_index(l.n1) {
             sys.a[(i1, branch)] += 1.0;
             sys.a[(branch, i1)] += 1.0;
@@ -66,7 +128,7 @@ pub fn build_dc(circuit: &Circuit, guess: &DVector<f64>) -> Result<MnaSystem> {
         }
     }
 
-    stamp_voltage_sources(circuit, &mut sys, n_nodes, None);
+    stamp_voltage_sources(circuit, &mut sys, None);
     Ok(sys)
 }
 
@@ -80,16 +142,14 @@ pub fn build_transient(
     if dt <= 0.0 {
         return Err(SimError::Analysis("time step must be positive".into()));
     }
-    let size = circuit.tran_matrix_size();
-    let mut sys = MnaSystem::new(size);
-    let n_nodes = circuit.nodes.saturating_sub(1);
+    let mut sys = MnaSystem::for_circuit(circuit);
 
     stamp_resistors(circuit, &mut sys);
     stamp_diodes(circuit, &mut sys, guess);
     stamp_mosfets(circuit, &mut sys, guess);
     stamp_capacitors(circuit, &mut sys, dt, state);
-    stamp_inductors(circuit, &mut sys, dt, state, n_nodes, circuit.voltage_sources.len());
-    stamp_voltage_sources(circuit, &mut sys, n_nodes, Some(t));
+    stamp_inductors(circuit, &mut sys, dt, state);
+    stamp_voltage_sources(circuit, &mut sys, Some(t));
 
     Ok(sys)
 }
@@ -227,13 +287,11 @@ fn stamp_inductors(
     sys: &mut MnaSystem,
     dt: f64,
     state: &TransientState,
-    n_nodes: usize,
-    n_vsources: usize,
 ) {
     for (i, l) in circuit.inductors.iter().enumerate() {
         let r_eq   = l.inductance / dt;
         let i_prev = state.inductor_currents.get(i).copied().unwrap_or(0.0);
-        let branch = n_nodes + n_vsources + i;
+        let branch = sys.branch.ind_branch(i);
 
         if let Some(i1) = node_index(l.n1) {
             sys.a[(i1, branch)] += 1.0;
@@ -251,11 +309,10 @@ fn stamp_inductors(
 fn stamp_voltage_sources(
     circuit: &Circuit,
     sys: &mut MnaSystem,
-    n_nodes: usize,
     t: Option<f64>,
 ) {
     for (i, v) in circuit.voltage_sources.iter().enumerate() {
-        let branch = n_nodes + i;
+        let branch = sys.branch.src_branch(i);
         if let Some(i1) = node_index(v.n1) {
             sys.a[(i1, branch)] += 1.0;
             sys.a[(branch, i1)] += 1.0;
@@ -316,7 +373,7 @@ pub fn compute_branch_currents(
     dt: Option<f64>,
     prev_cap_voltages: Option<&[f64]>,
 ) -> BranchCurrents {
-    let n_nodes = circuit.nodes.saturating_sub(1);
+    let branch = BranchLayout::for_circuit(circuit);
 
     let resistors = circuit.resistors.iter().map(|r| {
         let v1 = node_voltage(solution, r.n1);
@@ -337,13 +394,12 @@ pub fn compute_branch_currents(
         }
     }).collect();
 
-    let inductor_branch_base = n_nodes + circuit.voltage_sources.len();
     let inductors = circuit.inductors.iter().enumerate().map(|(i, _)| {
-        solution[inductor_branch_base + i]
+        branch.ind_row(solution, i)
     }).collect();
 
     let voltage_sources = circuit.voltage_sources.iter().enumerate().map(|(i, _)| {
-        -solution[n_nodes + i]
+        -branch.src_row(solution, i)
     }).collect();
 
     let diodes = circuit.diodes.iter().map(|d| {
@@ -382,13 +438,12 @@ pub fn update_transient_state(
         .map(|c| node_voltage(solution, c.n1) - node_voltage(solution, c.n2))
         .collect();
 
-    let n_nodes = circuit.nodes.saturating_sub(1);
-    let branch_base = n_nodes + circuit.voltage_sources.len();
+    let branch = BranchLayout::for_circuit(circuit);
     state.inductor_currents = circuit
         .inductors
         .iter()
         .enumerate()
-        .map(|(i, _)| solution[branch_base + i])
+        .map(|(i, _)| branch.ind_row(solution, i))
         .collect();
 }
 

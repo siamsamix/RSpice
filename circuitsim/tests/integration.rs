@@ -48,3 +48,31 @@ L1 2 0 1m
     assert_relative_eq!(dc.node_voltages[2], 0.0, epsilon = 1e-6);
     assert_relative_eq!(dc.source_currents[0].abs(), 12.0 / 100.0, epsilon = 1e-4);
 }
+
+#[test]
+fn rc_lowpass_ac_response() {
+    // Guards the AC fold into MnaSystem: small-signal stamps, the phasor
+    // solve, and the complex branch extraction.
+    let f0 = 1.0 / (2.0 * std::f64::consts::PI * 1_000.0 * 1_000.0e-6);
+    let netlist = r#"
+V1 1 0 DC 5 AC 1
+R1 1 2 1k
+C1 2 0 1u
+.op
+.ac LIN 2 1 159.1549431
+.end
+"#;
+    let result = simulate(netlist).unwrap();
+    let ac = result.ac.expect("AC result");
+
+    // Last point sits at the pole: |H(f0)| = 1/√2, phase −45°.
+    let last = ac.points.last().unwrap();
+    let h = last.node_voltages[2] / last.node_voltages[1];
+    assert_relative_eq!(h.norm(), std::f64::consts::FRAC_1_SQRT_2, epsilon = 1e-3);
+    assert_relative_eq!(h.arg().to_degrees(), -45.0, epsilon = 0.5);
+
+    // First point (1 Hz << f0) passes nearly everything.
+    let first = ac.points.first().unwrap();
+    let h0 = first.node_voltages[2] / first.node_voltages[1];
+    assert_relative_eq!(h0.norm(), 0.99935, epsilon = 1e-3);
+}

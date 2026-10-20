@@ -1,0 +1,8 @@
+* Series RLC band-pass: the capacitor voltage peaks near
+* f0 = 1/(2π√LC) ≈ 5.03 kHz with Q = (1/R)√(L/C) ≈ 3.16.
+V1 in 0 DC 0 AC 1
+R1 in a 10
+L1 a out 1m
+C1 out 0 1u
+.ac dec 20 1k 100k
+.end

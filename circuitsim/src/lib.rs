@@ -1,7 +1,9 @@
 //! Analog circuit simulator using modified nodal analysis (MNA).
 //!
-//! Supports resistors, capacitors, inductors, and DC voltage sources with
-//! operating-point (`.op`) and transient (`.tran`) analysis.
+//! Supports resistors, capacitors, inductors, voltage and current sources
+//! (waveform and AC cards), diodes, and level-1 MOSFETs, with operating-point
+//! (`.op`), real DC-sweep (`.dc`), transient (`.tran`), and small-signal
+//! (`.ac`) analyses over a parameter language (`.param`, `.func`, `{expr}`).
 
 pub mod analysis;
 pub mod circuit;
@@ -9,16 +11,27 @@ pub mod error;
 pub mod mna;
 pub mod model;
 pub mod netlist;
+pub mod params;
 pub mod units;
 
-pub use analysis::{AcResult, run, DcResult, SimulationResult, TranResult};
-pub use netlist::{AcCommand, AcScale};
-pub use circuit::Circuit;
+pub use analysis::{AcResult, run, DcResult, DcSweepPoint, DcSweepResult, FourOutput, FourResult,
+                   Harmonic, MeasureResult, NoisePoint, NoiseResult, SimulationResult, StepRun,
+                   TfResult, TranResult};
+pub use netlist::{AcCommand, AcScale, DcCommand, DcSweepSpec, DcSweepValues, MeasAnalysis,
+                  FourCommand, NoiseCommand, MeasEdge, MeasFunc, MeasKind, Measurement, NodesetEntry,
+                  ParseOptions, StepSpec, StepValues, TfCommand, TfOutput, parse,
+                  parse_with_options};
+pub use circuit::{Circuit, ControlVar, ControlledSource, CurrentSource, Diode, DiodeModel,
+                  GenericModel, ModelTolerance, Mosfet, MosfetModel, MutualInductance, Switch,
+                  SwitchControl, SwitchModel, Waveform};
 pub use error::{Result, SimError};
-pub use netlist::{parse, Netlist};
+pub use netlist::{Netlist, parse_with_overrides};
 
 /// Parse a netlist string and run all requested analyses.
+///
+/// Parameter sweeps (`.dc` over a `.param`) re-expand the deck per sweep
+/// point, so the source text travels with the parsed netlist.
 pub fn simulate(source: &str) -> Result<SimulationResult> {
     let netlist = parse(source)?;
-    analysis::run(&netlist.circuit, &netlist.analysis)
+    analysis::run(&netlist)
 }

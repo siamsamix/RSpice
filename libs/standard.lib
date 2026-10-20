@@ -1,0 +1,31 @@
+* RSpice standard device library
+* Generic models for the parity examples. Values are textbook-level defaults,
+* not vendor data; replace with vendor cards for production work.
+
+* ── Diodes ────────────────────────────────────────────────────────────────
+.model D1N4148 D(IS=2.682n N=1.836 RS=0.5664 CJO=3.78p VJ=0.75 M=0.333 TT=11.5n BV=100 IBV=100u EG=1.11 XTI=3)
+.model D1N4007 D(IS=7.023n N=1.8 RS=0.03389 CJO=15p VJ=0.75 M=0.333 TT=5u BV=1000 IBV=5u)
+.model DLED D(IS=1e-20 N=1.8 RS=10 CJO=50p VJ=3 M=0.5 BV=5)
+
+* ── MOSFETs ───────────────────────────────────────────────────────────────
+.model NMOS1 NMOS(LEVEL=1 KP=110u VTO=0.7 LAMBDA=0.02 GAMMA=0.4 PHI=0.7 TOX=9n CGSO=2n CGDO=2n CGBO=0.2n)
+.model PMOS1 PMOS(LEVEL=1 KP=50u VTO=-0.7 LAMBDA=0.02 GAMMA=0.4 PHI=0.7 TOX=9n CGSO=2n CGDO=2n CGBO=0.2n)
+
+* ── Switches and passives ─────────────────────────────────────────────────
+.model SW1 SW(RON=1 ROFF=100meg VT=0.5 VH=0.1)
+.model RMETAL R(R=1 TC1=4e-3 TC2=0)
+.model CCOG C(C=1 TC1=30e-6 TC2=0)
+.model LAIR L(L=1 TC1=0 TC2=0)
+
+* ── Common subcircuits ────────────────────────────────────────────────────
+* Voltage divider: `X1 in out mid divider r1=10k r2=10k`
+.subckt divider top bottom mid PARAMS: r1=10k r2=10k
+Rtop top mid {r1}
+Rbot mid bottom {r2}
+.ends divider
+
+* RC low-pass: `X1 in out lp r=1k c=100n`
+.subckt lowpass in out PARAMS: r=1k c=100n
+R1 in out {r}
+C1 out 0 {c}
+.ends lowpass

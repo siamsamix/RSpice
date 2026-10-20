@@ -1,0 +1,10 @@
+* Measurement suite on an RC charging waveform.
+V1 in 0 PULSE(0 5 0 1n 1n 1 2)
+R1 in out 1k
+C1 out 0 1u
+.tran 10u 5m
+.meas tran vmax max V(out)
+.meas tran vavg avg V(out) from=0 to=5m
+.meas tran tcross cross V(out) val=2.5
+.meas tran trise trig V(out) val=0.5 rise=1 targ V(out) val=4.5 rise=1
+.end

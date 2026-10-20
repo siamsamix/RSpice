@@ -1,0 +1,9 @@
+* Non-inverting op-amp with the bundled two-resistor feedback network.
+.include opamps.lib
+V1 in 0 DC 0.1
+X1 in fb out opamp
+R1 out fb 9k
+R2 fb 0 1k
+.op
+.tf V(out) V1
+.end

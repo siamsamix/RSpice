@@ -6,9 +6,10 @@
 //! fields) and every tab re-wrote the same element walk with its own copy of
 //! the dB/phase math (twenty loops). One owner each here; the tabs only draw.
 
-use circuitsim::analysis::{AcPoint, AcResult, TranPoint, TranResult};
+use circuitsim::analysis::{AcPoint, AcResult, DcSweepResult, TranPoint, TranResult};
 use circuitsim::mna::{AcBranchCurrents, BranchCurrents};
 use egui_plot::{Line, PlotPoints, PlotUi};
+use num_complex::Complex64;
 
 use crate::theme::PLOT_COLORS;
 
@@ -62,6 +63,9 @@ pub struct PlotState {
     pub ac_mag_bounds: Bounds,
     pub ac_phase_bounds: Bounds,
     pub ac_apply: bool,
+
+    pub dc_bounds: Bounds,
+    pub dc_apply: bool,
 }
 
 impl Default for PlotState {
@@ -77,6 +81,8 @@ impl Default for PlotState {
             ac_mag_bounds: Bounds::default(),
             ac_phase_bounds: Bounds::default(),
             ac_apply: false,
+            dc_bounds: Bounds::default(),
+            dc_apply: false,
         }
     }
 }
@@ -129,10 +135,19 @@ pub fn draw(plot_ui: &mut PlotUi, series: &[PlotSeries], width: f32) {
 
 // ── Transient series ─────────────────────────────────────────────────────────
 
+/// Deck-spelling label for a node (`in`, `out`); falls back to the node id.
+fn node_name(names: &[String], node: usize) -> String {
+    match names.get(node) {
+        Some(s) if !s.is_empty() => s.clone(),
+        _ => node.to_string(),
+    }
+}
+
 /// (time, V(node)) for every enabled node, ground excluded.
 pub fn tran_voltage_series(
     tran: &TranResult,
     enabled: &[bool],
+    names: &[String],
     x_mult: f64,
     y_mult: f64,
 ) -> Vec<PlotSeries> {
@@ -142,7 +157,7 @@ pub fn tran_voltage_series(
             continue;
         }
         out.push(PlotSeries {
-            name: format!("V({node})"),
+            name: format!("V({})", node_name(names, node)),
             color: PLOT_COLORS[node % PLOT_COLORS.len()],
             points: tran
                 .points
@@ -159,11 +174,12 @@ pub fn tran_diff_series(
     tran: &TranResult,
     a: usize,
     b: usize,
+    names: &[String],
     x_mult: f64,
     y_mult: f64,
 ) -> Vec<PlotSeries> {
     vec![PlotSeries {
-        name: format!("V({a})−V({b})"),
+        name: format!("V({})−V({})", node_name(names, a), node_name(names, b)),
         color: PLOT_COLORS[1 % PLOT_COLORS.len()],
         points: tran
             .points
@@ -177,45 +193,82 @@ pub fn tran_diff_series(
     }]
 }
 
-fn branch_count(points: &[TranPoint], pick: fn(&BranchCurrents) -> usize) -> usize {
-    points
-        .first()
-        .map(|p| pick(&p.branch_currents))
-        .unwrap_or(0)
+/// One branch family of the element walk; the M/I families completed the
+/// original R, C, L, V, D set.
+#[derive(Clone, Copy)]
+enum TranFamily {
+    Resistors,
+    Capacitors,
+    Inductors,
+    VoltageSources,
+    Diodes,
+    Mosfets,
+    CurrentSources,
 }
 
-/// All transient branch series in canonical legend order R, C, L, V, D — the
-/// one element walk that replaced a copy per tab.
+impl TranFamily {
+    fn letter(self) -> &'static str {
+        match self {
+            Self::Resistors => "R",
+            Self::Capacitors => "C",
+            Self::Inductors => "L",
+            Self::VoltageSources => "V",
+            Self::Diodes => "D",
+            Self::Mosfets => "M",
+            Self::CurrentSources => "I",
+        }
+    }
+
+    fn count(self, b: &BranchCurrents) -> usize {
+        match self {
+            Self::Resistors => b.resistors.len(),
+            Self::Capacitors => b.capacitors.len(),
+            Self::Inductors => b.inductors.len(),
+            Self::VoltageSources => b.voltage_sources.len(),
+            Self::Diodes => b.diodes.len(),
+            Self::Mosfets => b.mosfets.len(),
+            Self::CurrentSources => b.current_sources.len(),
+        }
+    }
+
+    fn value(self, b: &BranchCurrents, i: usize) -> f64 {
+        match self {
+            Self::Resistors => b.resistors.get(i).copied().unwrap_or_default(),
+            Self::Capacitors => b.capacitors.get(i).copied().unwrap_or_default(),
+            Self::Inductors => b.inductors.get(i).copied().unwrap_or_default(),
+            Self::VoltageSources => b.voltage_sources.get(i).copied().unwrap_or_default(),
+            Self::Diodes => b.diodes.get(i).copied().unwrap_or_default(),
+            Self::Mosfets => b.mosfets.get(i).copied().unwrap_or_default(),
+            Self::CurrentSources => b.current_sources.get(i).copied().unwrap_or_default(),
+        }
+    }
+}
+
+const TRAN_FAMILY_ORDER: [TranFamily; 7] = [
+    TranFamily::Resistors,
+    TranFamily::Capacitors,
+    TranFamily::Inductors,
+    TranFamily::VoltageSources,
+    TranFamily::Diodes,
+    TranFamily::Mosfets,
+    TranFamily::CurrentSources,
+];
+
+/// All transient branch series in canonical legend order R, C, L, V, D, M, I —
+/// the one element walk that replaced a copy per tab.
 pub fn tran_current_series(tran: &TranResult, x_mult: f64, y_mult: f64) -> Vec<PlotSeries> {
     let points: &[TranPoint] = &tran.points;
     let mut out = Vec::new();
     let mut color_idx = 0usize;
 
-    let families: [(&str, fn(&BranchCurrents) -> usize); 5] = [
-        ("R", |b: &BranchCurrents| b.resistors.len()),
-        ("C", |b: &BranchCurrents| b.capacitors.len()),
-        ("L", |b: &BranchCurrents| b.inductors.len()),
-        ("V", |b: &BranchCurrents| b.voltage_sources.len()),
-        ("D", |b: &BranchCurrents| b.diodes.len()),
-    ];
-    for (letter, len_of) in families {
-        for i in 0..branch_count(points, len_of) {
+    for family in TRAN_FAMILY_ORDER {
+        for i in 0..points.first().map(|p| family.count(&p.branch_currents)).unwrap_or(0) {
             out.push(PlotSeries {
-                name: format!("I({letter}{})", i + 1),
+                name: format!("I({}{})", family.letter(), i + 1),
                 color: PLOT_COLORS[color_idx % PLOT_COLORS.len()],
                 points: points
                     .iter()
-                    .map(|p| {
-                        let b = &p.branch_currents;
-                        let v = match letter {
-                            "R" => *b.resistors.get(i).unwrap_or(&0.0),
-                            "C" => *b.capacitors.get(i).unwrap_or(&0.0),
-                            "L" => *b.inductors.get(i).unwrap_or(&0.0),
-                            "V" => *b.voltage_sources.get(i).unwrap_or(&0.0),
-                            _ => *b.diodes.get(i).unwrap_or(&0.0),
-                        };
-                        [p.time * x_mult, v * y_mult]
-                    })
+                    .map(|p| [p.time * x_mult, family.value(&p.branch_currents, i) * y_mult])
                     .collect(),
             });
             color_idx += 1;
@@ -253,6 +306,7 @@ fn ac_x(freq: f64, x_mult: f64, log_x: bool) -> f64 {
 pub fn ac_voltage_series(
     ac: &AcResult,
     enabled: &[bool],
+    names: &[String],
     qty: AcQuantity,
     x_mult: f64,
     y_mult: f64,
@@ -268,7 +322,7 @@ pub fn ac_voltage_series(
             _ => "",
         };
         out.push(PlotSeries {
-            name: format!("V({node}){suffix}"),
+            name: format!("V({}){suffix}", node_name(names, node)),
             color: PLOT_COLORS[node % PLOT_COLORS.len()],
             points: ac
                 .points
@@ -288,15 +342,68 @@ pub fn ac_voltage_series(
     out
 }
 
-fn ac_count(points: &[AcPoint], pick: fn(&AcBranchCurrents) -> usize) -> usize {
-    points
-        .first()
-        .map(|p| pick(&p.branch_currents))
-        .unwrap_or(0)
+/// One AC branch family; M/I close the set behind the original five.
+#[derive(Clone, Copy)]
+enum AcFamily {
+    Resistors,
+    Capacitors,
+    Inductors,
+    VoltageSources,
+    Diodes,
+    Mosfets,
+    CurrentSources,
 }
 
-/// All AC branch series in canonical legend order R, C, L, V, D — both the dB
-/// and the phase plot walk this once instead of five loops each.
+impl AcFamily {
+    fn letter(self) -> &'static str {
+        match self {
+            Self::Resistors => "R",
+            Self::Capacitors => "C",
+            Self::Inductors => "L",
+            Self::VoltageSources => "V",
+            Self::Diodes => "D",
+            Self::Mosfets => "M",
+            Self::CurrentSources => "I",
+        }
+    }
+
+    fn count(self, b: &AcBranchCurrents) -> usize {
+        match self {
+            Self::Resistors => b.resistors.len(),
+            Self::Capacitors => b.capacitors.len(),
+            Self::Inductors => b.inductors.len(),
+            Self::VoltageSources => b.voltage_sources.len(),
+            Self::Diodes => b.diodes.len(),
+            Self::Mosfets => b.mosfets.len(),
+            Self::CurrentSources => b.current_sources.len(),
+        }
+    }
+
+    fn value(self, b: &AcBranchCurrents, i: usize) -> Complex64 {
+        match self {
+            Self::Resistors => b.resistors.get(i).copied().unwrap_or_default(),
+            Self::Capacitors => b.capacitors.get(i).copied().unwrap_or_default(),
+            Self::Inductors => b.inductors.get(i).copied().unwrap_or_default(),
+            Self::VoltageSources => b.voltage_sources.get(i).copied().unwrap_or_default(),
+            Self::Diodes => b.diodes.get(i).copied().unwrap_or_default(),
+            Self::Mosfets => b.mosfets.get(i).copied().unwrap_or_default(),
+            Self::CurrentSources => b.current_sources.get(i).copied().unwrap_or_default(),
+        }
+    }
+}
+
+const AC_FAMILY_ORDER: [AcFamily; 7] = [
+    AcFamily::Resistors,
+    AcFamily::Capacitors,
+    AcFamily::Inductors,
+    AcFamily::VoltageSources,
+    AcFamily::Diodes,
+    AcFamily::Mosfets,
+    AcFamily::CurrentSources,
+];
+
+/// All AC branch series in canonical legend order R, C, L, V, D, M, I — both
+/// the dB and the phase plot walk this once instead of loops per tab.
 pub fn ac_current_series(
     ac: &AcResult,
     qty: AcQuantity,
@@ -308,33 +415,19 @@ pub fn ac_current_series(
     let mut out = Vec::new();
     let mut color_idx = 0usize;
 
-    let families: [(&str, fn(&AcBranchCurrents) -> usize); 5] = [
-        ("R", |b: &AcBranchCurrents| b.resistors.len()),
-        ("C", |b: &AcBranchCurrents| b.capacitors.len()),
-        ("L", |b: &AcBranchCurrents| b.inductors.len()),
-        ("V", |b: &AcBranchCurrents| b.voltage_sources.len()),
-        ("D", |b: &AcBranchCurrents| b.diodes.len()),
-    ];
     let suffix = match qty {
         AcQuantity::Phase => " phase",
         _ => "",
     };
-    for (letter, len_of) in families {
-        for i in 0..ac_count(points, len_of) {
+    for family in AC_FAMILY_ORDER {
+        for i in 0..points.first().map(|p| family.count(&p.branch_currents)).unwrap_or(0) {
             out.push(PlotSeries {
-                name: format!("I({letter}{}){suffix}", i + 1),
+                name: format!("I({}{}){suffix}", family.letter(), i + 1),
                 color: PLOT_COLORS[color_idx % PLOT_COLORS.len()],
                 points: points
                     .iter()
                     .map(|p| {
-                        let b = &p.branch_currents;
-                        let v = match letter {
-                            "R" => b.resistors.get(i).copied().unwrap_or_default(),
-                            "C" => b.capacitors.get(i).copied().unwrap_or_default(),
-                            "L" => b.inductors.get(i).copied().unwrap_or_default(),
-                            "V" => b.voltage_sources.get(i).copied().unwrap_or_default(),
-                            _ => b.diodes.get(i).copied().unwrap_or_default(),
-                        };
+                        let v = family.value(&p.branch_currents, i);
                         let y = match qty {
                             AcQuantity::MagnitudeDb => to_db(v.norm()) * y_mult,
                             AcQuantity::MagnitudeLinear => v.norm() * y_mult,
@@ -346,6 +439,39 @@ pub fn ac_current_series(
             });
             color_idx += 1;
         }
+    }
+    out
+}
+
+// ── DC sweep series ──────────────────────────────────────────────────────────
+
+/// (sweep value, V(node)) series for a flat (single-sweep) `.dc`; ground never
+/// gets a trace. A nested sweep is better shown as a table — the DC tab renders
+/// one then — so these series carry the single-sweep case only.
+pub fn dc_sweep_series(
+    sweep: &DcSweepResult,
+    enabled: &[bool],
+    names: &[String],
+    x_mult: f64,
+    y_mult: f64,
+) -> Vec<PlotSeries> {
+    let mut out = Vec::new();
+    for (node, &on) in enabled.iter().enumerate() {
+        if !on || node == 0 {
+            continue;
+        }
+        out.push(PlotSeries {
+            name: format!("V({})", node_name(names, node)),
+            color: PLOT_COLORS[node % PLOT_COLORS.len()],
+            points: sweep
+                .points
+                .iter()
+                .map(|p| [
+                    p.values.first().copied().unwrap_or(0.0) * x_mult,
+                    p.node_voltages.get(node).copied().unwrap_or(0.0) * y_mult,
+                ])
+                .collect(),
+        });
     }
     out
 }

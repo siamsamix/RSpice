@@ -1,0 +1,25 @@
+* RC ladder — one .subckt reused as two stages.
+*
+* Demonstrates the subcircuit language: the definition binds its ports,
+* its body carries the parameter defaults, each X line may override them
+* per-instance, and the flattened element names / internal nets hang off
+* the instance path (X1.tap, X2.tap, ...).
+*
+* DC ladder maths: five 1 k resistors in series from the 5 V source drop
+* exactly 1 V per stage, so the mangled node names read like a ruler —
+*   src = 5 V, X1.tap = 4 V, stage_a = 3 V, X2.tap = 2 V, stage_b = 1 V.
+.subckt rc_stage in out
+.param rt=1k cl=50n
+R1 in tap {rt}
+R2 tap out {rt}
+C1 tap 0 {cl}
+.ends
+
+V1 src 0 DC 5
+X1 src stage_a rc_stage cl=200n
+X2 stage_a stage_b rc_stage
+Rload stage_b 0 1k
+
+.op
+.tran 10u 2m
+.end

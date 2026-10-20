@@ -1,0 +1,28 @@
+* RSpice op-amp macromodels (single-pole, ideal input offset of 0 V).
+* X1 inp inn out opamp  → A0 = 1e5, pole at ~10 Hz, Rout = 50 Ω.
+
+.subckt opamp inp inn out
+Rin inp inn 1meg
+G1 0 n1 inp inn 1
+R1 n1 0 1
+C1 n1 0 15.9m
+E1 out 0 n1 0 1e5
+Rout out 0 50
+.ends opamp
+
+* Unity-gain-stable variant with a lower pole and 75 Ω output.
+.subckt opamp_u inp inn out
+Rin inp inn 10meg
+G1 0 n1 inp inn 1
+R1 n1 0 1
+C1 n1 0 31.8m
+E1 out 0 n1 0 2e5
+Rout out 0 75
+.ends opamp_u
+
+* Comparator: high gain, no compensation.
+.subckt comparator inp inn out PARAMS: gain=1e6 rout=100
+Rin inp inn 1meg
+E1 out 0 inp inn {gain}
+Rout out 0 {rout}
+.ends comparator

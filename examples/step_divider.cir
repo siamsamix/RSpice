@@ -1,0 +1,8 @@
+* Parametric step: output voltage versus the top resistor.
+.param rtop=1k
+V1 in 0 DC 1
+R1 in out {rtop}
+R2 out 0 1k
+.step param rtop 1k 3k 1k
+.op
+.end

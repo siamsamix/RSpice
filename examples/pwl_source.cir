@@ -1,0 +1,6 @@
+* Piecewise-linear stimulus with a repeating block.
+V1 in 0 PWL(0 0 1m 1 2m 0 REPEAT FOR 2 (2m 0 3m 1 4m 0) ENDREPEAT)
+R1 in 0 1k
+.tran 50u 12m
+.four 500 V(in)
+.end

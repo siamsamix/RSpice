@@ -1,0 +1,284 @@
+# RSpice — Roadmap to LTspice/PSpice parity
+
+Things RSpice must gain to deliver "all the features of both LTspice and PSpice", tracked by category.
+Terminology follows `CONTEXT.md` (element, model card, analysis command, directive, stamp, MNA, NR).
+
+**Baseline (settled with author):** full product parity with LTspice and OrCAD/PSpice — engine, device
+models, parser language, analyses, waveform viewer, schematic GUI, model libraries & interop — plus a
+separate "beyond parity" track for speed/accuracy goals that neither reference tool covers.
+Feature list compiled from built-in knowledge of LTspice 24.x and PSpice/Advanced Analysis 23.x;
+no web research per decision. Niche claims flagged in the footnote at the bottom: verify against the
+shipped tools' docs before implementing.
+
+**Legend:** `[P0]` correctness/foundation — do first · `[P1]` core parity — everyday workflows ·
+`[P2]` long tail — niche directives, advanced tooling.
+Source tags: `(both)` present in both reference tools · `(LT)` LTspice-only · `(PS)` PSpice-only.
+
+**Where we stand:** sim core — dense-LU MNA, `.op`, adaptive trapezoidal/Gear `.tran` with
+source-edge breakpoints and `.options method=…`, small-signal `.ac`, one/two-sweep `.dc`,
+`.tf`, `.noise`, `.four`, nested `.step` (parameters or temperature), `.meas`, and multi-run
+results; elements `R C L V I D M E F G H S W K`, the full source-waveform family
+(`PULSE/SIN/EXP/PWL[ FILE, REPEAT]/SFFM/AM`), temperature-dependent diode/MOSFET/passive
+equations; parser with `*`/`;` comments, `+` continuation, `MEG`/`MIL` suffixes,
+case-insensitive named nodes, subcircuits/libraries/initial conditions, and the
+`{}`/`.param`/`.func` language; bundled `libs/` models and op-amp macromodels; egui GUI
+(schematic + waveform tabs, symbols `R C L V Gnd`); CLI batch/report/CSV export. Every item
+below is written against that state.
+
+---
+
+## 1. Correctness fixes in what already exists
+
+- [x] **[P0] (spot)** Comment handling: `*` or `;` anywhere in a line truncates the netlist text —
+  SPICE only starts a comment with `*` at the start of a line; quoted/element values can be destroyed
+  (`netlist.rs` `strip_comment`).
+- [x] **[P0] (spot)** README drift: Limitations section still claims "No nonlinear devices" while
+  diode/MOSFET models exist; analysis table omits `.ac`; "inspired by" should become the parity goal.
+- [x] **[P0] (spot)** Waveform/DC tabs omit MOSFET branch currents — `BranchCurrents.mosfets` is
+  computed at `mna.rs:501-578` but never listed in `plot.rs`/`app.rs` plot or DC tables.
+- [x] **[P0] (both)** `.dc` is a trap: it parses sweep arguments and silently ignores them, degrading to
+  a plain operating point (see Analyses item below for the real feature).
+
+## 2. Parser & netlist language
+
+- [x] **[P0] (both)** Line continuation: leading `+` continues the previous line — required by nearly
+  every real-world `.lib`/netlist file.
+- [x] **[P0] (both)** Unit suffixes: support `MEG` (1e6) and `MIL`; current suffix parsing takes only
+  the last character, so `4.7Meg` mis-parses (`units.rs`).
+- [x] **[P0] (both)** Alphanumeric node names and net aliases (`in`, `out`, `V(out)`), case-insensitive;
+  nodes are integers-only today.
+- [x] **[P0] (both)** Parameter language: `{}` expression evaluation, `.param`, `.func`, math function
+  library, string/numeric params, quoted values — no parametrization exists at all.
+- [x] **[P1] (both)** Subcircuit hierarchy: `.subckt`/`.ends` (with `PARAMS=`), nesting, `.global` nets,
+  `X` element instantiations — done: ports/bindings, `PARAMS:` and bare `key=value` defaults, instance
+  overrides beat body `.param` re-assignments, internal nets/elements mangle to `X1.path` names,
+  forward-referenced and nested definitions, `.global` shared through scopes.
+- [x] **[P1] (both)** Library system directives: `.include` and `.lib` (with section selection), model
+  search paths, bundled library directories (`nom.lib` convention in PSpice, user-lib dirs in LTspice)
+  — done: `.include` and `.lib` (whole-file and section) resolve through the deck's directory plus
+  `RSPICE_LIB`/`search_paths` (no bundled libraries shipped yet); library-structure cards inside a
+  read library never leak into the deck.
+- [x] **[P1] (both)** Full model-card grammar per device: complete parameter lists, model levels, and
+  per-instance sizing (W/L, area/perimeter AD/AS/PS/PD); tolerance slots for Monte Carlo
+  (`LOT`/`DEV` in PSpice's `.model` cards) reserved now — done: diode/MOSFET parameter lists with
+  LEVEL validation, per-instance AD/AS/PS/PD + diode AREA carried into elements, DEV/LOT slots parsed
+  into `ModelTolerance` (consumers come with the Monte Carlo work, TODO §8), unknown families kept
+  as `GenericModel` cards.
+- [x] **[P1] (both)** Tolerant import of third-party netlists: case-insensitivity everywhere, tabs/space
+  chaos, unknown directives as warnings with best-effort parse instead of hard errors — done: unknown
+  directives/element letters/stray `.endl` markers warn with the offending text and the deck still
+  simulates.
+- [x] **[P1] (both)** Initial-condition directives: `.ic` (bias/transient startup) and `.nodeset` —
+  done: both parse (fused/split spellings), node names resolve loudly; `.ic` pins a `UIC` transient's
+  t=0 state, `.nodeset` seeds (never forces) the DC iteration.
+- [ ] **[P2] (both)** Full `.options` surface: `reltol`, `vntol`, `abstol`, `gmin`, `itl1..itl6`,
+  `maxord`, `method`, PSpice `accurate`/`solvehold` style flags — parsed and honored.
+- [ ] **[P2] (LT)** Waveform/data selection directives: `.save`, `.keep`, `.savebias`, `.loadbias`.
+- [ ] **[P2] (LT)** `.csparam` support (feeds `.meas` results across stepped runs).
+- [ ] **[P2] (PS)** Node aliasing blocks `.aliases`/`.endaliases` for probe names.
+- [ ] **[P2] (both)** Output-file directives & simulation log: `.probe` (PS), `.out`/`.log` with
+  device operating-point tables.
+
+## 3. Engine & numerical core
+
+- [ ] **[P1] (both)** Sparse MNA solver replacing dense `nalgebra` LU — KLU-class with symbolic
+  Markowitz ordering computed at netlist load; dense LU is infeasible beyond a few thousand nodes.
+- [ ] **[P1] (both)** LU factorization reuse across NR iterations and timesteps when the matrix changes
+  only by values, not topology — today the matrix is rebuilt and cloned per iterate.
+- [ ] **[P1] (LT baseline)** Multithreaded matrix assembly/factorization and time-stepping loop;
+  LTspice is threaded today, PSpice multithreading is unclear on this baseline.
+- [x] **[P1] (both)** Trapezoidal integration as the default companion model with `.options
+  method=gear` (Gear I/II) available — done: trapezoidal default, `gear1`/`gear2` selectable,
+  variable-step BDF2 coefficients for Gear II.
+- [x] **[P1] (both)** Adaptive timestep control from local truncation error with `reltol`/`abstol`,
+  max-step and first-step control — done: step-doubling LTE estimate over node/current
+  tolerances, `.tran … tmax` and `.options maxstep=`, first step sized from the print interval.
+- [x] **[P1] (LT)** Discontinuity handling: zero-crossing refinement and pulse leading-edge thickening
+  so narrow events are not sampled away — done: every source edge (`PULSE`/`EXP`/`PWL`, including
+  repeated PWL blocks) is a hard step boundary, so 1 ns features are never skipped.
+- [ ] **[P1] (both)** Convergence suite: gmin stepping, source stepping, junction limiting
+  (pn-junction/FET limiters), PSpice's Autoconverge-style retry ladder; today only a diode voltage
+  clamp and a stub-conductance seed exist.
+- [x] **[P1] (both)** Temperature system: `.temp`, `tnom`, per-device temperature coefficients, `VT`
+  and bandgap terms recomputed from absolute temperature — done: diode `IS(T)`/`Vt` with
+  `EG`/`XTI`/`TNOM`, MOSFET `TCV`/`BEX`/`TNOM`, passive `TC1`/`TC2` model cards, several
+  `.temp` values or `.step temp` run the deck per temperature.
+
+## 4. Analyses
+
+- [x] **[P0] (both)** Real `.dc` sweep: sweep an independent V/I source (or model parameter) across
+  start/stop/increment or a value LIST, with optional nested second sweeps. Under no circumstances may
+  sweep arguments be silently ignored again.
+- [ ] **[P1] (both)** `.tran` completeness: adaptive stepping, `uic`, `tstart`, first argument as
+  output/print interval rather than timestep, startup suppression of sources; pulse sources must be
+  evaluated with edge refinement, not sampled at fixed instants. *(Adaptive stepping, UIC, tstart,
+  print-interval semantics, `tmax`, and edge breakpoints are done; source startup suppression is the
+  remaining piece.)*
+- [x] **[P1] (both)** `.noise`: input-referred and output noise density vs frequency over `.ac`
+  sweeps, integrated RMS totals; requires noise models for R (thermal), diode (shot/flicker), BJT, MOS,
+  JFET — done for R/diode/MOSFET (adjoint method); BJT/JFET noise arrives with those devices.
+- [x] **[P1] (both)** `.tf`: DC transfer function from source to node with input/output impedances.
+- [x] **[P1] (both)** `.four`: Fourier decomposition of a transient waveform (directive) — done;
+  viewer FFT with selectable windowing is tracked under §6.
+- [x] **[P1] (both)** `.step`: linear/octave/decade/LIST sweeps over parameters or temperature, nested
+  steps, run overlays, and results tagged per step — done: cartesian nesting, `runs` tagged with
+  their values, GUI overlays still open under §6.
+- [x] **[P1] (both)** `.measure`/`.meas` family: `avg/rms/max/min/pp/max_at/min_at/rise/fall/cross/
+  find…when/from…to/trig…targ` with expressions over the results, for `.tran`/`.ac`/`.dc` — done
+  (rise/fall spelled through `TRIG … TARG`, expressions use the probe/parameter evaluator).
+- [ ] **[P1] (both)** Operating-point presentation: annotated device operating points (LTspice plot/data
+  view) and `.op` variants (`pon`, `all`) per PSpice.
+- [ ] **[P2] (both)** `.ac` LIST frequency scales beyond dec/oct/lin.
+- [ ] **[P2] (both)** Small-signal secondary analyses: `.sens` (DC sensitivity), `.pz` (pole-zero),
+  `.disto` (harmonic distortion).
+
+## 5. Devices & primitives
+
+- [x] **[P0] (both)** Independent current source `I` — the most glaring single missing element; without
+  it most textbook circuits can't even be drawn.
+- [ ] **[P1] (both)** Source waveform family: `EXP`, `SFFM`, `AM`, `PWL` (incl. `PWL FILE` and repeat
+  blocks in LTspice); noise stimulus sources (LTspice's white/flicker functions) `(LT)`; PSpice
+  synthesizes noise via `.noise` + IBIS interface nets instead `(PS)`.
+- [x] **[P1] (both)** Controlled sources `E/F/G/H` including `POLY(n)` multivariate forms.
+- [ ] **[P1] (LT)** Behavioral sources `B` (arbitrary expressions of node voltages/branch currents,
+  `time()`, `idt()`/`sdt()`, `delay()`, `table()`, Laplace/frequency-domain hybrids).
+- [ ] **[P1] (PS)** ABM extensions on E/F/G/H: `VALUE=`, `TABLE=`, `FREQ=`, `LAPLACE=`, `CHEBYSHEV=`,
+  `EQUATION=` blocks.
+- [x] **[P1] (both)** Diode model completion: `RS`, `TT`, `CJO/M/VJ`, `EG/XTI`, `BV/IBV`, `KF/AF`
+  (flicker noise), recombination params — with junction capacitance so transients are physical —
+  done: `RS` splits into an internal junction node, `CJO`/`TT` are stamped as charge-based
+  transient capacitances and AC susceptances, `BV`/`IBV`/`NBV` implement reverse breakdown,
+  `EG/XTI/TNOM` drive the temperature law, and `KF/AF` feed `.noise`.
+- [ ] **[P1] (both)** BJT Gummel-Poon: full parameter set, PNP polarity, junction capacitances,
+  Early effect, temperature; device capacitance models are mandatory for transient use.
+- [ ] **[P2] (LT)** Advanced BJT models: VBIC and Mextram (level/type naming per LTspice's help).
+- [ ] **[P1] (both)** MOSFET levels 2 and 3; BSIM3/BSIM4 families per tool coverage (level numbering
+  differs between LTspice and PSpice — verify per target).
+- [x] **[P1] (both)** MOSFET capacitance/charge model: gate overlap (CGDO/CGSO/CGBO), junction caps
+  (CJ/CJSW/MJSW/PB), so switching transients carry realistic charge — done: overlap and zero-bias
+  junction capacitances are stamped in transient (companion history) and AC; grading parameters are
+  parsed for the bias-dependent upgrade.
+- [ ] **[P1] (both)** JFET with capacitance; `[P2] (LT/PS letters differ)` MESFET/GaAs FET (LTspice
+  letter `Z`, PSpice letter `B`; Curtice/Statz/Raytheon variants).
+- [ ] **[P2] (PS)** IGBT model; SCR/TRIAC/GTO/thyristor macromodels from the standard libraries.
+- [x] **[P1] (both)** Switches: voltage-controlled (`S`) and current-controlled switch primitives with
+  model cards (on/off resistance thresholds, hysteresis).
+- [x] **[P1] (both)** Mutual inductance `K` and ideal transformers; `[P2] (PS)` nonlinear magnetic core
+  models (XFRM_NONLINEAR/RM); `[P2] (LT)` behavioral inductor via `flux=` control equation.
+- [ ] **[P1] (both)** Transmission lines: lossless `T` and lossy `O` (LTRA with RLCG parameterization).
+- [ ] **[P1] (both)** Passive model cards: `.model R/L/C` with temperature coefficients `TC1/TC2`;
+  LTspice-style intrinsic parasitics on every R/L/C (`rser`, `cpar`, `lser`, `rpar`). *(Model cards
+  and TC1/TC2 are done; intrinsic parasitics are the remaining piece.)*
+- [ ] **[P1] (both)** Opamp primitives/macromodels: ideal op-amp element and universal/multi-pole
+  macromodel library entries, plus vendor `.subckt` opamps loadable from the library system.
+- [ ] **[P2] (PS)** Measurement/utility devices: wattmeter, fuse, varistor from the special libraries.
+
+## 6. Waveform viewer & plotting
+
+- [ ] **[P1] (LT/PS)** Cursor infrastructure: crosshair cursors with readouts and measured deltas
+  (LTspice dual cursors; PSpice cursor measurements).
+- [ ] **[P1] (LT)** Waveform arithmetic: add arbitrary expression traces (`V(out)*I(V1)` power, scaled,
+  offset, combined) — the viewer plots only raw `V(n)`, `I(el)`, `V(a)-V(b)` today.
+- [ ] **[P1] (both)** FFT of transient traces with configurable windowing (LTspice Blackman-Harris et
+  al.; PSpice Probe FFT).
+- [ ] **[P1] (both)** Stepped/parametric overlays: all `.step`/parametric runs on one plot with per-run
+  identification; PSpice performance-analysis curves of a measurement vs swept parameter belong here.
+- [ ] **[P1] (both)** Axis completeness: linear/log on both axes, physical unit auto-detection and
+  formatting (Hz/s/V/A/dB/°), multi-pane layouts.
+- [ ] **[P1] (both)** Cross-probing: click a wire/part in the schematic to add/trace `V(net)` and
+  `I(device)` in the viewer, and vice versa.
+- [ ] **[P1] (both)** Waveform file I/O: read/write binary and ASCII `.raw` (LTspice) / `.dat` (PSpice)
+  including step-run metadata.
+- [ ] **[P1] (spot)** Full export surface: CSV of arbitrary traces (node voltages, element currents,
+  measurements — today only `.tran` node voltages are exportable), image export.
+- [ ] **[P2] (both)** Waveform data compression/decimation options (`.options plotwinsize` in LTspice,
+  Probe compression in PSpice).
+- [ ] **[P2] (both)** Persist and reuse plot configurations (trace sets, scales, window layouts).
+
+## 7. Schematic GUI
+
+- [ ] **[P1] (both)** Schematic symbols for every device family — at minimum diode, MOSFET, BJT,
+  current/control/behavioral sources, switches, transformers, transmission lines, opamps; the editor is
+  `R C L V Gnd`-only today.
+- [ ] **[P1] (both)** Symbol library format with attached model/.subckt references and a component
+  picker: placing `MM1` should be able to attach `model=...`/`spiceline` data.
+- [ ] **[P1] (both)** Net/wire labels with clean node names governing the generated netlist and plot
+  names.
+- [ ] **[P1] (both)** SPICE text directives placed as schematic annotations (`.tran`, `.step`,
+  `.meas`, `.include` as first-class schematic objects) — both reference tools run the whole show this
+  way.
+- [ ] **[P1] (both)** Hierarchical schematics mapping to `.subckt` definitions and instances.
+- [ ] **[P2] (both)** ERC: dangling-pin, shorted-output, floating-node diagnostics with connectivity
+  highlighting; undo/redo completeness.
+- [ ] **[P2] (spot)** Persistent configuration/preferences (window state, library paths, theme — forced
+  dark today).
+
+## 8. Advanced Analysis & mixed signal (PSpice-centric parity)
+
+- [ ] **[P1] (PS; LT approximates)** Monte Carlo: statistical runs over `LOT`/`DEV` tolerances, seed
+  control, multiple runs, histogram/yield readouts. First land the parametric `random()`/`gauss()`
+  functions that LTspice uses to fake MC via `.step` `(LT)`.
+- [ ] **[P2] (PS AA)** Worst-case analysis from component/model tolerances with sensitivity ranking.
+- [ ] **[P2] (PS AA)** Sensitivity analysis: ranked parameter sensitivities of a target measurement.
+- [ ] **[P2] (PS AA)** Optimizer: curve-fitting parameter tuning against measurement goals
+  (goal-function library incl. user-defined goal functions).
+- [ ] **[P2] (PS AA)** Smoke test: device stress checks (max V/I/power/temperature from model cards)
+  with derating tables.
+- [ ] **[P2] (PS AA)** Performance analysis: measurement-vs-parameter curves across parametric runs
+  (see Waveforms section item).
+- [ ] **[P2] (PS)** Digital primitives & mixed signal: gates, flip-flops, `PINDLY`/`CONSTRAINT`,
+  digital stimulus (`DIGSTIM`, `DIGCLOCK`, `STIM*`, `FILESTIM`), A/D and D/A interface bridges, analog
+  co-simulation during `.tran`.
+- [ ] **[P2] (PS)** IBIS I/O model translation and simulation.
+
+## 9. Model libraries & interop
+
+- [x] **[P1] (both)** Bundled model libraries shipped with the app (generic analog, opamps, couplers,
+  standard devices) and the include/lib search behavior to use them plus user directories — done:
+  `libs/standard.lib`, `libs/opamps.lib`, `libs/nom.lib`; the CLI searches `-I`, `RSPICE_LIB`, the
+  bundled tree, and the deck directory.
+- [ ] **[P2] (PS)** Model Editor-style model authoring/import tooling (model cards from datasheet
+  parameters); LTspice's symbol-authoring ecosystem (`*.asy`) equivalents live in the GUI section.
+- [ ] **[P2] (both)** Encrypted/protected models: LTspice-encrypted subcircuits and PSpice-protected
+  libraries. decryption is IP-encumbered and possibly infeasible — at minimum detect and fail loudly
+  with actionable messages.
+- [ ] **[P2] (PS)** Packaging: standalone/`PSpice for TI`-style distribution of a simulation profile
+  workflow (`(PS)` ecosystem item).
+
+## 10. Tooling, CLI & docs
+
+- [x] **[P1] (spot)** Regression corpus: golden-result tests against analytic references (hydro RC
+  step, resonant peaks, diode curves) and a manifest of `.cir` fixtures that runs in CI — done:
+  `circuitsim/tests/regression.rs` plus the `examples/*.cir` manifest.
+- [x] **[P1] (both)** CLI batch mode: run-to-completion flags with exit codes, selectable analysis
+  output (all analyses, not just `.tran` CSV), waveform file output, per-figure error reporting —
+  done: `-b/--batch`, `-a/--analysis`, `--output`, `--waves`, `-I`, warnings on stderr, exit 1 on error.
+- [ ] **[P2] (both)** Manual: command reference, netlist format rules, worked examples; both reference
+  tools ship professional-grade documentation.
+- [ ] **[P2] (spot)** Trunk configuration committed for the published wasm build (`Trunk.toml`).
+
+## 11. Beyond parity — advanced & fast (goals neither reference tool covers)
+
+Neither LTspice nor PSpice does these today; RSpice targets them for its "advanced and fast" claim.
+
+- [ ] **[P1] (spot)** Benchmark harness: canonical circuit suite with throughput (node·iterations/s)
+  and accuracy compared element-for-element against LTspice `.raw` results; "fast" must be measured,
+  not asserted. *(Harness with canonical suite, throughput, and analytic accuracy landed at
+  `circuitsim/examples/benchmark.rs`; LTspice `.raw` comparison awaits the raw reader.)*
+- [ ] **[P1] (spot)** Parallel parametric sweeps: distribute `.step`/Monte-Carlo/MC-style runs across
+  cores — neither tool parallelizes over runs.
+- [ ] **[P2] (spot)** GPU-accelerated linear solve (wgpu) as an optional backend for very large designs.
+- [ ] **[P2] (spot)** Steady-state detection and automatic quality presets ("fast" / "accurate" solver
+  profiles).
+- [ ] **[P2] (spot)** Chunked/streaming waveform writer with memory-mapped reads for hour-scale runs.
+- [ ] **[P2] (spot)** Result memoization keyed by netlist+model hash (skip identical re-runs).
+
+---
+
+### Footnote — claims to verify against shipped docs before implementing
+
+These were compiled from built-in knowledge with no web research (per decision); the following are the
+ones most likely to drift by version: exact LTspice MOSFET/BSIM level coverage and level-integer
+mapping · PSpice MESFET spelling and letters · LTspice VBIC/Mextram type names · PSpice wattmeter and
+special-library part availability · the current OrCAD X-era PSpice additions newer than the pinned
+23.x baseline · decryption/packaging items — legal/feasibility review required.

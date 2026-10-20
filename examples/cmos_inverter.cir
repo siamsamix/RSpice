@@ -1,0 +1,8 @@
+* CMOS inverter transfer point.
+.include standard.lib
+VDD vdd 0 DC 1.8
+VIN in 0 DC 0.9
+M1 out in 0 0 NMOS1 W=2u L=1u
+M2 out in vdd vdd PMOS1 W=4u L=1u
+.op
+.end

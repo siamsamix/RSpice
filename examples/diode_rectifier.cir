@@ -1,0 +1,8 @@
+* Half-wave rectifier with a load capacitor.
+.include standard.lib
+V1 in 0 SIN(0 5 1k)
+D1 in out D1N4148
+C1 out 0 10u
+R1 out 0 1k
+.tran 5u 5m
+.end

@@ -1,0 +1,3 @@
+* PSpice nom.lib-style master library: pull in the bundled sections.
+.lib standard.lib
+.lib opamps.lib

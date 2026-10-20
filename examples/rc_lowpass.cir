@@ -1,0 +1,6 @@
+* RC low-pass — AC magnitude falls 3 dB at 1/(2πRC) ≈ 1.59 kHz.
+V1 in 0 DC 0 AC 1
+R1 in out 1k
+C1 out 0 100n
+.ac dec 10 10 1meg
+.end

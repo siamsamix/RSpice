@@ -1,14 +1,23 @@
 use circuitsim::circuit::{Capacitor as CsCapacitor, Circuit as CsCircuit, Inductor as CsInductor, NodeId, Resistor as CsResistor, VoltageSource as CsVoltageSource};
-use circuitsim::netlist::{emit as netlist_emit, AcCommand, AcScale, AnalysisCommands, Netlist};
+use circuitsim::netlist::{emit as netlist_emit, AcCommand, AcScale, AnalysisCommands, Netlist, ParseOptions};
 use circuitsim::units::parse_value;
-use circuitsim::{parse, run, AcResult, DcResult, SimulationResult, TranResult};
+use circuitsim::{parse, run, AcResult, DcResult, DcSweepResult, SimulationResult, TranResult};
 use egui;
 use egui_plot::{Legend, Plot};
-
-use crate::schematic::{CompKind, Component, GridPt, NodeAssignment, Wire, GRID_SIZE};
-use crate::plot::{ac_current_series, ac_voltage_series, apply_bounds, draw, tran_current_series, tran_diff_series, tran_voltage_series, AcQuantity, PlotState};
 use std::collections::HashMap;
 use egui::{Color32, Pos2, Rect, Stroke, Vec2};
+
+use crate::schematic::{CompKind, Component, GridPt, NodeAssignment, Wire, GRID_SIZE};
+use crate::plot::{ac_current_series, ac_voltage_series, apply_bounds, dc_sweep_series, draw, tran_current_series, tran_diff_series, tran_voltage_series, AcQuantity, PlotState};
+
+/// Deck-spelling label for a node (`in`, `out`), falling back to its id.
+/// A free function so UI closures can capture only the names slice.
+fn node_label(names: &[String], i: usize) -> String {
+    match names.get(i) {
+        Some(s) if !s.is_empty() => s.clone(),
+        _ => i.to_string(),
+    }
+}
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Direction { Right, Down, Left, Up }
@@ -197,9 +206,13 @@ pub struct CircuitSimApp {
     status: Option<(bool, String)>,
     circuit_summary: Option<String>,
     dc: Option<DcResult>,
+    dc_sweep: Option<DcSweepResult>,
     tran: Option<TranResult>,
     ac: Option<AcResult>,
+    /// Deck-spelling node names (indexed by node id) for trace labels.
+    node_names: Vec<String>,
     plot_nodes: Vec<bool>,
+    dc_plot_nodes: Vec<bool>,
     ac_plot_nodes: Vec<bool>,
     ac_mag_scale: AcMagScale,
     result_tab: ResultTab,
@@ -222,9 +235,12 @@ impl Default for CircuitSimApp {
             status: None,
             circuit_summary: None,
             dc: None,
+            dc_sweep: None,
             tran: None,
             ac: None,
+            node_names: vec!["0".to_string()],
             plot_nodes: vec![false; 16],
+            dc_plot_nodes: vec![false; 16],
             ac_plot_nodes: vec![false; 16],
             ac_mag_scale: AcMagScale::default(),
             result_tab: ResultTab::Overview,
@@ -307,6 +323,7 @@ impl CircuitSimApp {
                         .map_err(|e| format!("R{r_idx} value '{}': {e}", c.val))?;
                     circuit.resistors.push(CsResistor {
                         name: format!("R{r_idx}"), n1, n2, resistance,
+                        model: None,
                     });
                     r_idx += 1;
                 }
@@ -315,6 +332,7 @@ impl CircuitSimApp {
                         .map_err(|e| format!("C{c_idx} value '{}': {e}", c.val))?;
                     circuit.capacitors.push(CsCapacitor {
                         name: format!("C{c_idx}"), n1, n2, capacitance,
+                        model: None,
                     });
                     c_idx += 1;
                 }
@@ -323,6 +341,7 @@ impl CircuitSimApp {
                         .map_err(|e| format!("L{l_idx} value '{}': {e}", c.val))?;
                     circuit.inductors.push(CsInductor {
                         name: format!("L{l_idx}"), n1, n2, inductance,
+                        model: None,
                     });
                     l_idx += 1;
                 }
@@ -332,7 +351,7 @@ impl CircuitSimApp {
                     circuit.voltage_sources.push(CsVoltageSource {
                         name: format!("V{v_idx}"),
                         n1, n2, voltage,
-                        pulse: None, sine: None, ac: None,
+                        waveform: None, ac: None,
                     });
                     v_idx += 1;
                 }
@@ -375,7 +394,18 @@ impl CircuitSimApp {
             }
         }
 
-        Ok(Netlist { circuit, analysis })
+        Ok(Netlist {
+            circuit,
+            analysis,
+            // Schematic-built decks carry no source text and no parameters:
+            // the parameter language only exists in the text editor.
+            source: String::new(),
+            params: HashMap::new(),
+            // Nothing was parsed here — no import diagnostics exist yet.
+            warnings: Vec::new(),
+            options: ParseOptions::default(),
+            overrides: HashMap::new(),
+        })
     }
 
     /// Parse the current netlist text and build a schematic layout from it.
@@ -407,6 +437,9 @@ impl CircuitSimApp {
             }
         };
         let circuit = &netlist.circuit;
+        // Tolerant import reports what it carried over but could not apply
+        // (unknown directives, unsupported device families).
+        let import_warnings = netlist.warnings.len();
 
         // Display of an f64 prints plain decimal notation, which parse_value
         // always re-parses — the round trip never loses the number.
@@ -447,14 +480,16 @@ impl CircuitSimApp {
                 val:    fmt_val(v.voltage),
             });
         }
-        // Diodes and MOSFETs have no schematic symbol yet — count them instead
-        // of silently dropping them like the old hand-parser did.
-        let skipped = circuit.diodes.len() + circuit.mosfets.len();
+        // Diodes, MOSFETs and current sources have no schematic symbol yet —
+        // count them instead of silently dropping them like the old
+        // hand-parser did.
+        let skipped =
+            circuit.diodes.len() + circuit.mosfets.len() + circuit.current_sources.len();
 
         if parsed.is_empty() {
             let msg = if skipped > 0 {
                 format!(
-                    "No supported components (R/C/L/V) found in netlist — {} diode/MOSFET element(s) have no schematic symbol",
+                    "No supported components (R/C/L/V) found in netlist — {} diode/MOSFET/current-source element(s) have no schematic symbol",
                     skipped
                 )
             } else {
@@ -630,7 +665,10 @@ impl CircuitSimApp {
         let n = parsed.len();
         let mut status = format!("Imported {} component(s) from netlist", n);
         if skipped > 0 {
-            status.push_str(&format!(" ({} D/M element(s) not drawn)", skipped));
+            status.push_str(&format!(" ({} D/M/I element(s) not drawn)", skipped));
+        }
+        if import_warnings > 0 {
+            status.push_str(&format!(" · {} import warning(s)", import_warnings));
         }
         self.status = Some((true, status));
     }
@@ -638,17 +676,22 @@ impl CircuitSimApp {
     fn run_simulation(&mut self) {
         match parse(&self.netlist) {
             Ok(netlist) => {
-                let summary = format!(
-                    "{} nodes · {} R · {} C · {} L · {} V",
+                let mut summary = format!(
+                    "{} nodes · {} R · {} C · {} L · {} V · {} I",
                     netlist.circuit.nodes,
                     netlist.circuit.resistors.len(),
                                       netlist.circuit.capacitors.len(),
                                       netlist.circuit.inductors.len(),
-                                      netlist.circuit.voltage_sources.len()
+                                      netlist.circuit.voltage_sources.len(),
+                                      netlist.circuit.current_sources.len()
                 );
+                if !netlist.warnings.is_empty() {
+                    summary.push_str(&format!(" · {} import warning(s)", netlist.warnings.len()));
+                }
                 self.circuit_summary = Some(summary);
+                self.node_names = netlist.circuit.node_names.clone();
 
-                match run(&netlist.circuit, &netlist.analysis) {
+                match run(&netlist) {
                     Ok(result) => {
                         self.apply_result(result);
                         self.status = Some((true, "Simulation finished".into()));
@@ -667,9 +710,10 @@ impl CircuitSimApp {
     }
 
     fn apply_result(&mut self, result: SimulationResult) {
-        self.dc   = result.dc;
+        self.dc = result.dc;
+        self.dc_sweep = result.dc_sweep;
         self.tran = result.tran.clone();
-        self.ac   = result.ac.clone();
+        self.ac = result.ac.clone();
 
         let max_nodes = self
         .tran
@@ -677,6 +721,12 @@ impl CircuitSimApp {
         .and_then(|t| t.points.first())
         .map(|p| p.node_voltages.len())
         .or_else(|| self.dc.as_ref().map(|d| d.node_voltages.len()))
+        .or_else(|| {
+            self.dc_sweep
+            .as_ref()
+            .and_then(|s| s.points.first())
+            .map(|p| p.node_voltages.len())
+        })
         .or_else(|| {
             self.ac.as_ref()
             .and_then(|a| a.points.first())
@@ -689,20 +739,29 @@ impl CircuitSimApp {
             self.plot_nodes[i] = i <= 3;
         }
 
+        self.dc_plot_nodes.resize(max_nodes, false);
+        for i in 1..max_nodes.min(self.dc_plot_nodes.len()) {
+            self.dc_plot_nodes[i] = i <= 3;
+        }
+
         self.ac_plot_nodes.resize(max_nodes, false);
         for i in 1..max_nodes.min(self.ac_plot_nodes.len()) {
             self.ac_plot_nodes[i] = i <= 3;
         }
         if self.ac.is_some() {
             self.result_tab = ResultTab::FreqResponse;
+        } else if self.dc_sweep.is_some() && self.tran.is_none() {
+            self.result_tab = ResultTab::Dc;
         }
     }
 
     fn clear_results(&mut self) {
         self.circuit_summary = None;
-        self.dc   = None;
+        self.dc = None;
+        self.dc_sweep = None;
         self.tran = None;
-        self.ac   = None;
+        self.ac = None;
+        self.node_names = vec!["0".to_string()];
     }
 
     fn load_example(&mut self, ex: Example) {
@@ -1928,7 +1987,7 @@ impl CircuitSimApp {
     }
 
     fn overview_tab(&mut self, ui: &mut egui::Ui) {
-        if self.dc.is_none() && self.tran.is_none() && self.ac.is_none() {
+        if self.dc.is_none() && self.dc_sweep.is_none() && self.tran.is_none() && self.ac.is_none() {
             ui.vertical_centered(|ui| {
                 ui.add_space(80.0);
                 ui.label(egui::RichText::new("⚡").size(48.0).color(ACCENT.gamma_multiply(0.4)));
@@ -1962,7 +2021,7 @@ impl CircuitSimApp {
                         );
                         for (i, v) in dc.node_voltages.iter().enumerate() {
                             ui.horizontal(|ui| {
-                                ui.label(format!("N({i})"));
+                                ui.label(format!("V({})", node_label(&self.node_names, i)));
                                 ui.with_layout(
                                     egui::Layout::right_to_left(egui::Align::Center),
                                     |ui| {
@@ -2007,18 +2066,33 @@ impl CircuitSimApp {
         .show_axes([true, true])
         .show_background(true);
 
-        let series = tran_voltage_series(tran, &self.plot_nodes, 1.0, 1.0);
+        let series = tran_voltage_series(tran, &self.plot_nodes, &self.node_names, 1.0, 1.0);
         plot.show(ui, |plot_ui| {
             draw(plot_ui, &series, 1.5);
         });
     }
 
-    fn dc_tab(&mut self, ui: &mut egui::Ui) {
-        let Some(dc) = &self.dc else {
-            ui.label(egui::RichText::new("No DC analysis in netlist (.op)").color(TEXT_SECONDARY));
-            return;
-        };
+    /// One row of the DC branch-current grid (shared by every element family).
+    fn dc_branch_row(ui: &mut egui::Ui, label: String, cur: f64) {
+        ui.label(label);
+        ui.label(
+            egui::RichText::new(format!("{cur:.6e} A"))
+            .family(egui::FontFamily::Monospace)
+            .color(ACCENT),
+        );
+        ui.end_row();
+    }
 
+    fn dc_tab(&mut self, ui: &mut egui::Ui) {
+        if self.dc.is_none() && self.dc_sweep.is_none() {
+            ui.label(
+                egui::RichText::new("No DC analysis in netlist (.op / .dc)")
+                .color(TEXT_SECONDARY),
+            );
+            return;
+        }
+
+        if let Some(dc) = &self.dc {
         card_frame().show(ui, |ui| {
             // ── Node voltages ────────────────────────────────────────────
             section_heading(ui, "Node voltages");
@@ -2031,7 +2105,7 @@ impl CircuitSimApp {
                 ui.label(egui::RichText::new("Voltage").strong());
                 ui.end_row();
                 for (i, v) in dc.node_voltages.iter().enumerate() {
-                    ui.label(format!("N({i})"));
+                    ui.label(format!("V({})", node_label(&self.node_names, i)));
                     ui.label(
                         egui::RichText::new(format!("{v:.6e} V"))
                         .family(egui::FontFamily::Monospace)
@@ -2056,52 +2130,138 @@ impl CircuitSimApp {
                 let b = &dc.branch_currents;
 
                 for (i, &cur) in b.resistors.iter().enumerate() {
-                    ui.label(format!("R{}", i + 1));
-                    ui.label(
-                        egui::RichText::new(format!("{cur:.6e} A"))
-                        .family(egui::FontFamily::Monospace)
-                        .color(ACCENT),
-                    );
-                    ui.end_row();
+                    Self::dc_branch_row(ui, format!("R{}", i + 1), cur);
                 }
                 for (i, &cur) in b.capacitors.iter().enumerate() {
-                    ui.label(format!("C{}", i + 1));
-                    ui.label(
-                        egui::RichText::new(format!("{cur:.6e} A"))
-                        .family(egui::FontFamily::Monospace)
-                        .color(ACCENT),
-                    );
-                    ui.end_row();
+                    Self::dc_branch_row(ui, format!("C{}", i + 1), cur);
                 }
                 for (i, &cur) in b.inductors.iter().enumerate() {
-                    ui.label(format!("L{}", i + 1));
-                    ui.label(
-                        egui::RichText::new(format!("{cur:.6e} A"))
-                        .family(egui::FontFamily::Monospace)
-                        .color(ACCENT),
-                    );
-                    ui.end_row();
+                    Self::dc_branch_row(ui, format!("L{}", i + 1), cur);
                 }
                 for (i, &cur) in b.voltage_sources.iter().enumerate() {
-                    ui.label(format!("V{}", i + 1));
-                    ui.label(
-                        egui::RichText::new(format!("{cur:.6e} A"))
-                        .family(egui::FontFamily::Monospace)
-                        .color(ACCENT),
-                    );
-                    ui.end_row();
+                    Self::dc_branch_row(ui, format!("V{}", i + 1), cur);
                 }
                 for (i, &cur) in b.diodes.iter().enumerate() {
-                    ui.label(format!("D{}", i + 1));
-                    ui.label(
-                        egui::RichText::new(format!("{cur:.6e} A"))
-                        .family(egui::FontFamily::Monospace)
-                        .color(ACCENT),
-                    );
-                    ui.end_row();
+                    Self::dc_branch_row(ui, format!("D{}", i + 1), cur);
+                }
+                // MOSFETs and independent current sources report their branch
+                // current like every other element (drain n1→n2 convention).
+                for (i, &cur) in b.mosfets.iter().enumerate() {
+                    Self::dc_branch_row(ui, format!("M{}", i + 1), cur);
+                }
+                for (i, &cur) in b.current_sources.iter().enumerate() {
+                    Self::dc_branch_row(ui, format!("I{}", i + 1), cur);
                 }
             });
         });
+        }
+
+        // ── Sweep ────────────────────────────────────────────────────────────
+        if let Some(sweep) = &self.dc_sweep {
+        ui.add_space(16.0);
+        card_frame().show(ui, |ui| {
+            section_heading(ui, "DC sweep");
+            ui.label(
+                egui::RichText::new(format!(
+                    "{} points · targets: {}",
+                    sweep.points.len(),
+                    sweep.targets.join(", ")
+                ))
+                .color(TEXT_SECONDARY)
+                .size(12.0),
+            );
+
+            let n_nodes = sweep
+                .points
+                .first()
+                .map(|p| p.node_voltages.len())
+                .unwrap_or(1);
+
+            if sweep.targets.len() == 1 {
+                // Flat sweep: a plot with one V(node) trace per enabled node.
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(egui::RichText::new("Nodes:").color(TEXT_SECONDARY));
+                    for i in 1..n_nodes.min(self.dc_plot_nodes.len()) {
+                        let mut on = self.dc_plot_nodes[i];
+                        if ui.checkbox(&mut on, format!("V({})", node_label(&self.node_names, i))).changed() {
+                            self.dc_plot_nodes[i] = on;
+                        }
+                    }
+                    ui.separator();
+                    if ui.button("Auto Fit").clicked() {
+                        self.plot.dc_bounds.reset();
+                        self.plot.dc_apply = true;
+                    }
+                });
+                ui.add_space(6.0);
+
+                let apply_b = self.plot.dc_apply;
+                let bounds = self.plot.dc_bounds;
+                let x_label = sweep.targets.first().cloned().unwrap_or_else(|| "sweep".into());
+                let series = dc_sweep_series(sweep, &self.dc_plot_nodes, &self.node_names, 1.0, 1.0);
+                self.plot.dc_apply = false;
+
+                Plot::new("dc_sweep_plot")
+                .height(260.0)
+                .x_axis_label(x_label)
+                .y_axis_label("Voltage (V)")
+                .y_axis_min_width(50.0)
+                .legend(Legend::default().position(egui_plot::Corner::RightTop))
+                .show_background(true)
+                .allow_scroll(true)
+                .allow_drag(true)
+                .allow_boxed_zoom(true)
+                .show(ui, |plot_ui| {
+                    if apply_b {
+                        apply_bounds(plot_ui, &bounds);
+                    }
+                    draw(plot_ui, &series, 2.0);
+                });
+            } else {
+                // Nested sweep: a table — `${outer} • ${inner}` pairs don't line
+                // up into a single curve, so the numbers are shown directly.
+                egui::Grid::new("dc_sweep_grid")
+                .num_columns(sweep.targets.len() + n_nodes)
+                .spacing([24.0, 6.0])
+                .striped(true)
+                .show(ui, |ui| {
+                    for t in &sweep.targets {
+                        ui.label(egui::RichText::new(t.clone()).strong());
+                    }
+                    for n in 0..n_nodes {
+                        ui.label(egui::RichText::new(format!("V({})", node_label(&self.node_names, n))).strong());
+                    }
+                    ui.end_row();
+
+                    const MAX_SWEEP_ROWS: usize = 500;
+                    for pt in sweep.points.iter().take(MAX_SWEEP_ROWS) {
+                        for &v in &pt.values {
+                            ui.label(
+                                egui::RichText::new(format!("{v:.4e}"))
+                                .family(egui::FontFamily::Monospace),
+                            );
+                        }
+                        for v in pt.node_voltages.iter() {
+                            ui.label(
+                                egui::RichText::new(format!("{v:.4e}"))
+                                .family(egui::FontFamily::Monospace),
+                            );
+                        }
+                        ui.end_row();
+                    }
+                    if sweep.points.len() > MAX_SWEEP_ROWS {
+                        ui.label(
+                            egui::RichText::new(format!(
+                                "… ({} further points not shown)",
+                                sweep.points.len() - MAX_SWEEP_ROWS
+                            ))
+                            .color(TEXT_SECONDARY),
+                        );
+                    }
+                });
+            }
+        });
+        }
     }
 
     fn waveforms_tab(&mut self, ui: &mut egui::Ui) {
@@ -2147,7 +2307,7 @@ impl CircuitSimApp {
                     .allow_drag(true)
                     .allow_boxed_zoom(true);
 
-                    let series = tran_voltage_series(tran, &self.plot_nodes, x_mult, y_mult);
+                    let series = tran_voltage_series(tran, &self.plot_nodes, &self.node_names, x_mult, y_mult);
                     let apply_b = self.plot.tran_apply;
                     let bounds = self.plot.tran_bounds;
                     if apply_b {
@@ -2210,6 +2370,10 @@ impl CircuitSimApp {
                 self.diff_node_a = self.diff_node_a.clamp(0, n_nodes.saturating_sub(1));
                 self.diff_node_b = self.diff_node_b.clamp(0, n_nodes.saturating_sub(1));
 
+                // Own a names copy here: the combos borrow diff_node_a/b while
+                // formatting labels, so a whole-`self` borrow would collide.
+                let node_names = self.node_names.clone();
+
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("Auto Fit").clicked() {
                         self.plot.tran_bounds.reset();
@@ -2221,22 +2385,22 @@ impl CircuitSimApp {
                     ui.label(egui::RichText::new("V(A) − V(B)  →  A:").color(TEXT_SECONDARY));
 
                     egui::ComboBox::from_id_salt("diff_node_a")
-                        .selected_text(format!("Node {}", self.diff_node_a))
+                        .selected_text(format!("V({})", node_label(&node_names, self.diff_node_a)))
                         .width(80.0)
                         .show_ui(ui, |ui| {
                             for n in 0..n_nodes {
-                                ui.selectable_value(&mut self.diff_node_a, n, format!("Node {n}"));
+                                ui.selectable_value(&mut self.diff_node_a, n, format!("V({})", node_label(&node_names, n)));
                             }
                         });
 
                     ui.label(egui::RichText::new("B:").color(TEXT_SECONDARY));
 
                     egui::ComboBox::from_id_salt("diff_node_b")
-                        .selected_text(format!("Node {}", self.diff_node_b))
+                        .selected_text(format!("V({})", node_label(&node_names, self.diff_node_b)))
                         .width(80.0)
                         .show_ui(ui, |ui| {
                             for n in 0..n_nodes {
-                                ui.selectable_value(&mut self.diff_node_b, n, format!("Node {n}"));
+                                ui.selectable_value(&mut self.diff_node_b, n, format!("V({})", node_label(&node_names, n)));
                             }
                         });
                 });
@@ -2251,7 +2415,7 @@ impl CircuitSimApp {
                     let plot = Plot::new("waveforms_diff")
                         .height(adjusted_height)
                         .x_axis_label("time (s)")
-                        .y_axis_label(format!("V({node_a}) − V({node_b})  (V)"))
+                        .y_axis_label(format!("V({}) − V({})  (V)", node_label(&self.node_names, node_a), node_label(&self.node_names, node_b)))
                         .y_axis_min_width(50.0)
                         .legend(Legend::default().position(egui_plot::Corner::RightTop))
                         .show_background(true)
@@ -2259,7 +2423,7 @@ impl CircuitSimApp {
                         .allow_drag(true)
                         .allow_boxed_zoom(true);
 
-                    let series = tran_diff_series(tran, node_a, node_b, x_mult, y_mult);
+                    let series = tran_diff_series(tran, node_a, node_b, &self.node_names, x_mult, y_mult);
                     let apply_b = self.plot.tran_apply;
                     let bounds = self.plot.tran_bounds;
                     if apply_b {
@@ -2301,7 +2465,7 @@ impl CircuitSimApp {
             ui.label(egui::RichText::new("Nodes:").color(TEXT_SECONDARY));
             for i in 1..n_nodes.min(self.ac_plot_nodes.len()) {
                 let mut on = self.ac_plot_nodes[i];
-                if ui.checkbox(&mut on, format!("V({i})")).changed() {
+                if ui.checkbox(&mut on, format!("V({})", node_label(&self.node_names, i))).changed() {
                     self.ac_plot_nodes[i] = on;
                 }
             }
@@ -2333,12 +2497,13 @@ impl CircuitSimApp {
             AcMagScale::Linear => AcQuantity::MagnitudeLinear,
         };
         let ac_plot_nodes = self.ac_plot_nodes.clone();
+        let node_names = self.node_names.clone();
 
         // All series are built up front by the one plot adapter; the show
         // closures only draw. (The old code cloned the whole result per frame
         // into a snapshot so its in-closure loops could hold it.)
-        let node_mag_series = ac_voltage_series(ac, &ac_plot_nodes, mag_qty, self.plot.ac_x, self.plot.ac_mag_y, log_x);
-        let node_phase_series = ac_voltage_series(ac, &ac_plot_nodes, AcQuantity::Phase, self.plot.ac_x, self.plot.ac_phase_y, log_x);
+        let node_mag_series = ac_voltage_series(ac, &ac_plot_nodes, &node_names, mag_qty, self.plot.ac_x, self.plot.ac_mag_y, log_x);
+        let node_phase_series = ac_voltage_series(ac, &ac_plot_nodes, &node_names, AcQuantity::Phase, self.plot.ac_x, self.plot.ac_phase_y, log_x);
         let cur_mag_series = ac_current_series(ac, mag_qty, self.plot.ac_x, self.plot.ac_mag_y, log_x);
         let cur_phase_series = ac_current_series(ac, AcQuantity::Phase, self.plot.ac_x, self.plot.ac_phase_y, log_x);
 

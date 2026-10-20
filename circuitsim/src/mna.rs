@@ -9,7 +9,10 @@
 use nalgebra::{DMatrix, DVector};
 use num_complex::Complex64;
 
-use crate::circuit::{Circuit, MosfetType, NodeId, VoltageSource};
+use crate::circuit::{
+    Circuit, ControlVar, CurrentSource, IntegrationMethod, MosfetType, NodeId, SwitchControl,
+    VoltageSource,
+};
 use crate::error::{Result, SimError};
 
 /// Field arithmetic for one MNA system: [`f64`] for DC/transient,
@@ -56,7 +59,47 @@ impl Field for Complex64 {
 #[derive(Debug, Clone, Default)]
 pub struct TransientState {
     pub capacitor_voltages: Vec<f64>,
+    pub capacitor_currents: Vec<f64>,
+    /// Voltages one accepted step further back (Gear II).
+    pub capacitor_voltages_older: Vec<f64>,
     pub inductor_currents: Vec<f64>,
+    pub inductor_voltages: Vec<f64>,
+    pub inductor_currents_older: Vec<f64>,
+    /// Mutual-inductance voltage history (one per `K` card).
+    pub mutual_voltages: Vec<f64>,
+    /// Diode junction/diffusion-capacitance history.
+    pub diode_voltages: Vec<f64>,
+    pub diode_charges: Vec<f64>,
+    pub diode_charges_older: Vec<f64>,
+    pub diode_cap_currents: Vec<f64>,
+    /// MOSFET terminal capacitance history: Cgs, Cgd, Cgb, Cdb, Csb.
+    pub mosfet_cap_voltages: Vec<[f64; 5]>,
+    pub mosfet_cap_voltages_older: Vec<[f64; 5]>,
+    pub mosfet_cap_currents: Vec<[f64; 5]>,
+    /// BJT junction capacitance history: B-E and B-C.
+    pub bjt_cap_voltages: Vec<[f64; 2]>,
+    pub bjt_cap_voltages_older: Vec<[f64; 2]>,
+    pub bjt_cap_currents: Vec<[f64; 2]>,
+    /// Last settled state of every switch (`S`/`W`), for hysteresis.
+    pub switch_states: Vec<Option<bool>>,
+    /// Step size of the last accepted step (0 before the first step).
+    pub last_dt: f64,
+}
+
+/// BDF2 coefficients `(a0, a1, a2)` for `v' ≈ a0·v_{n+1} + a1·v_n + a2·v_{n−1}`
+/// with the previous step `h_prev` and the current step `h`. Reduces to the
+/// familiar `(1.5, −2, 0.5)/h` when the step is constant; adapts exactly when
+/// it is not (the step-doubling controller changes steps often).
+fn bdf2_coefficients(h_prev: f64, h: f64) -> (f64, f64, f64) {
+    if h_prev <= 0.0 {
+        // First Gear-II step has no history: fall back to Gear I.
+        return (1.0 / h, -1.0 / h, 0.0);
+    }
+    // Coordinates anchored at t_{n+1}: t_n = −h, t_{n−1} = −(h + h_prev).
+    let a0 = (2.0 * h + h_prev) / (h * (h + h_prev));
+    let a1 = -(h + h_prev) / (h * h_prev);
+    let a2 = h / (h_prev * (h + h_prev));
+    (a0, a1, a2)
 }
 
 // ─── Branch-row layout ──────────────────────────────────────────────────────
@@ -74,16 +117,20 @@ pub struct BranchLayout {
     pub vsrc_base: usize,
     /// First row of the inductor branch block.
     pub ind_base: usize,
+    /// First row of the `E` (VCVS) branch block.
+    pub vcvs_base: usize,
+    /// First row of the `H` (CCVS) branch block.
+    pub ccvs_base: usize,
 }
 
 impl BranchLayout {
     pub fn for_circuit(circuit: &Circuit) -> Self {
         let n_nodes = circuit.nodes.saturating_sub(1);
-        Self {
-            n_nodes,
-            vsrc_base: n_nodes,
-            ind_base: n_nodes + circuit.voltage_sources.len(),
-        }
+        let vsrc_base = n_nodes;
+        let ind_base = vsrc_base + circuit.voltage_sources.len();
+        let vcvs_base = ind_base + circuit.inductors.len();
+        let ccvs_base = vcvs_base + circuit.vcvs.len();
+        Self { n_nodes, vsrc_base, ind_base, vcvs_base, ccvs_base }
     }
 
     /// Row index of the current unknown of voltage source `i`.
@@ -94,6 +141,16 @@ impl BranchLayout {
     /// Row index of the current unknown of inductor `i`.
     pub fn ind_branch(&self, i: usize) -> usize {
         self.ind_base + i
+    }
+
+    /// Row index of the output current unknown of VCVS `i`.
+    pub fn vcvs_branch(&self, i: usize) -> usize {
+        self.vcvs_base + i
+    }
+
+    /// Row index of the output current unknown of CCVS `i`.
+    pub fn ccvs_branch(&self, i: usize) -> usize {
+        self.ccvs_base + i
     }
 
     /// Value of the voltage-source `i` row in a solved unknown vector.
@@ -131,7 +188,13 @@ impl<T: Field> MnaSystem<T> {
             size,
             a: DMatrix::zeros(size, size),
             z: DVector::zeros(size),
-            branch: BranchLayout { n_nodes: 0, vsrc_base: 0, ind_base: 0 },
+            branch: BranchLayout {
+                n_nodes: 0,
+                vsrc_base: 0,
+                ind_base: 0,
+                vcvs_base: 0,
+                ccvs_base: 0,
+            },
         }
     }
 
@@ -160,11 +223,18 @@ pub enum Mode<'a> {
     /// DC operating point: nonlinear devices linearised at `guess`,
     /// capacitors open, inductors as short branches.
     Dc { guess: &'a DVector<f64> },
-    /// One backward-Euler transient step at time `t` with step `dt`.
-    Tran { dt: f64, t: f64, state: &'a TransientState, guess: &'a DVector<f64> },
+    /// One transient step at time `t` with step `dt`.
+    Tran {
+        dt: f64,
+        t: f64,
+        state: &'a TransientState,
+        method: IntegrationMethod,
+        guess: &'a DVector<f64>,
+    },
     /// Small-signal AC point at `freq`, linearised at the DC bias point.
-    /// All independent sources become short circuits; the analysis driver
-    /// patches the stimulus source afterwards.
+    /// Independent voltage sources become short circuits; the analysis driver
+    /// patches the stimulus source afterwards. Current sources with an AC
+    /// magnitude inject their phasor directly.
     Ac { freq: f64, bias: &'a DVector<f64> },
 }
 
@@ -177,10 +247,16 @@ pub fn build_system<T: Field>(circuit: &Circuit, mode: Mode) -> Result<MnaSystem
     let mut sys = MnaSystem::<T>::for_circuit(circuit);
 
     stamp_resistors(circuit, &mut sys);
+    // Controlled sources are linear in every analysis: their coefficients do
+    // not depend on the bias point (a `POLY` output is linear in the control
+    // variables), so one stamp serves DC, transient, and AC.
+    stamp_controlled_sources(circuit, &mut sys);
 
     match mode {
         Mode::Dc { guess } => {
-            stamp_diodes(circuit, &mut sys, guess, true)?;
+            stamp_switches(circuit, &mut sys, guess, &[])?;
+            stamp_diodes(circuit, &mut sys, guess, true, None)?;
+            stamp_bjts(circuit, &mut sys, guess, true)?;
             stamp_mosfets(circuit, &mut sys, guess, true)?;
 
             // Inductors are shorts at DC — stamp as 0 V voltage sources.
@@ -197,23 +273,31 @@ pub fn build_system<T: Field>(circuit: &Circuit, mode: Mode) -> Result<MnaSystem
             }
 
             stamp_voltage_sources(circuit, &mut sys, |v| v.voltage);
+            stamp_current_sources(circuit, &mut sys, |i| i.current);
         }
-        Mode::Tran { dt, t, state, guess } => {
+        Mode::Tran { dt, t, state, method, guess } => {
             if dt <= 0.0 {
                 return Err(SimError::Analysis("time step must be positive".into()));
             }
-            stamp_diodes(circuit, &mut sys, guess, true)?;
+            stamp_switches(circuit, &mut sys, guess, &state.switch_states)?;
+            stamp_diodes(circuit, &mut sys, guess, true, Some(&state.diode_voltages))?;
+            stamp_diode_capacitances(circuit, &mut sys, guess, state, dt, method)?;
+            stamp_bjts(circuit, &mut sys, guess, true)?;
+            stamp_bjt_capacitances(circuit, &mut sys, guess, state, dt, method)?;
             stamp_mosfets(circuit, &mut sys, guess, true)?;
-            stamp_capacitors(circuit, &mut sys, dt, state);
-            stamp_inductors(circuit, &mut sys, dt, state);
+            stamp_mosfet_capacitances(circuit, &mut sys, state, dt, method)?;
+            stamp_capacitors(circuit, &mut sys, dt, state, method);
+            stamp_inductors(circuit, &mut sys, dt, state, method);
             stamp_voltage_sources(circuit, &mut sys, |v| v.value_at(t));
+            stamp_current_sources(circuit, &mut sys, |i| i.value_at(t));
         }
         Mode::Ac { freq, bias } => {
             let omega = 2.0 * std::f64::consts::PI * freq;
+            stamp_switches(circuit, &mut sys, bias, &[])?;
 
             // Y_C = jωC
             for c in &circuit.capacitors {
-                let y = T::imag(omega * c.capacitance);
+                let y = T::imag(omega * circuit.capacitance_at(c));
                 stamp_admittance(&mut sys, c.n1, c.n2, y);
             }
 
@@ -222,7 +306,7 @@ pub fn build_system<T: Field>(circuit: &Circuit, mode: Mode) -> Result<MnaSystem
             // z[branch] = 0 (no independent source in the inductor branch).
             for (i, l) in circuit.inductors.iter().enumerate() {
                 let branch = sys.branch.ind_branch(i);
-                let z_l = T::imag(omega * l.inductance);
+                let z_l = T::imag(omega * circuit.inductance_at(l));
                 if let Some(i1) = node_index(l.n1) {
                     sys.a[(i1, branch)] += T::lift(1.0);
                     sys.a[(branch, i1)] += T::lift(1.0);
@@ -233,15 +317,30 @@ pub fn build_system<T: Field>(circuit: &Circuit, mode: Mode) -> Result<MnaSystem
                 }
                 sys.a[(branch, branch)] -= z_l;
             }
+            stamp_ac_mutual_inductances(circuit, &mut sys, omega);
 
             // Small-signal stamps at the DC bias: linearisation only, no
             // Newton-Raphson companion currents.
-            stamp_diodes(circuit, &mut sys, bias, false)?;
+            stamp_diodes(circuit, &mut sys, bias, false, None)?;
+            stamp_diode_capacitances_ac(circuit, &mut sys, bias, omega)?;
+            stamp_bjts(circuit, &mut sys, bias, false)?;
+            stamp_bjt_capacitances_ac(circuit, &mut sys, bias, omega);
             stamp_mosfets(circuit, &mut sys, bias, false)?;
+            stamp_mosfet_capacitances_ac(circuit, &mut sys, omega);
 
-            // Independent DC sources become short circuits (0 V); the caller
-            // drives the stimulus source by writing sys.z[src_branch(s)].
+            // Independent DC voltage sources become short circuits (0 V); the
+            // caller drives the stimulus source by writing sys.z[src_branch(s)].
             stamp_voltage_sources(circuit, &mut sys, |_| 0.0);
+
+            // Current sources: zero unless the card carries an AC magnitude —
+            // then the phasor `mag·∠phase` is injected at the source terminals.
+            for i in &circuit.current_sources {
+                if let Some(ac) = &i.ac {
+                    let phasor = T::lift(ac.mag * ac.phase.to_radians().cos())
+                        + T::imag(ac.mag * ac.phase.to_radians().sin());
+                    stamp_current_source(&mut sys, i.n1, i.n2, phasor);
+                }
+            }
         }
     }
 
@@ -252,9 +351,178 @@ pub fn build_system<T: Field>(circuit: &Circuit, mode: Mode) -> Result<MnaSystem
 
 fn stamp_resistors<T: Field>(circuit: &Circuit, sys: &mut MnaSystem<T>) {
     for r in &circuit.resistors {
-        let g = T::lift(1.0 / r.resistance);
+        let g = T::lift(1.0 / circuit.resistance_at(r));
         stamp_admittance(sys, r.n1, r.n2, g);
     }
+}
+
+/// Resolve a controlling voltage-source name to its index (case-insensitive).
+fn voltage_source_index(circuit: &Circuit, name: &str) -> Option<usize> {
+    circuit
+        .voltage_sources
+        .iter()
+        .position(|v| v.name.eq_ignore_ascii_case(name))
+}
+
+/// Stamp every `E`/`G`/`F`/`H` controlled source.
+///
+/// `E`/`H` gain a branch row (`V(out) = polynomial of controls`); `G`/`F`
+/// contribute a dependent current between their output nodes. For current
+/// controls the MNA branch unknown `j` and the element-convention current
+/// differ by a sign (`I = −j`), folded into the coefficient below.
+fn stamp_controlled_sources<T: Field>(circuit: &Circuit, sys: &mut MnaSystem<T>) {
+    let layout = sys.branch;
+
+    // VCVS (E): one branch unknown, output voltage equals the polynomial.
+    for (i, c) in circuit.vcvs.iter().enumerate() {
+        let row = layout.vcvs_branch(i);
+        stamp_branch_nodes(sys, row, c.out_p, c.out_n);
+        for (k, control) in c.controls.iter().enumerate() {
+            let coeff = c.coeff(k);
+            if let ControlVar::Voltage(p, n) = control {
+                if let Some(col) = node_index(*p) {
+                    sys.a[(row, col)] -= T::lift(coeff);
+                }
+                if let Some(col) = node_index(*n) {
+                    sys.a[(row, col)] += T::lift(coeff);
+                }
+            }
+        }
+        sys.z[row] += T::lift(c.constant());
+    }
+
+    // CCVS (H): branch row driven by controlling source currents.
+    for (i, c) in circuit.ccvs.iter().enumerate() {
+        let row = layout.ccvs_branch(i);
+        stamp_branch_nodes(sys, row, c.out_p, c.out_n);
+        for (k, control) in c.controls.iter().enumerate() {
+            let coeff = c.coeff(k);
+            if let ControlVar::Current(name) = control {
+                if let Some(idx) = voltage_source_index(circuit, name) {
+                    let col = layout.src_branch(idx);
+                    sys.a[(row, col)] -= T::lift(coeff);
+                }
+            }
+        }
+        sys.z[row] += T::lift(c.constant());
+    }
+
+    // VCCS (G): transconductance into the output nodes.
+    for c in &circuit.vccs {
+        for (k, control) in c.controls.iter().enumerate() {
+            let coeff = c.coeff(k);
+            if let ControlVar::Voltage(p, n) = control {
+                stamp_transconductance(sys, c.out_p, c.out_n, *p, *n, T::lift(coeff));
+            }
+        }
+        let c0 = T::lift(c.constant());
+        stamp_current_source(sys, c.out_p, c.out_n, c0);
+    }
+
+    // CCCS (F): dependent current driven by a source branch unknown.
+    for c in &circuit.cccs {
+        for (k, control) in c.controls.iter().enumerate() {
+            let coeff = c.coeff(k);
+            // The MNA branch unknown j *is* the element-convention current
+            // n1 → n2 through the controlling source, so no sign flip.
+            if let ControlVar::Current(name) = control {
+                if let Some(idx) = voltage_source_index(circuit, name) {
+                    let col = layout.src_branch(idx);
+                    if let Some(out) = node_index(c.out_p) {
+                        sys.a[(out, col)] += T::lift(coeff);
+                    }
+                    if let Some(out) = node_index(c.out_n) {
+                        sys.a[(out, col)] -= T::lift(coeff);
+                    }
+                }
+            }
+        }
+        let c0 = T::lift(c.constant());
+        stamp_current_source(sys, c.out_p, c.out_n, c0);
+    }
+}
+
+/// `V(a) − V(b) = 0` row plus the symmetric branch couplings.
+fn stamp_branch_nodes<T: Field>(sys: &mut MnaSystem<T>, row: usize, p: NodeId, n: NodeId) {
+    if let Some(i) = node_index(p) {
+        sys.a[(i, row)] += T::lift(1.0);
+        sys.a[(row, i)] += T::lift(1.0);
+    }
+    if let Some(j) = node_index(n) {
+        sys.a[(j, row)] -= T::lift(1.0);
+        sys.a[(row, j)] -= T::lift(1.0);
+    }
+}
+
+/// Dependent current `g·(V(cp) − V(cn))` flowing `out_p → out_n`.
+fn stamp_transconductance<T: Field>(
+    sys: &mut MnaSystem<T>,
+    out_p: NodeId,
+    out_n: NodeId,
+    cp: NodeId,
+    cn: NodeId,
+    g: T,
+) {
+    if let Some(row) = node_index(out_p) {
+        if let Some(col) = node_index(cp) { sys.a[(row, col)] += g; }
+        if let Some(col) = node_index(cn) { sys.a[(row, col)] -= g; }
+    }
+    if let Some(row) = node_index(out_n) {
+        if let Some(col) = node_index(cp) { sys.a[(row, col)] -= g; }
+        if let Some(col) = node_index(cn) { sys.a[(row, col)] += g; }
+    }
+}
+
+/// Conductance of one switch at the current iterate.
+fn switch_conductance(
+    circuit: &Circuit,
+    index: usize,
+    guess: &DVector<f64>,
+    previous: &[Option<bool>],
+) -> Result<f64> {
+    let s = &circuit.switches[index];
+    let model = circuit.switch_models.get(&s.model).ok_or_else(|| {
+        SimError::Circuit(format!(
+            "switch '{}' references unknown model '{}'",
+            s.name, s.model
+        ))
+    })?;
+    let layout = BranchLayout::for_circuit(circuit);
+    let control = match &s.control {
+        SwitchControl::Voltage(p, n) => node_voltage(guess, *p) - node_voltage(guess, *n),
+        SwitchControl::Current(name) => {
+            let idx = voltage_source_index(circuit, name).ok_or_else(|| {
+                SimError::Circuit(format!(
+                    "switch '{}' cannot read current through '{}'",
+                    s.name, name
+                ))
+            })?;
+            layout.src_row(guess, idx)
+        }
+    };
+    let was_on = previous
+        .get(index)
+        .copied()
+        .flatten()
+        .or(s.initial);
+    Ok(model.conductance(control, was_on).0)
+}
+
+/// Stamp every switch as a conductance, using the previous state for
+/// hysteresis. An empty `previous` (DC/AC) falls back to the card's `ON`/
+/// `OFF` keyword or the threshold comparison.
+fn stamp_switches<T: Field>(
+    circuit: &Circuit,
+    sys: &mut MnaSystem<T>,
+    guess: &DVector<f64>,
+    previous: &[Option<bool>],
+) -> Result<()> {
+    for i in 0..circuit.switches.len() {
+        let g = switch_conductance(circuit, i, guess, previous)?;
+        let s = &circuit.switches[i];
+        stamp_admittance(sys, s.n1, s.n2, T::lift(g));
+    }
+    Ok(())
 }
 
 /// `with_companion`: DC/transient stamping linearises for Newton-Raphson and
@@ -266,8 +534,9 @@ fn stamp_diodes<T: Field>(
     sys: &mut MnaSystem<T>,
     guess: &DVector<f64>,
     with_companion: bool,
+    previous_voltages: Option<&[f64]>,
 ) -> Result<()> {
-    for d in &circuit.diodes {
+    for (index, d) in circuit.diodes.iter().enumerate() {
         let model = circuit.diode_models.get(&d.model).ok_or_else(|| {
             SimError::Circuit(format!(
                 "diode '{}' references unknown model '{}'",
@@ -277,8 +546,17 @@ fn stamp_diodes<T: Field>(
         let v_anode = node_voltage(guess, d.anode);
         let v_cathode = node_voltage(guess, d.cathode);
         // Linearization, clamp, and companion current all come from the model —
-        // the physics lives in one place (model.rs).
-        let ev = model.eval(v_anode - v_cathode);
+        // the physics lives in one place (model.rs). `area` is the element's
+        // AREA multiplier (default 1).
+        let mut vd = v_anode - v_cathode;
+        if let Some(previous) = previous_voltages.and_then(|v| v.get(index)) {
+            // Junction limiting: the linearization point may creep only a
+            // bounded distance from the previous accepted junction voltage,
+            // which stops a strongly conducting diode from oscillating across
+            // the whole circuit during Newton iterations.
+            vd = vd.clamp(previous - 0.1, previous + 0.1);
+        }
+        let ev = model.eval_for_at(vd, d.area, circuit.temperature);
 
         stamp_admittance(sys, d.anode, d.cathode, T::lift(ev.gd));
         if with_companion {
@@ -287,6 +565,222 @@ fn stamp_diodes<T: Field>(
     }
 
     Ok(())
+}
+
+/// Diode junction + transit-time capacitance for a transient companion.
+///
+/// The stored charge is history-based (BE/trapezoidal/BDF2 chose the same
+/// linearization), so the diode contributes `dQ/dV` as an admittance plus the
+/// charge-history current as an equivalent source.
+fn stamp_diode_capacitances<T: Field>(
+    circuit: &Circuit,
+    sys: &mut MnaSystem<T>,
+    guess: &DVector<f64>,
+    state: &TransientState,
+    dt: f64,
+    method: IntegrationMethod,
+) -> Result<()> {
+    for (i, d) in circuit.diodes.iter().enumerate() {
+        let model = circuit.diode_models.get(&d.model).ok_or_else(|| {
+            SimError::Circuit(format!(
+                "diode '{}' references unknown model '{}'",
+                d.name, d.model
+            ))
+        })?;
+        if model.cjo == 0.0 && model.tt == 0.0 {
+            continue;
+        }
+        let vd = node_voltage(guess, d.anode) - node_voltage(guess, d.cathode);
+        let q = model.total_charge_at(vd, d.area, circuit.temperature);
+        let dqdv = model.dcharge_dv_at(vd, d.area, circuit.temperature);
+        let q_prev = state.diode_charges.get(i).copied().unwrap_or(q);
+        let q_older = state.diode_charges_older.get(i).copied().unwrap_or(q_prev);
+        let i_prev = state.diode_cap_currents.get(i).copied().unwrap_or(0.0);
+        let (g_eq, i_eq) = match method {
+            IntegrationMethod::Trapezoidal => {
+                let g = 2.0 * dqdv / dt;
+                // i = g·v + i_eq is the companion; at v = vd it must equal
+                // the charge-history current 2(Q−Qprev)/dt − iprev.
+                (g, g * vd - (2.0 * (q - q_prev) / dt - i_prev))
+            }
+            IntegrationMethod::Gear1 => {
+                let g = dqdv / dt;
+                (g, g * vd - (q - q_prev) / dt)
+            }
+            IntegrationMethod::Gear2 => {
+                let (a0, a1, a2) = bdf2_coefficients(state.last_dt, dt);
+                let g = dqdv * a0;
+                (g, g * vd - (a0 * q + a1 * q_prev + a2 * q_older))
+            }
+        };
+        if g_eq.is_finite() && i_eq.is_finite() {
+            stamp_admittance(sys, d.anode, d.cathode, T::lift(g_eq));
+            // Companion sources inject n2 → n1, matching the linear
+            // capacitor stamp's sign convention.
+            stamp_current_source(sys, d.cathode, d.anode, T::lift(i_eq));
+        }
+    }
+    Ok(())
+}
+
+/// Small-signal diode capacitance at the DC bias (`jωC`), including the
+/// transit-time diffusion term.
+fn stamp_diode_capacitances_ac<T: Field>(
+    circuit: &Circuit,
+    sys: &mut MnaSystem<T>,
+    bias: &DVector<f64>,
+    omega: f64,
+) -> Result<()> {
+    for d in &circuit.diodes {
+        let model = circuit.diode_models.get(&d.model).ok_or_else(|| {
+            SimError::Circuit(format!(
+                "diode '{}' references unknown model '{}'",
+                d.name, d.model
+            ))
+        })?;
+        if model.cjo == 0.0 && model.tt == 0.0 {
+            continue;
+        }
+        let vd = node_voltage(bias, d.anode) - node_voltage(bias, d.cathode);
+        let c = model.junction_capacitance(vd, d.area)
+            + model.tt * model.eval_for_at(vd, d.area, circuit.temperature).gd;
+        if c > 0.0 && omega > 0.0 {
+            stamp_admittance(sys, d.anode, d.cathode, T::imag(omega * c));
+        }
+    }
+    Ok(())
+}
+
+/// Stamp a BJT from its Ebers–Moll terminal currents.
+///
+/// The Jacobian is formed by central differences on `(Vbe, Vbc)` — the two
+/// independent junction biases — and each terminal's row is the chain rule
+/// of those derivatives into the real collector/base/emitter voltages.
+fn stamp_bjts<T: Field>(
+    circuit: &Circuit,
+    sys: &mut MnaSystem<T>,
+    guess: &DVector<f64>,
+    with_companion: bool,
+) -> Result<()> {
+    for q in &circuit.bjts {
+        let model = circuit.bjt_models.get(&q.model).ok_or_else(|| {
+            SimError::Circuit(format!(
+                "BJT '{}' references unknown model '{}'",
+                q.name, q.model
+            ))
+        })?;
+        let vbe = node_voltage(guess, q.nb) - node_voltage(guess, q.ne);
+        let vbc = node_voltage(guess, q.nb) - node_voltage(guess, q.nc);
+        let temp = circuit.temperature;
+        let current = model.currents(vbe, vbc, q.area, temp);
+        let h = 1e-6;
+        let plus_be = model.currents(vbe + h, vbc, q.area, temp);
+        let minus_be = model.currents(vbe - h, vbc, q.area, temp);
+        let plus_bc = model.currents(vbe, vbc + h, q.area, temp);
+        let minus_bc = model.currents(vbe, vbc - h, q.area, temp);
+
+        // (I0, dI/dVbe, dI/dVbc) per terminal current.
+        let terms = [
+            (q.nc, current.ic, (plus_be.ic - minus_be.ic) / (2.0 * h), (plus_bc.ic - minus_bc.ic) / (2.0 * h)),
+            (q.nb, current.ib, (plus_be.ib - minus_be.ib) / (2.0 * h), (plus_bc.ib - minus_bc.ib) / (2.0 * h)),
+            (q.ne, current.ie, (plus_be.ie - minus_be.ie) / (2.0 * h), (plus_bc.ie - minus_bc.ie) / (2.0 * h)),
+        ];
+        for (node, i0, dbe, dbc) in terms {
+            // Chain rule into real terminal voltages.
+            let vb = dbe + dbc;
+            let ve = -dbe;
+            let vc = -dbc;
+            if let Some(row) = node_index(node) {
+                if let Some(col) = node_index(q.nb) { sys.a[(row, col)] += T::lift(vb); }
+                if let Some(col) = node_index(q.ne) { sys.a[(row, col)] += T::lift(ve); }
+                if let Some(col) = node_index(q.nc) { sys.a[(row, col)] += T::lift(vc); }
+                if with_companion {
+                    let constant = i0 - dbe * vbe - dbc * vbc;
+                    sys.z[row] -= T::lift(constant);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Transient companions for the B-E and B-C junction capacitances.
+fn stamp_bjt_capacitances<T: Field>(
+    circuit: &Circuit,
+    sys: &mut MnaSystem<T>,
+    guess: &DVector<f64>,
+    state: &TransientState,
+    dt: f64,
+    method: IntegrationMethod,
+) -> Result<()> {
+    for (i, q) in circuit.bjts.iter().enumerate() {
+        let Some(model) = circuit.bjt_models.get(&q.model) else {
+            continue;
+        };
+        let vbe = node_voltage(guess, q.nb) - node_voltage(guess, q.ne);
+        let vbc = node_voltage(guess, q.nb) - node_voltage(guess, q.nc);
+        let caps = [
+            model.cbe(vbe, q.area, circuit.temperature),
+            model.cbc(vbc, q.area, circuit.temperature),
+        ];
+        let nodes = [(q.nb, q.ne), (q.nb, q.nc)];
+        for k in 0..2 {
+            let cap = caps[k];
+            if cap <= 0.0 {
+                continue;
+            }
+            let v_prev = state.bjt_cap_voltages.get(i).map(|v| v[k]).unwrap_or(0.0);
+            let v_older = state
+                .bjt_cap_voltages_older
+                .get(i)
+                .map(|v| v[k])
+                .unwrap_or(v_prev);
+            let i_prev = state.bjt_cap_currents.get(i).map(|v| v[k]).unwrap_or(0.0);
+            let (g_eq, i_eq) = match method {
+                IntegrationMethod::Trapezoidal => {
+                    let g = 2.0 * cap / dt;
+                    (g, g * v_prev + i_prev)
+                }
+                IntegrationMethod::Gear1 => {
+                    let g = cap / dt;
+                    (g, g * v_prev)
+                }
+                IntegrationMethod::Gear2 => {
+                    let (a0, a1, a2) = bdf2_coefficients(state.last_dt, dt);
+                    (cap * a0, -cap * (a1 * v_prev + a2 * v_older))
+                }
+            };
+            stamp_admittance(sys, nodes[k].0, nodes[k].1, T::lift(g_eq));
+            stamp_current_source(sys, nodes[k].1, nodes[k].0, T::lift(i_eq));
+        }
+    }
+    Ok(())
+}
+
+fn stamp_bjt_capacitances_ac<T: Field>(
+    circuit: &Circuit,
+    sys: &mut MnaSystem<T>,
+    bias: &DVector<f64>,
+    omega: f64,
+) {
+    if omega <= 0.0 {
+        return;
+    }
+    for q in &circuit.bjts {
+        let Some(model) = circuit.bjt_models.get(&q.model) else {
+            continue;
+        };
+        let vbe = node_voltage(bias, q.nb) - node_voltage(bias, q.ne);
+        let vbc = node_voltage(bias, q.nb) - node_voltage(bias, q.nc);
+        let cbe = model.cbe(vbe, q.area, circuit.temperature);
+        let cbc = model.cbc(vbc, q.area, circuit.temperature);
+        if cbe > 0.0 {
+            stamp_admittance(sys, q.nb, q.ne, T::imag(omega * cbe));
+        }
+        if cbc > 0.0 {
+            stamp_admittance(sys, q.nb, q.nc, T::imag(omega * cbc));
+        }
+    }
 }
 
 /// Stamp a single MOSFET using the level-1 Shichman-Hodges model.
@@ -331,7 +825,7 @@ fn stamp_mosfets<T: Field>(
         // clamp belongs to this stamp's companion-model convention, not to the
         // model itself.
         let beta = model.kp * (m.w / m.l);
-        let ev = model.eval(beta, vg - vs, (vd - vs).max(0.0), vb - vs);
+        let ev = model.eval_at(beta, vg - vs, (vd - vs).max(0.0), vb - vs, circuit.temperature);
 
         // ── Linearised companion model (Newton-Raphson stamp) ─────────────
         //
@@ -339,8 +833,10 @@ fn stamp_mosfets<T: Field>(
         // where all coefficients and Ieq come from model.rs at the same
         // linearization point.
         //
-        // We apply sign to account for PMOS polarity.
-        let s = sign; // +1 for NMOS, -1 for PMOS
+        // The mirroring already carries the sign in the *voltages*; the
+        // linearized drain-current coefficients are the same in real-node
+        // space for both polarities. Only the companion constant flips.
+        let s = 1.0;
         let gm = ev.gm;
         let gds = ev.gds;
         let gbs = ev.gbs;
@@ -395,40 +891,184 @@ fn stamp_mosfets<T: Field>(
 
         // -- Ieq: DC equivalent current injected at drain / extracted at source --
         if with_companion {
-            stamp_current_source(sys, drain, source, T::lift(s * ev.i_eq));
+            // PMOS: I_ds = −i_eq_mirror + (linear terms), so the constant flips.
+            let companion = if sign < 0.0 { -ev.i_eq } else { ev.i_eq };
+            stamp_current_source(sys, drain, source, T::lift(companion));
         }
     }
 
     Ok(())
 }
 
-/// Backward-Euler capacitors: companion conductance `C/dt` plus the current
-/// source carrying the previous step's voltage.
+/// Terminal capacitances of one MOSFET: Cgs, Cgd, Cgb, Cdb, Csb.
+///
+/// Overlap terms are constant per width/length; the junction terms use the
+/// zero-bias area/perimeter products (the grading coefficients are carried in
+/// the model for a future bias-dependent upgrade).
+fn mosfet_cap_values(circuit: &Circuit, m: &crate::circuit::Mosfet) -> [f64; 5] {
+    let Some(model) = circuit.mosfet_models.get(&m.model) else {
+        return [0.0; 5];
+    };
+    let cgs = model.cgso.unwrap_or(0.0) * m.w;
+    let cgd = model.cgdo.unwrap_or(0.0) * m.w;
+    let cgb = model.cgbo.unwrap_or(0.0) * m.l;
+    let cj = model.cj.unwrap_or(0.0);
+    let cjsw = model.cjsw.unwrap_or(0.0);
+    let cdb = m.ad * cj + m.ps * cjsw;
+    let csb = m.asr * cj + m.pd * cjsw;
+    [cgs.max(0.0), cgd.max(0.0), cgb.max(0.0), cdb.max(0.0), csb.max(0.0)]
+}
+
+fn mosfet_cap_nodes(m: &crate::circuit::Mosfet) -> [(NodeId, NodeId); 5] {
+    [
+        (m.ng, m.ns),
+        (m.ng, m.nd),
+        (m.ng, m.nb),
+        (m.nd, m.nb),
+        (m.ns, m.nb),
+    ]
+}
+
+/// Transient companion for the MOSFET terminal capacitances.
+fn stamp_mosfet_capacitances<T: Field>(
+    circuit: &Circuit,
+    sys: &mut MnaSystem<T>,
+    state: &TransientState,
+    dt: f64,
+    method: IntegrationMethod,
+) -> Result<()> {
+    for (i, m) in circuit.mosfets.iter().enumerate() {
+        let caps = mosfet_cap_values(circuit, m);
+        let nodes = mosfet_cap_nodes(m);
+        for k in 0..5 {
+            let cap = caps[k];
+            if cap <= 0.0 {
+                continue;
+            }
+            let v_prev = state
+                .mosfet_cap_voltages
+                .get(i)
+                .map(|v| v[k])
+                .unwrap_or(0.0);
+            let v_older = state
+                .mosfet_cap_voltages_older
+                .get(i)
+                .map(|v| v[k])
+                .unwrap_or(v_prev);
+            let i_prev = state
+                .mosfet_cap_currents
+                .get(i)
+                .map(|v| v[k])
+                .unwrap_or(0.0);
+            let (g_eq, i_eq) = match method {
+                IntegrationMethod::Trapezoidal => {
+                    let g = 2.0 * cap / dt;
+                    (g, g * v_prev + i_prev)
+                }
+                IntegrationMethod::Gear1 => {
+                    let g = cap / dt;
+                    (g, g * v_prev)
+                }
+                IntegrationMethod::Gear2 => {
+                    let (a0, a1, a2) = bdf2_coefficients(state.last_dt, dt);
+                    (cap * a0, -cap * (a1 * v_prev + a2 * v_older))
+                }
+            };
+            stamp_admittance(sys, nodes[k].0, nodes[k].1, T::lift(g_eq));
+            stamp_current_source(sys, nodes[k].1, nodes[k].0, T::lift(i_eq));
+        }
+    }
+    Ok(())
+}
+
+/// Small-signal MOSFET terminal capacitances (`jωC`).
+fn stamp_mosfet_capacitances_ac<T: Field>(
+    circuit: &Circuit,
+    sys: &mut MnaSystem<T>,
+    omega: f64,
+) {
+    if omega <= 0.0 {
+        return;
+    }
+    for m in &circuit.mosfets {
+        let caps = mosfet_cap_values(circuit, m);
+        let nodes = mosfet_cap_nodes(m);
+        for k in 0..5 {
+            if caps[k] > 0.0 {
+                stamp_admittance(sys, nodes[k].0, nodes[k].1, T::imag(omega * caps[k]));
+            }
+        }
+    }
+}
+
+/// Capacitor companion model for the selected integrator./// Capacitor companion model for the selected integrator.
+///
+/// With `g` the companion conductance and `i_eq` the equivalent current
+/// injected `n2 → n1` (the same convention the backward-Euler path used):
+///
+/// * trapezoidal: `g = 2C/dt`, `i_eq = −g·v_prev − i_prev`
+/// * Gear I (backward Euler): `g = C/dt`, `i_eq = g·v_prev`
+/// * Gear II (constant step): `g = 1.5C/dt`,
+///   `i_eq = −(2C/dt)·v_prev + (0.5C/dt)·v_older`
 fn stamp_capacitors<T: Field>(
     circuit: &Circuit,
     sys: &mut MnaSystem<T>,
     dt: f64,
     state: &TransientState,
+    method: IntegrationMethod,
 ) {
     for (i, c) in circuit.capacitors.iter().enumerate() {
-        let g_eq = c.capacitance / dt;
+        let cap = circuit.capacitance_at(c);
         let v_prev = state.capacitor_voltages.get(i).copied().unwrap_or(0.0);
-        let i_eq = g_eq * v_prev;
+        let i_prev = state.capacitor_currents.get(i).copied().unwrap_or(0.0);
+        let v_older = state.capacitor_voltages_older.get(i).copied().unwrap_or(v_prev);
+        let (g_eq, i_eq) = match method {
+            IntegrationMethod::Trapezoidal => {
+                let g = 2.0 * cap / dt;
+                (g, g * v_prev + i_prev)
+            }
+            IntegrationMethod::Gear1 => {
+                let g = cap / dt;
+                (g, g * v_prev)
+            }
+            IntegrationMethod::Gear2 => {
+                let (a0, a1, a2) = bdf2_coefficients(state.last_dt, dt);
+                (cap * a0, -cap * (a1 * v_prev + a2 * v_older))
+            }
+        };
         stamp_admittance(sys, c.n1, c.n2, T::lift(g_eq));
         stamp_current_source(sys, c.n2, c.n1, T::lift(i_eq));
     }
 }
 
-/// Backward-Euler inductors as branch unknowns with companion `L/dt`.
+/// Inductor companion model for the selected integrator (`r_eq` is the
+/// companion resistance, `v_eq` the history voltage in the branch row).
 fn stamp_inductors<T: Field>(
     circuit: &Circuit,
     sys: &mut MnaSystem<T>,
     dt: f64,
     state: &TransientState,
+    method: IntegrationMethod,
 ) {
     for (i, l) in circuit.inductors.iter().enumerate() {
-        let r_eq = l.inductance / dt;
+        let ind = circuit.inductance_at(l);
         let i_prev = state.inductor_currents.get(i).copied().unwrap_or(0.0);
+        let i_older = state.inductor_currents_older.get(i).copied().unwrap_or(i_prev);
+        let v_prev = state.inductor_voltages.get(i).copied().unwrap_or(0.0);
+        let (r_eq, v_eq) = match method {
+            IntegrationMethod::Trapezoidal => {
+                let r = 2.0 * ind / dt;
+                (r, -r * i_prev - v_prev)
+            }
+            IntegrationMethod::Gear1 => {
+                let r = ind / dt;
+                (r, -r * i_prev)
+            }
+            IntegrationMethod::Gear2 => {
+                let (a0, a1, a2) = bdf2_coefficients(state.last_dt, dt);
+                (ind * a0, ind * (a1 * i_prev + a2 * i_older))
+            }
+        };
         let branch = sys.branch.ind_branch(i);
 
         if let Some(i1) = node_index(l.n1) {
@@ -440,7 +1080,93 @@ fn stamp_inductors<T: Field>(
             sys.a[(branch, i2)] -= T::lift(1.0);
         }
         sys.a[(branch, branch)] -= T::lift(r_eq);
-        sys.z[branch] = T::lift(-r_eq * i_prev);
+        sys.z[branch] = T::lift(v_eq);
+    }
+    stamp_mutual_inductances(circuit, sys, dt, state, method);
+}
+
+/// Inductor index by card name (case-insensitive).
+fn inductor_index(circuit: &Circuit, name: &str) -> Option<usize> {
+    circuit
+        .inductors
+        .iter()
+        .position(|l| l.name.eq_ignore_ascii_case(name))
+}
+
+/// Mutual coupling `M = k·√(L1·L2)` for the backward-Euler companion:
+/// each inductor's voltage gains `(M/dt)·(i_other − i_other,prev)`.
+fn stamp_mutual_inductances<T: Field>(
+    circuit: &Circuit,
+    sys: &mut MnaSystem<T>,
+    dt: f64,
+    state: &TransientState,
+    method: IntegrationMethod,
+) {
+    for (kidx, k) in circuit.mutual_inductances.iter().enumerate() {
+        let (Some(i), Some(j)) = (
+            inductor_index(circuit, &k.inductor1),
+            inductor_index(circuit, &k.inductor2),
+        ) else {
+            continue;
+        };
+        let m = k.coupling
+            * (circuit.inductance_at(&circuit.inductors[i])
+                * circuit.inductance_at(&circuit.inductors[j]))
+                .sqrt();
+        let prev_i = state.inductor_currents.get(i).copied().unwrap_or(0.0);
+        let prev_j = state.inductor_currents.get(j).copied().unwrap_or(0.0);
+        let older_i = state.inductor_currents_older.get(i).copied().unwrap_or(prev_i);
+        let older_j = state.inductor_currents_older.get(j).copied().unwrap_or(prev_j);
+        let v_mutual = state.mutual_voltages.get(kidx).copied().unwrap_or(0.0);
+        let (coef, eq_i, eq_j) = match method {
+            IntegrationMethod::Trapezoidal => {
+                let c = 2.0 * m / dt;
+                (c, -c * prev_j - v_mutual, -c * prev_i - v_mutual)
+            }
+            IntegrationMethod::Gear1 => {
+                let c = m / dt;
+                (c, -c * prev_j, -c * prev_i)
+            }
+            IntegrationMethod::Gear2 => {
+                let (a0, a1, a2) = bdf2_coefficients(state.last_dt, dt);
+                (
+                    m * a0,
+                    m * (a1 * prev_j + a2 * older_j),
+                    m * (a1 * prev_i + a2 * older_i),
+                )
+            }
+        };
+        let bi = sys.branch.ind_branch(i);
+        let bj = sys.branch.ind_branch(j);
+        sys.a[(bi, bj)] -= T::lift(coef);
+        sys.a[(bj, bi)] -= T::lift(coef);
+        sys.z[bi] += T::lift(eq_i);
+        sys.z[bj] += T::lift(eq_j);
+    }
+}
+
+/// AC mutual coupling: cross terms `−jωM` in the two branch rows.
+fn stamp_ac_mutual_inductances<T: Field>(
+    circuit: &Circuit,
+    sys: &mut MnaSystem<T>,
+    omega: f64,
+) {
+    for k in &circuit.mutual_inductances {
+        let (Some(i), Some(j)) = (
+            inductor_index(circuit, &k.inductor1),
+            inductor_index(circuit, &k.inductor2),
+        ) else {
+            continue;
+        };
+        let m = k.coupling
+            * (circuit.inductance_at(&circuit.inductors[i])
+                * circuit.inductance_at(&circuit.inductors[j]))
+                .sqrt();
+        let zm = T::imag(omega * m);
+        let bi = sys.branch.ind_branch(i);
+        let bj = sys.branch.ind_branch(j);
+        sys.a[(bi, bj)] -= zm;
+        sys.a[(bj, bi)] -= zm;
     }
 }
 
@@ -460,6 +1186,19 @@ where
             sys.a[(branch, i2)] -= T::lift(1.0);
         }
         sys.z[branch] = T::lift(value_at(v));
+    }
+}
+
+/// Independent current sources: pure right-hand-side injections, no branch
+/// rows. The value flows `n1 → n2` through the source, so `n2` receives it.
+fn stamp_current_sources<T, F>(circuit: &Circuit, sys: &mut MnaSystem<T>, value_at: F)
+where
+    T: Field,
+    F: Fn(&CurrentSource) -> f64,
+{
+    for i in &circuit.current_sources {
+        let value = T::lift(value_at(i));
+        stamp_current_source(sys, i.n1, i.n2, value);
     }
 }
 
@@ -503,9 +1242,12 @@ pub struct BranchCurrents {
     pub capacitors: Vec<f64>,
     pub inductors: Vec<f64>,
     pub voltage_sources: Vec<f64>,
+    pub current_sources: Vec<f64>,
     pub diodes: Vec<f64>,
     /// Drain current (from drain to source) for each MOSFET.
     pub mosfets: Vec<f64>,
+    /// Collector current (into the collector) for each BJT.
+    pub bjts: Vec<f64>,
 }
 
 pub fn compute_branch_currents(
@@ -513,13 +1255,14 @@ pub fn compute_branch_currents(
     solution: &DVector<f64>,
     dt: Option<f64>,
     prev_cap_voltages: Option<&[f64]>,
+    t: Option<f64>,
 ) -> Result<BranchCurrents> {
     let branch = BranchLayout::for_circuit(circuit);
 
     let resistors = circuit.resistors.iter().map(|r| {
         let v1 = node_voltage(solution, r.n1);
         let v2 = node_voltage(solution, r.n2);
-        (v1 - v2) / r.resistance
+        (v1 - v2) / circuit.resistance_at(r)
     }).collect();
 
     let capacitors = circuit.capacitors.iter().enumerate().map(|(i, c)| {
@@ -529,7 +1272,7 @@ pub fn compute_branch_currents(
                 let v2 = node_voltage(solution, c.n2);
                 let v_now = v1 - v2;
                 let v_prev = prev.get(i).copied().unwrap_or(0.0);
-                c.capacitance * (v_now - v_prev) / dt_val
+                circuit.capacitance_at(c) * (v_now - v_prev) / dt_val
             }
             _ => 0.0,
         }
@@ -539,8 +1282,18 @@ pub fn compute_branch_currents(
         branch.ind_row(solution, i)
     }).collect();
 
+    // The branch unknown is the element-convention current n1 → n2.
     let voltage_sources = circuit.voltage_sources.iter().enumerate().map(|(i, _)| {
-        -branch.src_row(solution, i)
+        branch.src_row(solution, i)
+    }).collect();
+
+    let current_sources = circuit.current_sources.iter().map(|i_src| {
+        // Waveform cards carry the value at `t`; plain sources use their DC
+        // value (n1→n2 through the source, by construction of the stamp).
+        match t {
+            Some(t) => i_src.value_at(t),
+            None => i_src.current,
+        }
     }).collect();
 
     let mut diodes = Vec::with_capacity(circuit.diodes.len());
@@ -553,7 +1306,7 @@ pub fn compute_branch_currents(
         })?;
         let v_a = node_voltage(solution, d.anode);
         let v_c = node_voltage(solution, d.cathode);
-        diodes.push(model.eval(v_a - v_c).i_d);
+        diodes.push(model.eval_for_at(v_a - v_c, d.area, circuit.temperature).i_d);
     }
 
     // MOSFET: re-evaluate Ids at the converged solution.
@@ -572,30 +1325,408 @@ pub fn compute_branch_currents(
         let vb = sign * node_voltage(solution, m.nb);
         let beta = model.kp * (m.w / m.l);
         // Raw Vds here: reports the physical model current, as before.
-        mosfets.push(sign * model.eval(beta, vg - vs, vd - vs, vb - vs).ids);
+        mosfets.push(sign * model.eval_at(beta, vg - vs, vd - vs, vb - vs, circuit.temperature).ids);
     }
 
-    Ok(BranchCurrents { resistors, capacitors, inductors, voltage_sources, diodes, mosfets })
+    let mut bjts = Vec::with_capacity(circuit.bjts.len());
+    for q in &circuit.bjts {
+        let model = circuit.bjt_models.get(&q.model).ok_or_else(|| {
+            SimError::Circuit(format!(
+                "BJT '{}' references unknown model '{}'",
+                q.name, q.model
+            ))
+        })?;
+        let vbe = node_voltage(solution, q.nb) - node_voltage(solution, q.ne);
+        let vbc = node_voltage(solution, q.nb) - node_voltage(solution, q.nc);
+        bjts.push(model.currents(vbe, vbc, q.area, circuit.temperature).ic);
+    }
+
+    Ok(BranchCurrents {
+        resistors,
+        capacitors,
+        inductors,
+        voltage_sources,
+        current_sources,
+        diodes,
+        mosfets,
+        bjts,
+    })
 }
 
-pub fn update_transient_state(
+/// Branch currents at one transient point: the real computation plus the
+/// integrator-consistent capacitor currents from the accepted state.
+pub fn compute_branch_currents_at(
     circuit: &Circuit,
     solution: &DVector<f64>,
-    state: &mut TransientState,
-) {
-    state.capacitor_voltages = circuit
+    t: f64,
+    state: &TransientState,
+) -> Result<BranchCurrents> {
+    let mut currents = compute_branch_currents(circuit, solution, None, None, Some(t))?;
+    currents.capacitors = state.capacitor_currents.clone();
+    currents.inductors = state.inductor_currents.clone();
+    if currents.diodes.len() == state.diode_cap_currents.len() {
+        for (total, displacement) in currents
+            .diodes
+            .iter_mut()
+            .zip(&state.diode_cap_currents)
+        {
+            *total += *displacement;
+        }
+    }
+    Ok(currents)
+}
+
+/// State implied by a solved operating point / initial vector: voltages and
+/// currents known, every history term zero (DC steady state).
+pub fn seed_transient_state(circuit: &Circuit, solution: &DVector<f64>) -> TransientState {
+    let branch = BranchLayout::for_circuit(circuit);
+    let mut state = TransientState {
+        capacitor_voltages: circuit
+            .capacitors
+            .iter()
+            .map(|c| node_voltage(solution, c.n1) - node_voltage(solution, c.n2))
+            .collect(),
+        inductor_currents: circuit
+            .inductors
+            .iter()
+            .enumerate()
+            .map(|(i, _)| branch.ind_row(solution, i))
+            .collect(),
+        ..Default::default()
+    };
+    state.capacitor_currents = vec![0.0; circuit.capacitors.len()];
+    state.inductor_voltages = vec![0.0; circuit.inductors.len()];
+    state.mutual_voltages = vec![0.0; circuit.mutual_inductances.len()];
+    state.diode_voltages = circuit
+        .diodes
+        .iter()
+        .map(|d| node_voltage(solution, d.anode) - node_voltage(solution, d.cathode))
+        .collect();
+    state.diode_charges = circuit
+        .diodes
+        .iter()
+        .map(|d| {
+            let model = circuit.diode_models.get(&d.model);
+            let v = node_voltage(solution, d.anode) - node_voltage(solution, d.cathode);
+            model
+                .map(|m| m.total_charge_at(v, d.area, circuit.temperature))
+                .unwrap_or(0.0)
+        })
+        .collect();
+    state.diode_cap_currents = vec![0.0; circuit.diodes.len()];
+    state.mosfet_cap_voltages = circuit
+        .mosfets
+        .iter()
+        .map(|m| {
+            let nodes = mosfet_cap_nodes(m);
+            let mut v = [0.0; 5];
+            for k in 0..5 {
+                v[k] = node_voltage(solution, nodes[k].0) - node_voltage(solution, nodes[k].1);
+            }
+            v
+        })
+        .collect();
+    state.mosfet_cap_currents = vec![[0.0; 5]; circuit.mosfets.len()];
+    state.bjt_cap_voltages = circuit
+        .bjts
+        .iter()
+        .map(|q| {
+            [
+                node_voltage(solution, q.nb) - node_voltage(solution, q.ne),
+                node_voltage(solution, q.nb) - node_voltage(solution, q.nc),
+            ]
+        })
+        .collect();
+    state.bjt_cap_currents = vec![[0.0; 2]; circuit.bjts.len()];
+    state.switch_states = switch_states_after(circuit, solution, &[]);
+    state
+}
+
+/// Advance the integrator history after one accepted step.
+pub fn advance_transient_state(
+    circuit: &Circuit,
+    solution: &DVector<f64>,
+    previous: &TransientState,
+    dt: f64,
+    method: IntegrationMethod,
+) -> TransientState {
+    let branch = BranchLayout::for_circuit(circuit);
+    let capacitor_voltages: Vec<f64> = circuit
         .capacitors
         .iter()
         .map(|c| node_voltage(solution, c.n1) - node_voltage(solution, c.n2))
         .collect();
-
-    let branch = BranchLayout::for_circuit(circuit);
-    state.inductor_currents = circuit
+    let inductor_currents: Vec<f64> = circuit
         .inductors
         .iter()
         .enumerate()
         .map(|(i, _)| branch.ind_row(solution, i))
         .collect();
+    let inductor_voltages: Vec<f64> = circuit
+        .inductors
+        .iter()
+        .map(|l| node_voltage(solution, l.n1) - node_voltage(solution, l.n2))
+        .collect();
+
+    let capacitor_currents: Vec<f64> = circuit
+        .capacitors
+        .iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let cap = circuit.capacitance_at(c);
+            let v_new = capacitor_voltages[i];
+            let v_prev = previous.capacitor_voltages.get(i).copied().unwrap_or(v_new);
+            let i_prev = previous.capacitor_currents.get(i).copied().unwrap_or(0.0);
+            let v_older = previous
+                .capacitor_voltages_older
+                .get(i)
+                .copied()
+                .unwrap_or(v_prev);
+            match method {
+                IntegrationMethod::Trapezoidal => {
+                    (2.0 * cap / dt) * (v_new - v_prev) - i_prev
+                }
+                IntegrationMethod::Gear1 => cap / dt * (v_new - v_prev),
+                IntegrationMethod::Gear2 => {
+                    let (a0, a1, a2) = bdf2_coefficients(previous.last_dt, dt);
+                    cap * (a0 * v_new + a1 * v_prev + a2 * v_older)
+                }
+            }
+        })
+        .collect();
+
+    let diode_voltages: Vec<f64> = circuit
+        .diodes
+        .iter()
+        .map(|d| node_voltage(solution, d.anode) - node_voltage(solution, d.cathode))
+        .collect();
+    let diode_charges: Vec<f64> = circuit
+        .diodes
+        .iter()
+        .map(|d| {
+            let model = circuit.diode_models.get(&d.model);
+            let v = node_voltage(solution, d.anode) - node_voltage(solution, d.cathode);
+            model
+                .map(|m| m.total_charge_at(v, d.area, circuit.temperature))
+                .unwrap_or(0.0)
+        })
+        .collect();
+    let diode_cap_currents: Vec<f64> = (0..circuit.diodes.len())
+        .map(|i| {
+            let q = diode_charges[i];
+            let q_prev = previous.diode_charges.get(i).copied().unwrap_or(q);
+            let q_older = previous.diode_charges_older.get(i).copied().unwrap_or(q_prev);
+            let i_prev = previous.diode_cap_currents.get(i).copied().unwrap_or(0.0);
+            match method {
+                IntegrationMethod::Trapezoidal => 2.0 * (q - q_prev) / dt - i_prev,
+                IntegrationMethod::Gear1 => (q - q_prev) / dt,
+                IntegrationMethod::Gear2 => {
+                    let (a0, a1, a2) = bdf2_coefficients(previous.last_dt, dt);
+                    a0 * q + a1 * q_prev + a2 * q_older
+                }
+            }
+        })
+        .collect();
+
+    let mosfet_cap_voltages_new: Vec<[f64; 5]> = circuit
+        .mosfets
+        .iter()
+        .map(|m| {
+            let nodes = mosfet_cap_nodes(m);
+            let mut v = [0.0; 5];
+            for k in 0..5 {
+                v[k] = node_voltage(solution, nodes[k].0) - node_voltage(solution, nodes[k].1);
+            }
+            v
+        })
+        .collect();
+    let mosfet_cap_currents_new: Vec<[f64; 5]> = (0..circuit.mosfets.len())
+        .map(|i| {
+            let caps = mosfet_cap_values(circuit, &circuit.mosfets[i]);
+            let mut currents = [0.0; 5];
+            let new_v = mosfet_cap_voltages_new[i];
+            let prev_v = previous
+                .mosfet_cap_voltages
+                .get(i)
+                .copied()
+                .unwrap_or(new_v);
+            let older_v = previous
+                .mosfet_cap_voltages_older
+                .get(i)
+                .copied()
+                .unwrap_or(prev_v);
+            let prev_i = previous
+                .mosfet_cap_currents
+                .get(i)
+                .copied()
+                .unwrap_or([0.0; 5]);
+            for k in 0..5 {
+                let cap = caps[k];
+                if cap <= 0.0 {
+                    continue;
+                }
+                currents[k] = match method {
+                    IntegrationMethod::Trapezoidal => {
+                        (2.0 * cap / dt) * (new_v[k] - prev_v[k]) - prev_i[k]
+                    }
+                    IntegrationMethod::Gear1 => cap / dt * (new_v[k] - prev_v[k]),
+                    IntegrationMethod::Gear2 => {
+                        let (a0, a1, a2) = bdf2_coefficients(previous.last_dt, dt);
+                        cap * (a0 * new_v[k] + a1 * prev_v[k] + a2 * older_v[k])
+                    }
+                };
+            }
+            currents
+        })
+        .collect();
+
+    let bjt_cap_voltages_new: Vec<[f64; 2]> = circuit
+        .bjts
+        .iter()
+        .map(|q| {
+            [
+                node_voltage(solution, q.nb) - node_voltage(solution, q.ne),
+                node_voltage(solution, q.nb) - node_voltage(solution, q.nc),
+            ]
+        })
+        .collect();
+    let bjt_cap_currents_new: Vec<[f64; 2]> = (0..circuit.bjts.len())
+        .map(|i| {
+            let q = &circuit.bjts[i];
+            let caps = circuit
+                .bjt_models
+                .get(&q.model)
+                .map(|m| {
+                    [
+                        m.cbe(
+                            node_voltage(solution, q.nb) - node_voltage(solution, q.ne),
+                            q.area,
+                            circuit.temperature,
+                        ),
+                        m.cbc(
+                            node_voltage(solution, q.nb) - node_voltage(solution, q.nc),
+                            q.area,
+                            circuit.temperature,
+                        ),
+                    ]
+                })
+                .unwrap_or([0.0; 2]);
+            let new_v = bjt_cap_voltages_new[i];
+            let prev_v = previous.bjt_cap_voltages.get(i).copied().unwrap_or(new_v);
+            let older_v = previous
+                .bjt_cap_voltages_older
+                .get(i)
+                .copied()
+                .unwrap_or(prev_v);
+            let prev_i = previous.bjt_cap_currents.get(i).copied().unwrap_or([0.0; 2]);
+            let mut currents = [0.0; 2];
+            for k in 0..2 {
+                if caps[k] <= 0.0 {
+                    continue;
+                }
+                currents[k] = match method {
+                    IntegrationMethod::Trapezoidal => {
+                        (2.0 * caps[k] / dt) * (new_v[k] - prev_v[k]) - prev_i[k]
+                    }
+                    IntegrationMethod::Gear1 => caps[k] / dt * (new_v[k] - prev_v[k]),
+                    IntegrationMethod::Gear2 => {
+                        let (a0, a1, a2) = bdf2_coefficients(previous.last_dt, dt);
+                        caps[k] * (a0 * new_v[k] + a1 * prev_v[k] + a2 * older_v[k])
+                    }
+                };
+            }
+            currents
+        })
+        .collect();
+
+    let mut mutual_voltages = Vec::with_capacity(circuit.mutual_inductances.len());
+    for k in &circuit.mutual_inductances {
+        let (Some(i), Some(j)) = (
+            inductor_index(circuit, &k.inductor1),
+            inductor_index(circuit, &k.inductor2),
+        ) else {
+            mutual_voltages.push(0.0);
+            continue;
+        };
+        let m = k.coupling
+            * (circuit.inductance_at(&circuit.inductors[i])
+                * circuit.inductance_at(&circuit.inductors[j]))
+                .sqrt();
+        let new_j = inductor_currents[j];
+        let prev_j = previous.inductor_currents.get(j).copied().unwrap_or(new_j);
+        let older_j = previous
+            .inductor_currents_older
+            .get(j)
+            .copied()
+            .unwrap_or(prev_j);
+        let previous_mutual = {
+            // The history slot is indexed by the K card; recover it below.
+            previous.mutual_voltages.get(mutual_voltages.len()).copied().unwrap_or(0.0)
+        };
+        let v = match method {
+            IntegrationMethod::Trapezoidal => {
+                (2.0 * m / dt) * (new_j - prev_j) - previous_mutual
+            }
+            IntegrationMethod::Gear1 => (m / dt) * (new_j - prev_j),
+            IntegrationMethod::Gear2 => {
+                let (a0, a1, a2) = bdf2_coefficients(previous.last_dt, dt);
+                m * (a0 * new_j + a1 * prev_j + a2 * older_j)
+            }
+        };
+        mutual_voltages.push(v);
+    }
+
+    TransientState {
+        capacitor_voltages,
+        capacitor_currents,
+        capacitor_voltages_older: previous.capacitor_voltages.clone(),
+        inductor_currents,
+        inductor_voltages,
+        inductor_currents_older: previous.inductor_currents.clone(),
+        mutual_voltages,
+        diode_voltages,
+        diode_charges,
+        diode_charges_older: previous.diode_charges.clone(),
+        diode_cap_currents,
+        mosfet_cap_voltages: mosfet_cap_voltages_new,
+        mosfet_cap_voltages_older: previous.mosfet_cap_voltages.clone(),
+        mosfet_cap_currents: mosfet_cap_currents_new,
+        bjt_cap_voltages: bjt_cap_voltages_new,
+        bjt_cap_voltages_older: previous.bjt_cap_voltages.clone(),
+        bjt_cap_currents: bjt_cap_currents_new,
+        switch_states: switch_states_after(circuit, solution, &previous.switch_states),
+        last_dt: dt,
+    }
+}
+
+/// Settle every switch state after a solve, using the previous state for
+/// hysteresis.
+fn switch_states_after(
+    circuit: &Circuit,
+    solution: &DVector<f64>,
+    previous: &[Option<bool>],
+) -> Vec<Option<bool>> {
+    let branch = BranchLayout::for_circuit(circuit);
+    let mut switch_states = Vec::with_capacity(circuit.switches.len());
+    for (i, s) in circuit.switches.iter().enumerate() {
+        let control = match &s.control {
+            SwitchControl::Voltage(p, n) => {
+                node_voltage(solution, *p) - node_voltage(solution, *n)
+            }
+            SwitchControl::Current(name) => match voltage_source_index(circuit, name) {
+                Some(idx) => branch.src_row(solution, idx),
+                None => 0.0,
+            },
+        };
+        let was_on = previous.get(i).copied().flatten().or(s.initial);
+        let state_now = circuit
+            .switch_models
+            .get(&s.model)
+            .map(|m| m.conductance(control, was_on).1)
+            .unwrap_or(false);
+        switch_states.push(Some(state_now));
+    }
+    switch_states
 }
 
 // ─── Branch currents (AC, complex) ──────────────────────────────────────────
@@ -609,9 +1740,12 @@ pub struct AcBranchCurrents {
     pub capacitors: Vec<Complex64>,
     pub inductors: Vec<Complex64>,
     pub voltage_sources: Vec<Complex64>,
+    pub current_sources: Vec<Complex64>,
     pub diodes: Vec<Complex64>,
     /// Small-signal drain current phasor for each MOSFET: Id = gm·Vgs + gds·Vds + gbs·Vbs
     pub mosfets: Vec<Complex64>,
+    /// Small-signal collector current phasor for each BJT.
+    pub bjts: Vec<Complex64>,
 }
 
 /// Compute small-signal AC branch currents from a solved AC system.
@@ -635,14 +1769,14 @@ pub fn compute_ac_branch_currents(
     let resistors = circuit.resistors.iter().map(|r| {
         let v1 = node_voltage(solution, r.n1);
         let v2 = node_voltage(solution, r.n2);
-        (v1 - v2) * (one / r.resistance)
+        (v1 - v2) * (one / circuit.resistance_at(r))
     }).collect();
 
     // ── Capacitors: I = jωC * (V_n1 - V_n2) ─────────────────────────────
     let capacitors = circuit.capacitors.iter().map(|c| {
         let v1 = node_voltage(solution, c.n1);
         let v2 = node_voltage(solution, c.n2);
-        Complex64::new(0.0, omega * c.capacitance) * (v1 - v2)
+        Complex64::new(0.0, omega * circuit.capacitance_at(c)) * (v1 - v2)
     }).collect();
 
     // ── Inductors: branch unknown in solution vector ──────────────────────
@@ -652,8 +1786,18 @@ pub fn compute_ac_branch_currents(
 
     // ── Voltage sources: branch unknown in solution vector ────────────────
     // Negated to match n1→n2 passive convention (DC path note).
+    // The branch unknown is the element-convention current n1 → n2.
     let voltage_sources = circuit.voltage_sources.iter().enumerate().map(|(i, _)| {
-        -branch.src_row(solution, i)
+        branch.src_row(solution, i)
+    }).collect();
+
+    // ── Current sources: the injected phasor itself ───────────────────────
+    // Same `mag∠phase` the AC stamp injects; zero when the card has no AC
+    // magnitude (an open circuit in the small-signal model).
+    let current_sources = circuit.current_sources.iter().map(|i_src| {
+        i_src.ac.as_ref().map(|ac| {
+            Complex64::from_polar(ac.mag, ac.phase.to_radians())
+        }).unwrap_or_default()
     }).collect();
 
     // ── Diodes: linearised small-signal conductance gd * (V_a - V_c) ─────
@@ -666,11 +1810,20 @@ pub fn compute_ac_branch_currents(
             ))
         })?;
         let gd = model
-            .eval(node_voltage(dc_solution, d.anode) - node_voltage(dc_solution, d.cathode))
+            .eval_for_at(
+                node_voltage(dc_solution, d.anode) - node_voltage(dc_solution, d.cathode),
+                d.area,
+                circuit.temperature,
+            )
             .gd;
         let va_ac = node_voltage(solution, d.anode);
         let vc_ac = node_voltage(solution, d.cathode);
-        diodes.push(Complex64::new(gd, 0.0) * (va_ac - vc_ac));
+        // Conduction plus junction/transit-time displacement current.
+        let vd_bias = node_voltage(dc_solution, d.anode) - node_voltage(dc_solution, d.cathode);
+        let cap = model.junction_capacitance(vd_bias, d.area)
+            + model.tt * model.eval_for_at(vd_bias, d.area, circuit.temperature).gd;
+        let y = Complex64::new(gd, omega * cap);
+        diodes.push(y * (va_ac - vc_ac));
     }
 
     // ── MOSFETs: small-signal drain current phasor ────────────────────────
@@ -697,7 +1850,7 @@ pub fn compute_ac_branch_currents(
         let vb_dc = sign * node_voltage(dc_solution, m.nb);
 
         let beta = model.kp * (m.w / m.l);
-        let ev = model.eval(beta, vg_dc - vs_dc, vd_dc - vs_dc, vb_dc - vs_dc);
+        let ev = model.eval_at(beta, vg_dc - vs_dc, vd_dc - vs_dc, vb_dc - vs_dc, circuit.temperature);
         let gm = ev.gm;
         let gds = ev.gds;
         let gbs = ev.gbs;
@@ -712,16 +1865,47 @@ pub fn compute_ac_branch_currents(
         let vds_ac = vd_ac - vs_ac;
         let vbs_ac = vb_ac - vs_ac;
 
-        // Id = sign·(gm·Vgs + gds·Vds + gbs·Vbs).
+        // Id = gm·Vgs + gds·Vds + gbs·Vbs in real-node space (the mirrored
+        // bias only changes the coefficients, not their sign).
         mosfets.push(
-            Complex64::new(sign, 0.0)
-                * (Complex64::new(gm, 0.0) * vgs_ac
-                    + Complex64::new(gds, 0.0) * vds_ac
-                    + Complex64::new(gbs, 0.0) * vbs_ac),
+            Complex64::new(gm, 0.0) * vgs_ac
+                + Complex64::new(gds, 0.0) * vds_ac
+                + Complex64::new(gbs, 0.0) * vbs_ac,
         );
     }
 
-    Ok(AcBranchCurrents { resistors, capacitors, inductors, voltage_sources, diodes, mosfets })
+    let mut bjts = Vec::with_capacity(circuit.bjts.len());
+    for q in &circuit.bjts {
+        let model = circuit.bjt_models.get(&q.model).ok_or_else(|| {
+            SimError::Circuit(format!(
+                "BJT '{}' references unknown model '{}'",
+                q.name, q.model
+            ))
+        })?;
+        let vbe_dc = node_voltage(dc_solution, q.nb) - node_voltage(dc_solution, q.ne);
+        let vbc_dc = node_voltage(dc_solution, q.nb) - node_voltage(dc_solution, q.nc);
+        let h = 1e-6;
+        let pbe = model.currents(vbe_dc + h, vbc_dc, q.area, circuit.temperature).ic;
+        let mbe = model.currents(vbe_dc - h, vbc_dc, q.area, circuit.temperature).ic;
+        let pbc = model.currents(vbe_dc, vbc_dc + h, q.area, circuit.temperature).ic;
+        let mbc = model.currents(vbe_dc, vbc_dc - h, q.area, circuit.temperature).ic;
+        let dbe = (pbe - mbe) / (2.0 * h);
+        let dbc = (pbc - mbc) / (2.0 * h);
+        let vbe_ac = node_voltage(solution, q.nb) - node_voltage(solution, q.ne);
+        let vbc_ac = node_voltage(solution, q.nb) - node_voltage(solution, q.nc);
+        bjts.push(Complex64::new(dbe, 0.0) * vbe_ac + Complex64::new(dbc, 0.0) * vbc_ac);
+    }
+
+    Ok(AcBranchCurrents {
+        resistors,
+        capacitors,
+        inductors,
+        voltage_sources,
+        current_sources,
+        diodes,
+        mosfets,
+        bjts,
+    })
 }
 
 // ─── Operating-point seed ────────────────────────────────────────────────────
@@ -740,7 +1924,7 @@ pub fn initial_guess(circuit: &Circuit) -> DVector<f64> {
 
     // Resistors.
     for r in &circuit.resistors {
-        stamp_admittance(&mut sys, r.n1, r.n2, 1.0 / r.resistance);
+        stamp_admittance(&mut sys, r.n1, r.n2, 1.0 / circuit.resistance_at(r));
     }
 
     // Voltage sources at their DC value.
@@ -779,6 +1963,18 @@ pub fn initial_guess(circuit: &Circuit) -> DVector<f64> {
         // Stub between drain and source keeps the drain node from floating.
         stamp_admittance(&mut sys, m.nd, m.ns, g_stub);
     }
+
+    // Current source DC values make the guess match the driven problem.
+    for i in &circuit.current_sources {
+        stamp_current_source(&mut sys, i.n1, i.n2, i.current);
+    }
+
+    // Linear controlled sources and switches keep their branch rows out of
+    // the singular-matrix corner (a VCVS output with no other path would
+    // otherwise leave its row empty in the seed solve).
+    stamp_controlled_sources(circuit, &mut sys);
+    let zero = DVector::zeros(sys.size);
+    let _ = stamp_switches(circuit, &mut sys, &zero, &[]);
 
     match sys.solve() {
         Ok(x0) => x0,

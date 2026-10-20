@@ -1,0 +1,6 @@
+* Thermal noise of a resistive divider, output- and input-referred.
+V1 in 0 DC 1
+R1 in out 1k
+R2 out 0 1k
+.noise V(out) V1 DEC 5 10 1meg
+.end

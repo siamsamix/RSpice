@@ -1,0 +1,13 @@
+* The four SPICE controlled-source letters plus a POLY(2) VCVS.
+V1 a 0 DC 1
+V2 b 0 DC 2
+E1 eout 0 a 0 10
+G1 0 gout a 0 1m
+H1 hout 0 V1 2k
+F1 fout 0 V1 2
+R1 eout 0 1k
+R2 gout 0 1k
+R3 hout 0 1k
+R4 fout 0 1k
+.op
+.end

@@ -11,7 +11,8 @@ pub mod model;
 pub mod netlist;
 pub mod units;
 
-pub use analysis::{AcResult, AcCommand, AcScale, run, DcResult, SimulationResult, TranResult};
+pub use analysis::{AcResult, run, DcResult, SimulationResult, TranResult};
+pub use netlist::{AcCommand, AcScale};
 pub use circuit::Circuit;
 pub use error::{Result, SimError};
 pub use netlist::{parse, Netlist};

@@ -1,8 +1,33 @@
-use crate::analysis::{AcCommand, AcScale};
 use crate::circuit::{Capacitor, Circuit, Inductor, Mosfet, MosfetModel, MosfetType, NodeId, Pulse, Resistor, VoltageSource, Sine, Diode, Ac};
 use crate::error::{Result, SimError};
 use crate::units::parse_value;
 use crate::circuit::DiodeModel;
+
+/// Supported sweep scale (mirrors SPICE `.ac` syntax).
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum AcScale {
+    /// Logarithmically spaced points per decade.
+    Dec,
+    /// Logarithmically spaced points per octave.
+    Oct,
+    /// Linearly spaced points.
+    Lin,
+}
+
+/// Parameters extracted from a `.ac` command.
+#[derive(Debug, Clone)]
+pub struct AcCommand {
+    pub scale: AcScale,
+    /// Points per decade/octave, or total linear points.
+    pub points: usize,
+    /// Start frequency (Hz).
+    pub f_start: f64,
+    /// Stop frequency (Hz).
+    pub f_stop: f64,
+    /// Index of the voltage source to use as the AC stimulus (0-based into
+    /// `circuit.voltage_sources`).  `None` = drive the first source.
+    pub stimulus_source: Option<usize>,
+}
 
 #[derive(Debug, Clone, Default)]
 pub struct AnalysisCommands {
@@ -375,4 +400,106 @@ fn parse_voltage_source(tokens: &[&str], circuit: &mut Circuit) -> Result<()> {
         ac,
     });
     Ok(())
+}
+
+/// Emit the canonical textual form of a parsed netlist — the inverse of
+/// [`parse`]: model cards, element cards, dot commands, `.end`.
+///
+/// Numeric values print through `f64` `Display` (plain decimal notation,
+/// always re-parseable by `parse_value`, unlike a value the user typed with a
+/// suffix); non-GUI source waveforms (`PULSE`, `SIN`) carry their stored
+/// parameters so a round trip preserves them. Model cards are emitted sorted
+/// by name so the output is deterministic despite the HashMap storage.
+pub fn emit(netlist: &Netlist) -> String {
+    let circuit = &netlist.circuit;
+    let analysis = &netlist.analysis;
+    let mut out = String::from("* Canonical netlist\n");
+
+    // ── Model cards (sorted for deterministic output) ────────────────────
+    let mut diode_names: Vec<&String> = circuit.diode_models.keys().collect();
+    diode_names.sort();
+    for name in diode_names {
+        let m = &circuit.diode_models[name];
+        out.push_str(&format!(".model {} D(IS={} N={})\n", name, m.is, m.n));
+    }
+    let mut mosfet_names: Vec<&String> = circuit.mosfet_models.keys().collect();
+    mosfet_names.sort();
+    for name in mosfet_names {
+        let m = &circuit.mosfet_models[name];
+        let kind = match m.kind {
+            MosfetType::Nmos => "NMOS",
+            MosfetType::Pmos => "PMOS",
+        };
+        out.push_str(&format!(
+            ".model {} {}(KP={} VTH0={} LAMBDA={} GAMMA={} PHI={})\n",
+            name, kind, m.kp, m.vth0, m.lambda, m.gamma, m.phi
+        ));
+    }
+
+    // ── Element cards ────────────────────────────────────────────────────
+    for r in &circuit.resistors {
+        out.push_str(&format!("{} {} {} {}\n", r.name, r.n1.0, r.n2.0, r.resistance));
+    }
+    for c in &circuit.capacitors {
+        out.push_str(&format!("{} {} {} {}\n", c.name, c.n1.0, c.n2.0, c.capacitance));
+    }
+    for l in &circuit.inductors {
+        out.push_str(&format!("{} {} {} {}\n", l.name, l.n1.0, l.n2.0, l.inductance));
+    }
+    for d in &circuit.diodes {
+        out.push_str(&format!("{} {} {} {}\n", d.name, d.anode.0, d.cathode.0, d.model));
+    }
+    for m in &circuit.mosfets {
+        out.push_str(&format!(
+            "{} {} {} {} {} {} W={} L={}\n",
+            m.name, m.nd.0, m.ng.0, m.ns.0, m.nb.0, m.model, m.w, m.l
+        ));
+    }
+    for v in &circuit.voltage_sources {
+        // `DC <value>` is redundant for pulse/sine sources (the value equals
+        // their starting level) but keeps every source's operating point.
+        out.push_str(&format!("{} {} {} DC {}", v.name, v.n1.0, v.n2.0, v.voltage));
+        if let Some(ac) = &v.ac {
+            out.push_str(&format!(" AC {}", ac.mag));
+            if ac.phase != 0.0 {
+                out.push_str(&format!(" {}", ac.phase));
+            }
+        }
+        if let Some(p) = &v.pulse {
+            out.push_str(&format!(
+                " PULSE({} {} {} {} {} {} {})",
+                p.v1, p.v2, p.td, p.tr, p.tf, p.pw, p.per
+            ));
+        }
+        if let Some(s) = &v.sine {
+            out.push_str(&format!(" SIN({} {} {} {} {})", s.vo, s.va, s.freq, s.td, s.theta));
+        }
+        out.push('\n');
+    }
+
+    // ── Analysis commands ────────────────────────────────────────────────
+    if analysis.dc_op {
+        out.push_str(".op\n");
+    }
+    if let (Some(step), Some(stop)) = (analysis.tran_step, analysis.tran_stop) {
+        if analysis.tran_start != 0.0 {
+            out.push_str(&format!(".tran {} {} {}\n", step, stop, analysis.tran_start));
+        } else {
+            out.push_str(&format!(".tran {} {}\n", step, stop));
+        }
+    }
+    if let Some(ac) = &analysis.ac {
+        let scale = match ac.scale {
+            AcScale::Dec => "DEC",
+            AcScale::Oct => "OCT",
+            AcScale::Lin => "LIN",
+        };
+        let src = match ac.stimulus_source {
+            Some(i) => format!(" {}", i),
+            None => String::new(),
+        };
+        out.push_str(&format!(".ac {} {} {} {}{}\n", scale, ac.points, ac.f_start, ac.f_stop, src));
+    }
+    out.push_str(".end\n");
+    out
 }

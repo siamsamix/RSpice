@@ -5,7 +5,7 @@ use crate::mna::{
     update_transient_state, AcBranchCurrents, BranchCurrents, BranchLayout, MnaSystem, Mode,
     TransientState,
 };
-use crate::netlist::AnalysisCommands;
+use crate::netlist::{AcCommand, AcScale, AnalysisCommands};
 use num_complex::Complex64;
 
 #[derive(Debug, Clone)]
@@ -230,31 +230,9 @@ fn run_transient(
 
 // ─── AC frequency sweep ───────────────────────────────────────────────────────
 
-/// Supported sweep scale (mirrors SPICE .ac syntax).
-#[derive(Debug, Clone, Copy, PartialEq)]
-pub enum AcScale {
-    /// Logarithmically spaced points per decade.
-    Dec,
-    /// Logarithmically spaced points per octave.
-    Oct,
-    /// Linearly spaced points.
-    Lin,
-}
-
-/// Parameters extracted from a `.ac` command.
-#[derive(Debug, Clone)]
-pub struct AcCommand {
-    pub scale: AcScale,
-    /// Points per decade/octave, or total linear points.
-    pub points: usize,
-    /// Start frequency (Hz).
-    pub f_start: f64,
-    /// Stop frequency (Hz).
-    pub f_stop: f64,
-    /// Index of the voltage source to use as the AC stimulus (0-based into
-    /// `circuit.voltage_sources`).  `None` = drive the first source.
-    pub stimulus_source: Option<usize>,
-}
+/// Params note: `AcScale`/`AcCommand` live in `netlist.rs` — the command
+/// grammar is owned by the netlist module and analysis merely consumes it.
+/// (The old analysis-local definitions created the mutual-import tangle.)
 
 /// Build the frequency list for the sweep.
 pub fn ac_frequencies(cmd: &AcCommand) -> Vec<f64> {

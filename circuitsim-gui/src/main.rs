@@ -1,4 +1,5 @@
 mod app;
+mod plot;
 mod schematic;
 mod theme;
 

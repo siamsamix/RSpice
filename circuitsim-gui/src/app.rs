@@ -3,9 +3,10 @@ use circuitsim::netlist::{emit as netlist_emit, AcCommand, AcScale, AnalysisComm
 use circuitsim::units::parse_value;
 use circuitsim::{parse, run, AcResult, DcResult, SimulationResult, TranResult};
 use egui;
-use egui_plot::{Legend, Line, Plot, PlotPoints};
+use egui_plot::{Legend, Plot};
 
 use crate::schematic::{CompKind, Component, GridPt, NodeAssignment, Wire, GRID_SIZE};
+use crate::plot::{ac_current_series, ac_voltage_series, apply_bounds, draw, tran_current_series, tran_diff_series, tran_voltage_series, AcQuantity, PlotState};
 use std::collections::HashMap;
 use egui::{Color32, Pos2, Rect, Stroke, Vec2};
 
@@ -92,7 +93,7 @@ enum EditorMode { Text, Schematic }
 
 use crate::theme::{
     self, card_frame, code_frame, editor_frame, panel_frame, section_heading, status_chip,
-    ACCENT, BG_PANEL, BG_SURFACE, PLOT_COLORS, STATUS_ERROR, STATUS_OK, TEXT_SECONDARY,
+    ACCENT, BG_PANEL, BG_SURFACE, STATUS_ERROR, STATUS_OK, TEXT_SECONDARY,
 };
 
 const DEFAULT_NETLIST: &str = r#"* RC charging — edit and press Run (F5)
@@ -205,24 +206,8 @@ pub struct CircuitSimApp {
     tran_sub_tab: TranSubTab,
     editor_mode: EditorMode,
     schematic: SchematicState,
-    plot_x_scale: String,
-    plot_y_scale: String,
-    plot_x_min: String,
-    plot_x_max: String,
-    plot_y_min: String,
-    plot_y_max: String,
-    apply_plot_bounds: bool,
-
-    ac_plot_x_scale: String,
-    ac_mag_y_scale: String,
-    ac_phase_y_scale: String,
-    ac_plot_x_min: String,
-    ac_plot_x_max: String,
-    ac_mag_y_min: String,
-    ac_mag_y_max: String,
-    ac_phase_y_min: String,
-    ac_phase_y_max: String,
-    ac_apply_plot_bounds: bool,
+    /// Axis scales, bounds, and apply-flags for every plot (one owner).
+    plot: PlotState,
 
     // Differential voltage plot node selectors
     diff_node_a: usize,
@@ -246,24 +231,7 @@ impl Default for CircuitSimApp {
             tran_sub_tab: TranSubTab::default(),
             editor_mode: EditorMode::Text,
             schematic: SchematicState::default(),
-            plot_x_scale: "1.0".to_string(),
-            plot_y_scale: "1.0".to_string(),
-            plot_x_min: "".to_string(),
-            plot_x_max: "".to_string(),
-            plot_y_min: "".to_string(),
-            plot_y_max: "".to_string(),
-            apply_plot_bounds: false,
-
-            ac_plot_x_scale: "1.0".to_string(),
-            ac_mag_y_scale: "1.0".to_string(),
-            ac_phase_y_scale: "1.0".to_string(),
-            ac_plot_x_min: "".to_string(),
-            ac_plot_x_max: "".to_string(),
-            ac_mag_y_min: "".to_string(),
-            ac_mag_y_max: "".to_string(),
-            ac_phase_y_min: "".to_string(),
-            ac_phase_y_max: "".to_string(),
-            ac_apply_plot_bounds: false,
+            plot: PlotState::default(),
 
             diff_node_a: 1,
             diff_node_b: 2,
@@ -2039,29 +2007,9 @@ impl CircuitSimApp {
         .show_axes([true, true])
         .show_background(true);
 
+        let series = tran_voltage_series(tran, &self.plot_nodes, 1.0, 1.0);
         plot.show(ui, |plot_ui| {
-            for (node, &enabled) in self.plot_nodes.iter().enumerate() {
-                if !enabled || node == 0 {
-                    continue;
-                }
-                let points: PlotPoints = tran
-                .points
-                .iter()
-                .map(|p| {
-                    [
-                        p.time as f64,
-                        p.node_voltages.get(node).copied().unwrap_or(0.0) as f64,
-                    ]
-                })
-                .collect();
-                let color = PLOT_COLORS[node % PLOT_COLORS.len()];
-                plot_ui.line(
-                    Line::new(points)
-                    .name(format!("V({node})"))
-                    .color(color)
-                    .width(1.5),
-                );
-            }
+            draw(plot_ui, &series, 1.5);
         });
     }
 
@@ -2173,19 +2121,15 @@ impl CircuitSimApp {
         });
         ui.separator();
 
-        let x_mult = self.plot_x_scale.parse::<f64>().unwrap_or(1.0);
-        let y_mult = self.plot_y_scale.parse::<f64>().unwrap_or(1.0);
-        let plot_h = (ui.available_height() - 8.0).max(120.0);
+        let x_mult = self.plot.tran_x;
+        let y_mult = self.plot.tran_y;
 
         match self.tran_sub_tab {
             TranSubTab::Voltage => {
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("Auto Fit").clicked() {
-                        self.plot_x_min.clear();
-                        self.plot_x_max.clear();
-                        self.plot_y_min.clear();
-                        self.plot_y_max.clear();
-                        self.apply_plot_bounds = true;
+                        self.plot.tran_bounds.reset();
+                        self.plot.tran_apply = true;
                     }
                 });
                 ui.add_space(8.0);
@@ -2203,40 +2147,18 @@ impl CircuitSimApp {
                     .allow_drag(true)
                     .allow_boxed_zoom(true);
 
-                    plot.show(ui, |plot_ui| {
-                        if self.apply_plot_bounds {
-                            if self.plot_x_min.is_empty() && self.plot_x_max.is_empty()
-                                && self.plot_y_min.is_empty() && self.plot_y_max.is_empty() {
-                                plot_ui.set_auto_bounds(egui::Vec2b::new(true, true));
-                            } else {
-                                plot_ui.set_auto_bounds(egui::Vec2b::new(false, false));
-                                let cur = plot_ui.plot_bounds();
-                                let mut x_min = cur.min()[0]; let mut x_max = cur.max()[0];
-                                let mut y_min = cur.min()[1]; let mut y_max = cur.max()[1];
-                                if let Ok(v) = self.plot_x_min.parse::<f64>() { x_min = v; }
-                                if let Ok(v) = self.plot_x_max.parse::<f64>() { x_max = v; }
-                                if let Ok(v) = self.plot_y_min.parse::<f64>() { y_min = v; }
-                                if let Ok(v) = self.plot_y_max.parse::<f64>() { y_max = v; }
-                                let safe_x_min = x_min.min(x_max);
-                                let safe_x_max = if x_min == x_max { x_max + 1e-6 } else { x_min.max(x_max) };
-                                let safe_y_min = y_min.min(y_max);
-                                let safe_y_max = if y_min == y_max { y_max + 1e-6 } else { y_min.max(y_max) };
-                                plot_ui.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
-                                    [safe_x_min, safe_y_min], [safe_x_max, safe_y_max],
-                                ));
-                            }
-                            self.apply_plot_bounds = false;
-                        }
+                    let series = tran_voltage_series(tran, &self.plot_nodes, x_mult, y_mult);
+                    let apply_b = self.plot.tran_apply;
+                    let bounds = self.plot.tran_bounds;
+                    if apply_b {
+                        self.plot.tran_apply = false;
+                    }
 
-                        for (node, &enabled) in self.plot_nodes.iter().enumerate() {
-                            if !enabled || node == 0 { continue; }
-                            let points: PlotPoints = tran.points.iter().map(|p| {
-                                [p.time * x_mult,
-                                 p.node_voltages.get(node).copied().unwrap_or(0.0) * y_mult]
-                            }).collect();
-                            let color = PLOT_COLORS[node % PLOT_COLORS.len()];
-                            plot_ui.line(Line::new(points).name(format!("V({node})")).color(color).width(2.0));
+                    plot.show(ui, |plot_ui| {
+                        if apply_b {
+                            apply_bounds(plot_ui, &bounds);
                         }
+                        draw(plot_ui, &series, 2.0);
                     });
                 });
             }
@@ -2244,11 +2166,8 @@ impl CircuitSimApp {
             TranSubTab::Current => {
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("Auto Fit").clicked() {
-                        self.plot_x_min.clear();
-                        self.plot_x_max.clear();
-                        self.plot_y_min.clear();
-                        self.plot_y_max.clear();
-                        self.apply_plot_bounds = true;
+                        self.plot.tran_bounds.reset();
+                        self.plot.tran_apply = true;
                     }
                 });
                 ui.add_space(8.0);
@@ -2265,80 +2184,18 @@ impl CircuitSimApp {
                     .allow_drag(true)
                     .allow_boxed_zoom(true);
 
+                    let series = tran_current_series(tran, x_mult, y_mult);
+                    let apply_b = self.plot.tran_apply;
+                    let bounds = self.plot.tran_bounds;
+                    if apply_b {
+                        self.plot.tran_apply = false;
+                    }
+
                     plot.show(ui, |plot_ui| {
-                        if self.apply_plot_bounds {
-                            if self.plot_x_min.is_empty() && self.plot_x_max.is_empty()
-                                && self.plot_y_min.is_empty() && self.plot_y_max.is_empty() {
-                                    plot_ui.set_auto_bounds(egui::Vec2b::new(true, true));
-                                } else {
-                                    plot_ui.set_auto_bounds(egui::Vec2b::new(false, false));
-                                    let cur = plot_ui.plot_bounds();
-                                    let mut x_min = cur.min()[0]; let mut x_max = cur.max()[0];
-                                    let mut y_min = cur.min()[1]; let mut y_max = cur.max()[1];
-                                    if let Ok(v) = self.plot_x_min.parse::<f64>() { x_min = v; }
-                                    if let Ok(v) = self.plot_x_max.parse::<f64>() { x_max = v; }
-                                    if let Ok(v) = self.plot_y_min.parse::<f64>() { y_min = v; }
-                                    if let Ok(v) = self.plot_y_max.parse::<f64>() { y_max = v; }
-                                    let safe_x_min = x_min.min(x_max);
-                                    let safe_x_max = if x_min == x_max { x_max + 1e-6 } else { x_min.max(x_max) };
-                                    let safe_y_min = y_min.min(y_max);
-                                    let safe_y_max = if y_min == y_max { y_max + 1e-6 } else { y_min.max(y_max) };
-                                    plot_ui.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
-                                        [safe_x_min, safe_y_min], [safe_x_max, safe_y_max],
-                                    ));
-                                }
-                                self.apply_plot_bounds = false;
+                        if apply_b {
+                            apply_bounds(plot_ui, &bounds);
                         }
-                        // ----------------------------------------
-
-                        let mut color_idx = 0usize;
-
-                        let nr = tran.points.first().map(|p| p.branch_currents.resistors.len()).unwrap_or(0);
-                        for i in 0..nr {
-                            let pts: PlotPoints = tran.points.iter().map(|p| {
-                                [p.time * x_mult, p.branch_currents.resistors.get(i).copied().unwrap_or(0.0) * y_mult]
-                            }).collect();
-                            plot_ui.line(Line::new(pts).name(format!("I(R{})", i + 1))
-                            .color(PLOT_COLORS[color_idx % PLOT_COLORS.len()]).width(2.0));
-                            color_idx += 1;
-                        }
-                        let nc = tran.points.first().map(|p| p.branch_currents.capacitors.len()).unwrap_or(0);
-                        for i in 0..nc {
-                            let pts: PlotPoints = tran.points.iter().map(|p| {
-                                [p.time * x_mult, p.branch_currents.capacitors.get(i).copied().unwrap_or(0.0) * y_mult]
-                            }).collect();
-                            plot_ui.line(Line::new(pts).name(format!("I(C{})", i + 1))
-                            .color(PLOT_COLORS[color_idx % PLOT_COLORS.len()]).width(2.0));
-                            color_idx += 1;
-                        }
-                        let nl = tran.points.first().map(|p| p.branch_currents.inductors.len()).unwrap_or(0);
-                        for i in 0..nl {
-                            let pts: PlotPoints = tran.points.iter().map(|p| {
-                                [p.time * x_mult, p.branch_currents.inductors.get(i).copied().unwrap_or(0.0) * y_mult]
-                            }).collect();
-                            plot_ui.line(Line::new(pts).name(format!("I(L{})", i + 1))
-                            .color(PLOT_COLORS[color_idx % PLOT_COLORS.len()]).width(2.0));
-                            color_idx += 1;
-                        }
-                        let nv = tran.points.first().map(|p| p.branch_currents.voltage_sources.len()).unwrap_or(0);
-                        for i in 0..nv {
-                            let pts: PlotPoints = tran.points.iter().map(|p| {
-                                [p.time * x_mult, p.branch_currents.voltage_sources.get(i).copied().unwrap_or(0.0) * y_mult]
-                            }).collect();
-                            plot_ui.line(Line::new(pts).name(format!("I(V{})", i + 1))
-                            .color(PLOT_COLORS[color_idx % PLOT_COLORS.len()]).width(2.0));
-                            color_idx += 1;
-                        }
-                        let nd = tran.points.first().map(|p| p.branch_currents.diodes.len()).unwrap_or(0);
-                        for i in 0..nd {
-                            let pts: PlotPoints = tran.points.iter().map(|p| {
-                                [p.time * x_mult, p.branch_currents.diodes.get(i).copied().unwrap_or(0.0) * y_mult]
-                            }).collect();
-                            plot_ui.line(Line::new(pts).name(format!("I(D{})", i + 1))
-                            .color(PLOT_COLORS[color_idx % PLOT_COLORS.len()]).width(2.0));
-                            color_idx += 1;
-                        }
-                        let _ = color_idx;
+                        draw(plot_ui, &series, 2.0);
                     });
                 });
             }
@@ -2355,11 +2212,8 @@ impl CircuitSimApp {
 
                 ui.horizontal_wrapped(|ui| {
                     if ui.button("Auto Fit").clicked() {
-                        self.plot_x_min.clear();
-                        self.plot_x_max.clear();
-                        self.plot_y_min.clear();
-                        self.plot_y_max.clear();
-                        self.apply_plot_bounds = true;
+                        self.plot.tran_bounds.reset();
+                        self.plot.tran_apply = true;
                     }
 
                     ui.separator();
@@ -2391,8 +2245,6 @@ impl CircuitSimApp {
 
                 let node_a = self.diff_node_a;
                 let node_b = self.diff_node_b;
-                let x_mult = self.plot_x_scale.parse::<f64>().unwrap_or(1.0);
-                let y_mult = self.plot_y_scale.parse::<f64>().unwrap_or(1.0);
 
                 code_frame().show(ui, |ui| {
                     let adjusted_height = ui.available_height();
@@ -2407,45 +2259,18 @@ impl CircuitSimApp {
                         .allow_drag(true)
                         .allow_boxed_zoom(true);
 
+                    let series = tran_diff_series(tran, node_a, node_b, x_mult, y_mult);
+                    let apply_b = self.plot.tran_apply;
+                    let bounds = self.plot.tran_bounds;
+                    if apply_b {
+                        self.plot.tran_apply = false;
+                    }
+
                     plot.show(ui, |plot_ui| {
-                        if self.apply_plot_bounds {
-                            if self.plot_x_min.is_empty() && self.plot_x_max.is_empty()
-                                && self.plot_y_min.is_empty() && self.plot_y_max.is_empty()
-                            {
-                                plot_ui.set_auto_bounds(egui::Vec2b::new(true, true));
-                            } else {
-                                plot_ui.set_auto_bounds(egui::Vec2b::new(false, false));
-                                let cur = plot_ui.plot_bounds();
-                                let mut x_min = cur.min()[0]; let mut x_max = cur.max()[0];
-                                let mut y_min = cur.min()[1]; let mut y_max = cur.max()[1];
-                                if let Ok(v) = self.plot_x_min.parse::<f64>() { x_min = v; }
-                                if let Ok(v) = self.plot_x_max.parse::<f64>() { x_max = v; }
-                                if let Ok(v) = self.plot_y_min.parse::<f64>() { y_min = v; }
-                                if let Ok(v) = self.plot_y_max.parse::<f64>() { y_max = v; }
-                                let safe_x_min = x_min.min(x_max);
-                                let safe_x_max = if x_min == x_max { x_max + 1e-6 } else { x_min.max(x_max) };
-                                let safe_y_min = y_min.min(y_max);
-                                let safe_y_max = if y_min == y_max { y_max + 1e-6 } else { y_min.max(y_max) };
-                                plot_ui.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
-                                    [safe_x_min, safe_y_min], [safe_x_max, safe_y_max],
-                                ));
-                            }
-                            self.apply_plot_bounds = false;
+                        if apply_b {
+                            apply_bounds(plot_ui, &bounds);
                         }
-
-                        let diff_pts: PlotPoints = tran.points.iter().map(|p| {
-                            let va = p.node_voltages.get(node_a).copied().unwrap_or(0.0);
-                            let vb = p.node_voltages.get(node_b).copied().unwrap_or(0.0);
-                            [p.time * x_mult, (va - vb) * y_mult]
-                        }).collect();
-
-                        let color = PLOT_COLORS[1 % PLOT_COLORS.len()];
-                        plot_ui.line(
-                            Line::new(diff_pts)
-                                .name(format!("V({node_a})−V({node_b})"))
-                                .color(color)
-                                .width(2.0),
-                        );
+                        draw(plot_ui, &series, 2.0);
                     });
                 });
             }
@@ -2491,35 +2316,38 @@ impl CircuitSimApp {
         ui.horizontal_wrapped(|ui| {
 
             if ui.button("Auto Fit").clicked() {
-                self.ac_plot_x_min.clear();
-                self.ac_plot_x_max.clear();
-                self.ac_mag_y_min.clear();
-                self.ac_mag_y_max.clear();
-                self.ac_phase_y_min.clear();
-                self.ac_phase_y_max.clear();
-                self.ac_apply_plot_bounds = true;
+                self.plot.ac_mag_bounds.reset();
+                self.plot.ac_phase_bounds.reset();
+                self.plot.ac_apply = true;
             }
         });
 
         ui.add_space(6.0);
 
-        // Snapshot: capture voltages and branch currents per frequency point.
-        // AcBranchCurrents has separate Vecs per element type; clone them all.
-        let points_snapshot: Vec<_> = ac.points.iter().map(|p| {
-            (p.freq, p.node_voltages.clone(), p.branch_currents.clone())
-        }).collect();
-
-        let mag_scale = self.ac_mag_scale;
-        let ac_plot_nodes = self.ac_plot_nodes.clone();
-
+        let log_x = matches!(self.ac_mag_scale, AcMagScale::Db);
         let available_h = ui.available_height();
         let half_h = (available_h - 24.0) / 2.0;
 
-        let x_mult = self.ac_plot_x_scale.parse::<f64>().unwrap_or(1.0);
-        let mag_y_mult = self.ac_mag_y_scale.parse::<f64>().unwrap_or(1.0);
-        let phase_y_mult = self.ac_phase_y_scale.parse::<f64>().unwrap_or(1.0);
+        let mag_qty = match self.ac_mag_scale {
+            AcMagScale::Db => AcQuantity::MagnitudeDb,
+            AcMagScale::Linear => AcQuantity::MagnitudeLinear,
+        };
+        let ac_plot_nodes = self.ac_plot_nodes.clone();
+
+        // All series are built up front by the one plot adapter; the show
+        // closures only draw. (The old code cloned the whole result per frame
+        // into a snapshot so its in-closure loops could hold it.)
+        let node_mag_series = ac_voltage_series(ac, &ac_plot_nodes, mag_qty, self.plot.ac_x, self.plot.ac_mag_y, log_x);
+        let node_phase_series = ac_voltage_series(ac, &ac_plot_nodes, AcQuantity::Phase, self.plot.ac_x, self.plot.ac_phase_y, log_x);
+        let cur_mag_series = ac_current_series(ac, mag_qty, self.plot.ac_x, self.plot.ac_mag_y, log_x);
+        let cur_phase_series = ac_current_series(ac, AcQuantity::Phase, self.plot.ac_x, self.plot.ac_phase_y, log_x);
+
+        let apply_b = self.plot.ac_apply;
+        let mag_bounds = self.plot.ac_mag_bounds.x_through_log10();
+        let phase_bounds = self.plot.ac_phase_bounds.x_through_log10();
 
         // ── Magnitude plot ───────────────────────────────────────────────────
+        let mag_scale = self.ac_mag_scale;
         let mag_label = match mag_scale {
             AcMagScale::Db     => "magnitude (dB)",
             AcMagScale::Linear => "magnitude (V)",
@@ -2576,68 +2404,11 @@ impl CircuitSimApp {
             plot.show(ui, |plot_ui| {
 
                 // NEW: Apply bounds to Magnitude Plot
-                if self.ac_apply_plot_bounds {
-                    if self.ac_plot_x_min.is_empty() && self.ac_plot_x_max.is_empty()
-                        && self.ac_mag_y_min.is_empty() && self.ac_mag_y_max.is_empty() {
-                            plot_ui.set_auto_bounds(egui::Vec2b::new(true, true));
-                        } else {
-                            // TURN OFF AUTO BOUNDS
-                            plot_ui.set_auto_bounds(egui::Vec2b::new(false, false));
-
-                            let current = plot_ui.plot_bounds();
-                            let mut x_min = current.min()[0];
-                            let mut x_max = current.max()[0];
-                            let mut y_min = current.min()[1];
-                            let mut y_max = current.max()[1];
-
-                            // Note: If using Db scale, internal X axis is actually plotted in log10
-                            if let Ok(v) = self.ac_plot_x_min.parse::<f64>() {
-                                x_min = if matches!(mag_scale, AcMagScale::Db) && v > 0.0 { v.log10() } else { v };
-                            }
-                            if let Ok(v) = self.ac_plot_x_max.parse::<f64>() {
-                                x_max = if matches!(mag_scale, AcMagScale::Db) && v > 0.0 { v.log10() } else { v };
-                            }
-                            if let Ok(v) = self.ac_mag_y_min.parse::<f64>() { y_min = v; }
-                            if let Ok(v) = self.ac_mag_y_max.parse::<f64>() { y_max = v; }
-
-                            let safe_x_min = x_min.min(x_max);
-                            let safe_x_max = if x_min == x_max { x_max + 1e-6 } else { x_min.max(x_max) };
-                            let safe_y_min = y_min.min(y_max);
-                            let safe_y_max = if y_min == y_max { y_max + 1e-6 } else { y_min.max(y_max) };
-
-                            plot_ui.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
-                                [safe_x_min, safe_y_min],
-                                [safe_x_max, safe_y_max],
-                            ));
-                        }
+                if apply_b {
+                    apply_bounds(plot_ui, &mag_bounds);
                 }
 
-                for node in 1..n_nodes.min(ac_plot_nodes.len()) {
-                    if !ac_plot_nodes[node] { continue; }
-                    let pts: PlotPoints = points_snapshot.iter().map(|(freq, ref voltages, ref _currents)| {
-                        let v = voltages.get(node).copied().unwrap_or_default();
-                        let mag = v.norm();
-
-                        let y = match mag_scale {
-                            AcMagScale::Db     => if mag > 0.0 { 20.0 * mag.log10() } else { -200.0 },
-                            AcMagScale::Linear => mag,
-                        } * mag_y_mult; // Scale applied here
-
-                        let scaled_freq = *freq * x_mult;
-                        let x = match mag_scale {
-                            AcMagScale::Db     => scaled_freq.log10(),
-                            AcMagScale::Linear => scaled_freq,
-                        };
-                        [x, y]
-                    }).collect();
-                    let color = PLOT_COLORS[node % PLOT_COLORS.len()];
-                    plot_ui.line(
-                        Line::new(pts)
-                        .name(format!("V({node})"))
-                        .color(color)
-                        .width(2.0),
-                    );
-                }
+                draw(plot_ui, &node_mag_series, 2.0);
             });
         });
 
@@ -2674,62 +2445,11 @@ impl CircuitSimApp {
             plot.show(ui, |plot_ui| {
 
                 // Apply bounds to Phase Plot
-                if self.ac_apply_plot_bounds {
-                    if self.ac_plot_x_min.is_empty() && self.ac_plot_x_max.is_empty()
-                        && self.ac_phase_y_min.is_empty() && self.ac_phase_y_max.is_empty() {
-                            plot_ui.set_auto_bounds(egui::Vec2b::new(true, true));
-                        } else {
-                            plot_ui.set_auto_bounds(egui::Vec2b::new(false, false));
-
-                            let current = plot_ui.plot_bounds();
-                            let mut x_min = current.min()[0];
-                            let mut x_max = current.max()[0];
-                            let mut y_min = current.min()[1];
-                            let mut y_max = current.max()[1];
-
-                            if let Ok(v) = self.ac_plot_x_min.parse::<f64>() {
-                                x_min = if matches!(mag_scale, AcMagScale::Db) && v > 0.0 { v.log10() } else { v };
-                            }
-                            if let Ok(v) = self.ac_plot_x_max.parse::<f64>() {
-                                x_max = if matches!(mag_scale, AcMagScale::Db) && v > 0.0 { v.log10() } else { v };
-                            }
-                            if let Ok(v) = self.ac_phase_y_min.parse::<f64>() { y_min = v; }
-                            if let Ok(v) = self.ac_phase_y_max.parse::<f64>() { y_max = v; }
-
-                            let safe_x_min = x_min.min(x_max);
-                            let safe_x_max = if x_min == x_max { x_max + 1e-6 } else { x_min.max(x_max) };
-                            let safe_y_min = y_min.min(y_max);
-                            let safe_y_max = if y_min == y_max { y_max + 1e-6 } else { y_min.max(y_max) };
-
-                            plot_ui.set_plot_bounds(egui_plot::PlotBounds::from_min_max(
-                                [safe_x_min, safe_y_min],
-                                [safe_x_max, safe_y_max],
-                            ));
-                        }
+                if apply_b {
+                    apply_bounds(plot_ui, &phase_bounds);
                 }
 
-                for node in 1..n_nodes.min(ac_plot_nodes.len()) {
-                    if !ac_plot_nodes[node] { continue; }
-                    let pts: PlotPoints = points_snapshot.iter().map(|(freq, ref voltages, ref _currents)| {
-                        let v = voltages.get(node).copied().unwrap_or_default();
-
-                        let phase_deg = v.arg().to_degrees() * phase_y_mult;
-                        let scaled_freq = *freq * x_mult;
-
-                        let x = match mag_scale {
-                            AcMagScale::Db     => scaled_freq.log10(),
-                                                                     AcMagScale::Linear => scaled_freq,
-                        };
-                        [x, phase_deg]
-                    }).collect();
-                    let color = PLOT_COLORS[node % PLOT_COLORS.len()];
-                    plot_ui.line(
-                        Line::new(pts)
-                        .name(format!("V({node}) phase"))
-                        .color(color)
-                        .width(2.0),
-                    );
-                }
+                draw(plot_ui, &node_phase_series, 2.0);
             });
         });
 
@@ -2767,71 +2487,10 @@ impl CircuitSimApp {
             };
 
             plot.show(ui, |plot_ui| {
-                let mut color_idx = 0usize;
-                // Determine element counts from first point
-                let (nr, nc, nl, nv, nd) = points_snapshot.first().map(|(_, _, b)| {
-                    (b.resistors.len(), b.capacitors.len(), b.inductors.len(),
-                     b.voltage_sources.len(), b.diodes.len())
-                }).unwrap_or((0,0,0,0,0));
-
-                let plot_branch_current_mag = |plot_ui: &mut egui_plot::PlotUi,
-                                               name: String,
-                                               data: Vec<[f64;2]>,
-                                               color: egui::Color32| {
-                    plot_ui.line(Line::new(PlotPoints::new(data)).name(name).color(color).width(2.0));
-                };
-
-                for i in 0..nr {
-                    let data: Vec<[f64;2]> = points_snapshot.iter().map(|(freq, _, b)| {
-                        let mag = b.resistors.get(i).map(|c| c.norm()).unwrap_or(0.0);
-                        let y = match mag_scale { AcMagScale::Db => if mag > 0.0 { 20.0*mag.log10() } else { -200.0 }, AcMagScale::Linear => mag } * mag_y_mult;
-                        let x = if matches!(mag_scale, AcMagScale::Db) { (*freq * x_mult).log10() } else { *freq * x_mult };
-                        [x, y]
-                    }).collect();
-                    plot_branch_current_mag(plot_ui, format!("I(R{})", i+1), data, PLOT_COLORS[color_idx % PLOT_COLORS.len()]);
-                    color_idx += 1;
+                if apply_b {
+                    apply_bounds(plot_ui, &mag_bounds);
                 }
-                for i in 0..nc {
-                    let data: Vec<[f64;2]> = points_snapshot.iter().map(|(freq, _, b)| {
-                        let mag = b.capacitors.get(i).map(|c| c.norm()).unwrap_or(0.0);
-                        let y = match mag_scale { AcMagScale::Db => if mag > 0.0 { 20.0*mag.log10() } else { -200.0 }, AcMagScale::Linear => mag } * mag_y_mult;
-                        let x = if matches!(mag_scale, AcMagScale::Db) { (*freq * x_mult).log10() } else { *freq * x_mult };
-                        [x, y]
-                    }).collect();
-                    plot_branch_current_mag(plot_ui, format!("I(C{})", i+1), data, PLOT_COLORS[color_idx % PLOT_COLORS.len()]);
-                    color_idx += 1;
-                }
-                for i in 0..nl {
-                    let data: Vec<[f64;2]> = points_snapshot.iter().map(|(freq, _, b)| {
-                        let mag = b.inductors.get(i).map(|c| c.norm()).unwrap_or(0.0);
-                        let y = match mag_scale { AcMagScale::Db => if mag > 0.0 { 20.0*mag.log10() } else { -200.0 }, AcMagScale::Linear => mag } * mag_y_mult;
-                        let x = if matches!(mag_scale, AcMagScale::Db) { (*freq * x_mult).log10() } else { *freq * x_mult };
-                        [x, y]
-                    }).collect();
-                    plot_branch_current_mag(plot_ui, format!("I(L{})", i+1), data, PLOT_COLORS[color_idx % PLOT_COLORS.len()]);
-                    color_idx += 1;
-                }
-                for i in 0..nv {
-                    let data: Vec<[f64;2]> = points_snapshot.iter().map(|(freq, _, b)| {
-                        let mag = b.voltage_sources.get(i).map(|c| c.norm()).unwrap_or(0.0);
-                        let y = match mag_scale { AcMagScale::Db => if mag > 0.0 { 20.0*mag.log10() } else { -200.0 }, AcMagScale::Linear => mag } * mag_y_mult;
-                        let x = if matches!(mag_scale, AcMagScale::Db) { (*freq * x_mult).log10() } else { *freq * x_mult };
-                        [x, y]
-                    }).collect();
-                    plot_branch_current_mag(plot_ui, format!("I(V{})", i+1), data, PLOT_COLORS[color_idx % PLOT_COLORS.len()]);
-                    color_idx += 1;
-                }
-                for i in 0..nd {
-                    let data: Vec<[f64;2]> = points_snapshot.iter().map(|(freq, _, b)| {
-                        let mag = b.diodes.get(i).map(|c| c.norm()).unwrap_or(0.0);
-                        let y = match mag_scale { AcMagScale::Db => if mag > 0.0 { 20.0*mag.log10() } else { -200.0 }, AcMagScale::Linear => mag } * mag_y_mult;
-                        let x = if matches!(mag_scale, AcMagScale::Db) { (*freq * x_mult).log10() } else { *freq * x_mult };
-                        [x, y]
-                    }).collect();
-                    plot_branch_current_mag(plot_ui, format!("I(D{})", i+1), data, PLOT_COLORS[color_idx % PLOT_COLORS.len()]);
-                    color_idx += 1;
-                }
-                let _ = color_idx;
+                draw(plot_ui, &cur_mag_series, 2.0);
             });
         });
 
@@ -2865,67 +2524,15 @@ impl CircuitSimApp {
             };
 
             plot.show(ui, |plot_ui| {
-                let mut color_idx = 0usize;
-                let (nr, nc, nl, nv, nd) = points_snapshot.first().map(|(_, _, b)| {
-                    (b.resistors.len(), b.capacitors.len(), b.inductors.len(),
-                     b.voltage_sources.len(), b.diodes.len())
-                }).unwrap_or((0,0,0,0,0));
-
-                let plot_phase = |plot_ui: &mut egui_plot::PlotUi, name: String, data: Vec<[f64;2]>, color: egui::Color32| {
-                    plot_ui.line(Line::new(PlotPoints::new(data)).name(name).color(color).width(2.0));
-                };
-
-                for i in 0..nr {
-                    let data: Vec<[f64;2]> = points_snapshot.iter().map(|(freq, _, b)| {
-                        let phase = b.resistors.get(i).map(|c| c.arg().to_degrees()).unwrap_or(0.0) * phase_y_mult;
-                        let x = if matches!(mag_scale, AcMagScale::Db) { (*freq * x_mult).log10() } else { *freq * x_mult };
-                        [x, phase]
-                    }).collect();
-                    plot_phase(plot_ui, format!("I(R{}) phase", i+1), data, PLOT_COLORS[color_idx % PLOT_COLORS.len()]);
-                    color_idx += 1;
+                if apply_b {
+                    apply_bounds(plot_ui, &phase_bounds);
                 }
-                for i in 0..nc {
-                    let data: Vec<[f64;2]> = points_snapshot.iter().map(|(freq, _, b)| {
-                        let phase = b.capacitors.get(i).map(|c| c.arg().to_degrees()).unwrap_or(0.0) * phase_y_mult;
-                        let x = if matches!(mag_scale, AcMagScale::Db) { (*freq * x_mult).log10() } else { *freq * x_mult };
-                        [x, phase]
-                    }).collect();
-                    plot_phase(plot_ui, format!("I(C{}) phase", i+1), data, PLOT_COLORS[color_idx % PLOT_COLORS.len()]);
-                    color_idx += 1;
-                }
-                for i in 0..nl {
-                    let data: Vec<[f64;2]> = points_snapshot.iter().map(|(freq, _, b)| {
-                        let phase = b.inductors.get(i).map(|c| c.arg().to_degrees()).unwrap_or(0.0) * phase_y_mult;
-                        let x = if matches!(mag_scale, AcMagScale::Db) { (*freq * x_mult).log10() } else { *freq * x_mult };
-                        [x, phase]
-                    }).collect();
-                    plot_phase(plot_ui, format!("I(L{}) phase", i+1), data, PLOT_COLORS[color_idx % PLOT_COLORS.len()]);
-                    color_idx += 1;
-                }
-                for i in 0..nv {
-                    let data: Vec<[f64;2]> = points_snapshot.iter().map(|(freq, _, b)| {
-                        let phase = b.voltage_sources.get(i).map(|c| c.arg().to_degrees()).unwrap_or(0.0) * phase_y_mult;
-                        let x = if matches!(mag_scale, AcMagScale::Db) { (*freq * x_mult).log10() } else { *freq * x_mult };
-                        [x, phase]
-                    }).collect();
-                    plot_phase(plot_ui, format!("I(V{}) phase", i+1), data, PLOT_COLORS[color_idx % PLOT_COLORS.len()]);
-                    color_idx += 1;
-                }
-                for i in 0..nd {
-                    let data: Vec<[f64;2]> = points_snapshot.iter().map(|(freq, _, b)| {
-                        let phase = b.diodes.get(i).map(|c| c.arg().to_degrees()).unwrap_or(0.0) * phase_y_mult;
-                        let x = if matches!(mag_scale, AcMagScale::Db) { (*freq * x_mult).log10() } else { *freq * x_mult };
-                        [x, phase]
-                    }).collect();
-                    plot_phase(plot_ui, format!("I(D{}) phase", i+1), data, PLOT_COLORS[color_idx % PLOT_COLORS.len()]);
-                    color_idx += 1;
-                }
-                let _ = color_idx;
+                draw(plot_ui, &cur_phase_series, 2.0);
             });
         });
 
         // Toggle off the bounds application after all plots have processed it
-        self.ac_apply_plot_bounds = false;
+        self.plot.ac_apply = false;
     }
 
 }

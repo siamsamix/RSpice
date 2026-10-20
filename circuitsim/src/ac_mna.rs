@@ -197,7 +197,6 @@ pub fn build_ac(
         // z[branch] set to 0 by default; the caller drives the stimulus source
         // by writing sys.z[branch] = Complex64::new(amplitude, 0.0).
         // We expose the branch index so analysis.rs can find it.
-        let _ = v; // suppress unused warning
     }
 
     Ok(sys)

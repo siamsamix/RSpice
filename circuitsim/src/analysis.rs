@@ -48,24 +48,6 @@ pub struct AcResult {
     pub stimulus_node: usize,
 }
 
-impl AcResult {
-    /// Magnitude in volts at `node_id` for the point at `index`.
-    pub fn magnitude(&self, point_index: usize, node_id: usize) -> f64 {
-        self.points[point_index].node_voltages[node_id].norm()
-    }
-
-    /// Phase in degrees at `node_id` for the point at `index`.
-    pub fn phase_deg(&self, point_index: usize, node_id: usize) -> f64 {
-        self.points[point_index].node_voltages[node_id].arg().to_degrees()
-    }
-
-    /// Magnitude in dB (20·log₁₀(|V|)) at `node_id` for the point at `index`.
-    pub fn magnitude_db(&self, point_index: usize, node_id: usize) -> f64 {
-        let m = self.magnitude(point_index, node_id);
-        if m > 0.0 { 20.0 * m.log10() } else { f64::NEG_INFINITY }
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct SimulationResult {
     pub dc: Option<DcResult>,
@@ -206,11 +188,6 @@ fn seed_initial_guess(circuit: &Circuit) -> Result<nalgebra::DVector<f64>> {
     }
 }
 
-/// Public convenience wrapper that discards the raw vector.
-pub fn run_dc_op(circuit: &Circuit) -> Result<DcResult> {
-    solve_dc_op(circuit).map(|(r, _)| r)
-}
-
 fn extract_dc(circuit: &Circuit, x: &nalgebra::DVector<f64>) -> DcResult {
     let mut node_voltages = vec![0.0; circuit.nodes];
     for i in 1..circuit.nodes {
@@ -335,8 +312,6 @@ pub struct AcCommand {
     /// Index of the voltage source to use as the AC stimulus (0-based into
     /// `circuit.voltage_sources`).  `None` = drive the first source.
     pub stimulus_source: Option<usize>,
-    /// Peak amplitude of the AC stimulus (volts).  SPICE default = 1 V.
-    pub stimulus_amplitude: f64,
 }
 
 /// Build the frequency list for the sweep.

@@ -1709,13 +1709,6 @@ impl CircuitSimApp {
             self.schematic.selected_wire = None;
         }
 
-        // Cancel wire dragging on Right Click
-        if response.secondary_clicked() {
-            self.schematic.active_wire_start = None;
-            self.schematic.selected_component = None; // Deselect on right click
-            self.schematic.selected_wire = None;
-        }
-
         // Delete key removes selected wire or component
         if ui.input(|i| i.key_pressed(egui::Key::Delete)) {
             if let Some(wi) = self.schematic.selected_wire {

@@ -177,13 +177,8 @@ fn parse_dot_command(
                 .map(|s| s.parse::<usize>())
                 .transpose()
                 .map_err(|_| SimError::Parse("invalid .ac source index".into()))?;
-            let stimulus_amplitude = tokens
-                .get(6)
-                .map(|s| parse_value(s).map_err(SimError::Parse))
-                .transpose()?
-                .unwrap_or(1.0);
             analysis.ac = Some(AcCommand {
-                scale, points, f_start, f_stop, stimulus_source, stimulus_amplitude,
+                scale, points, f_start, f_stop, stimulus_source,
             });
         }
         ".dc" => analysis.dc_op = true,

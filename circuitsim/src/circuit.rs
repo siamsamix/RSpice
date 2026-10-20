@@ -229,11 +229,6 @@ impl Circuit {
         }
     }
 
-    pub fn dc_matrix_size(&self) -> usize {
-        let n = self.nodes.saturating_sub(1);
-        n + self.voltage_sources.len()
-    }
-
     pub fn tran_matrix_size(&self) -> usize {
         let n = self.nodes.saturating_sub(1);
         n + self.voltage_sources.len() + self.inductors.len()

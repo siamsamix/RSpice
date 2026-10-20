@@ -55,7 +55,51 @@ pub struct SimulationResult {
     pub ac: Option<AcResult>,
 }
 
+/// Newton-Raphson convergence tolerance (max |Δx| between iterates).
+const NR_TOLERANCE: f64 = 1e-6;
+/// Newton-Raphson iteration budget per solve.
+const NR_MAX_ITERS: usize = 100;
+
+/// One Newton-Raphson solve, shared by `.op` and every transient step:
+/// stamp the system at the current iterate, solve, repeat until the iterate
+/// moves less than [`NR_TOLERANCE`].
+///
+/// `build` receives the current iterate and MAINTAINS all other mode data
+/// (bias point, dt, transient state) by closure; the returned system owns its
+/// matrix, so no lifetimes leak through the seam.
+fn newton_raphson(
+    mut build: impl FnMut(&nalgebra::DVector<f64>) -> Result<MnaSystem<f64>>,
+    seed: &nalgebra::DVector<f64>,
+    failure: &str,
+) -> Result<nalgebra::DVector<f64>> {
+    let mut x = seed.clone();
+    for _ in 0..NR_MAX_ITERS {
+        let sys = build(&x)?;
+        let x_next = sys.solve()?;
+        let diff = (&x_next - &x).amax();
+        x = x_next;
+        if diff < NR_TOLERANCE {
+            return Ok(x);
+        }
+    }
+    Err(SimError::Analysis(failure.into()))
+}
+
+/// Node voltages extracted from a solved unknown vector, ground pinned to 0.
+fn extract_voltages<T: crate::mna::Field>(
+    circuit: &Circuit,
+    x: &nalgebra::DVector<T>,
+) -> Vec<T> {
+    let mut node_voltages = vec![T::lift(0.0); circuit.nodes];
+    for i in 1..circuit.nodes {
+        node_voltages[i] = node_voltage(x, crate::circuit::NodeId(i));
+    }
+    node_voltages
+}
+
 pub fn run(circuit: &Circuit, analysis: &AnalysisCommands) -> Result<SimulationResult> {
+    circuit.validate()?;
+
     let mut result = SimulationResult {
         dc: None,
         tran: None,
@@ -84,7 +128,7 @@ pub fn run(circuit: &Circuit, analysis: &AnalysisCommands) -> Result<SimulationR
     if run_tran {
         let step = analysis.tran_step.unwrap();
         let stop = analysis.tran_stop.unwrap();
-        result.tran = Some(run_transient(circuit, step, analysis.tran_start, stop)?);
+        result.tran = Some(run_transient(circuit, &dc_x, step, analysis.tran_start, stop)?);
     }
     if run_ac {
         let ac_cmd = analysis.ac.as_ref().unwrap();
@@ -97,102 +141,20 @@ pub fn run(circuit: &Circuit, analysis: &AnalysisCommands) -> Result<SimulationR
 /// Solve the DC operating point and return both the summary struct and the
 /// raw solution vector. The raw vector is needed by AC analysis (linearisation)
 /// and can seed transient initial conditions.
-pub fn solve_dc_op(circuit: &Circuit) -> Result<(DcResult, nalgebra::DVector<f64>)> {
-    // Seed from linear solve (resistors + V sources + small stubs for nonlinear devices).
-    // This gives the NR loop a starting point close to the real answer, avoiding
-    // cut-off initialisation issues with MOSFETs.
-    let mut x = seed_initial_guess(circuit)?;
-
-    let tol = 1e-6;
-    let mut converged = false;
-    for _ in 0..100 {
-        let sys = build_system::<f64>(circuit, Mode::Dc { guess: &x })?;
-        let x_next = sys.solve()?;
-        let diff = (&x_next - &x).amax();
-        x = x_next;
-        if diff < tol {
-            converged = true;
-            break;
-        }
-    }
-    if !converged {
-        return Err(SimError::Analysis("DC operating point failed to converge".into()));
-    }
-    let result = extract_dc(circuit, &x);
+fn solve_dc_op(circuit: &Circuit) -> Result<(DcResult, nalgebra::DVector<f64>)> {
+    let seed = crate::mna::initial_guess(circuit);
+    let x = newton_raphson(
+        |guess| build_system::<f64>(circuit, Mode::Dc { guess }),
+        &seed,
+        "DC operating point failed to converge",
+    )?;
+    let result = extract_dc(circuit, &x)?;
     Ok((result, x))
 }
 
-/// Build a reasonable initial guess for the NR iteration.
-///
-/// We stamp only the linear elements (resistors + voltage sources) plus a
-/// small conductance stub for every nonlinear device, then solve once.  This
-/// gives a voltage profile close to the final answer without any nonlinear
-/// maths.
-fn seed_initial_guess(circuit: &Circuit) -> Result<nalgebra::DVector<f64>> {
-    use crate::mna::MnaSystem;
-
-    let mut sys = MnaSystem::<f64>::for_circuit(circuit);
-
-    // Resistors.
-    for r in &circuit.resistors {
-        let g = 1.0 / r.resistance;
-        crate::mna::stamp_conductance_pub(&mut sys, r.n1, r.n2, g);
-    }
-
-    // Voltage sources at their DC value.
-    for (i, v) in circuit.voltage_sources.iter().enumerate() {
-        let branch = sys.branch.src_branch(i);
-        use crate::mna::node_index_pub;
-        if let Some(i1) = node_index_pub(v.n1) {
-            sys.a[(i1, branch)] += 1.0;
-            sys.a[(branch, i1)] += 1.0;
-        }
-        if let Some(i2) = node_index_pub(v.n2) {
-            sys.a[(i2, branch)] -= 1.0;
-            sys.a[(branch, i2)] -= 1.0;
-        }
-        sys.z[branch] = v.voltage;
-    }
-
-    // Inductors as 0 V shorts (same as build_dc).
-    for (i, l) in circuit.inductors.iter().enumerate() {
-        let branch = sys.branch.ind_branch(i);
-        use crate::mna::node_index_pub;
-        if let Some(i1) = node_index_pub(l.n1) {
-            sys.a[(i1, branch)] += 1.0;
-            sys.a[(branch, i1)] += 1.0;
-        }
-        if let Some(i2) = node_index_pub(l.n2) {
-            sys.a[(i2, branch)] -= 1.0;
-            sys.a[(branch, i2)] -= 1.0;
-        }
-    }
-
-    // Diodes and MOSFETs: small-conductance stub so every node has a path.
-    let g_stub = 1e-6;
-    for d in &circuit.diodes {
-        crate::mna::stamp_conductance_pub(&mut sys, d.anode, d.cathode, g_stub);
-    }
-    for m in &circuit.mosfets {
-        // Stub between drain and source keeps the drain node from floating.
-        crate::mna::stamp_conductance_pub(&mut sys, m.nd, m.ns, g_stub);
-    }
-
-    // If the matrix is still singular (e.g. all-floating island), fall back
-    // to zero rather than crashing.
-    let size = sys.size;
-    match sys.solve() {
-        Ok(x0) => Ok(x0),
-        Err(_)  => Ok(nalgebra::DVector::zeros(size)),
-    }
-}
-
-fn extract_dc(circuit: &Circuit, x: &nalgebra::DVector<f64>) -> DcResult {
-    let mut node_voltages = vec![0.0; circuit.nodes];
-    for i in 1..circuit.nodes {
-        node_voltages[i] = node_voltage(x, crate::circuit::NodeId(i));
-    }
-    let branch = crate::mna::BranchLayout::for_circuit(circuit);
+fn extract_dc(circuit: &Circuit, x: &nalgebra::DVector<f64>) -> Result<DcResult> {
+    let node_voltages = extract_voltages(circuit, x);
+    let branch = BranchLayout::for_circuit(circuit);
     let source_currents = circuit
         .voltage_sources
         .iter()
@@ -200,12 +162,16 @@ fn extract_dc(circuit: &Circuit, x: &nalgebra::DVector<f64>) -> DcResult {
         .map(|(i, _)| branch.src_row(x, i))
         .collect();
     // DC: no capacitor current (steady state), so pass None for dt/prev.
-    let branch_currents = compute_branch_currents(circuit, x, None, None);
-    DcResult { node_voltages, source_currents, branch_currents }
+    let branch_currents = compute_branch_currents(circuit, x, None, None)?;
+    Ok(DcResult { node_voltages, source_currents, branch_currents })
 }
 
-pub fn run_transient(
+/// Run the backward-Euler transient sweep, seeded from the DC operating-point
+/// solution `dc_x` that `run` has already computed (so the t=0 point and the
+/// inductor starting currents reflect the true DC bias, not zero).
+fn run_transient(
     circuit: &Circuit,
+    dc_x: &nalgebra::DVector<f64>,
     dt: f64,
     t_start: f64,
     t_stop: f64,
@@ -213,26 +179,17 @@ pub fn run_transient(
     if t_stop < t_start {
         return Err(SimError::Analysis("tstop must be >= tstart".into()));
     }
-    let size = circuit.tran_matrix_size();
-    let dc_x = nalgebra::DVector::zeros(size);
 
     let mut state = TransientState::default();
-
-    // FIX: Because build_dc now solves for inductor branches natively, we can safely
-    // extract the exact starting currents directly from the DC solution vector.
-    update_transient_state(circuit, &dc_x, &mut state);
+    update_transient_state(circuit, dc_x, &mut state);
 
     let mut points = Vec::new();
 
-    let mut initial_voltages = vec![0.0; circuit.nodes];
-    for i in 1..circuit.nodes {
-        initial_voltages[i] = node_voltage(&dc_x, crate::circuit::NodeId(i));
-    }
     points.push(TranPoint {
         time: t_start,
-        node_voltages: initial_voltages,
+        node_voltages: extract_voltages(circuit, dc_x),
         // DC steady-state: capacitor current is zero.
-        branch_currents: compute_branch_currents(circuit, &dc_x, None, None),
+        branch_currents: compute_branch_currents(circuit, dc_x, None, None)?,
     });
 
     let mut t = t_start + dt;
@@ -244,25 +201,11 @@ pub fn run_transient(
             return Err(SimError::Analysis("transient exceeded maximum steps".into()));
         }
 
-        let mut x = dc_x.clone(); // Use the last known state as the initial guess
-        let mut converged = false;
-
-        for _ in 0..100 { // Newton-Raphson loop for this specific time step
-            let sys = build_system::<f64>(circuit, Mode::Tran { dt, t, state: &state, guess: &x })?;
-            let x_next = sys.solve()?;
-
-            let diff = (&x_next - &x).amax();
-            x = x_next;
-
-            if diff < 1e-6 {
-                converged = true;
-                break;
-            }
-        }
-
-        if !converged {
-            return Err(SimError::Analysis(format!("Transient failed to converge at t={}", t)));
-        }
+        let x = newton_raphson(
+            |guess| build_system::<f64>(circuit, Mode::Tran { dt, t, state: &state, guess }),
+            dc_x,
+            &format!("Transient failed to converge at t={}", t),
+        )?;
 
         // Capture previous cap voltages before updating state, needed for I_C.
         let prev_cap_voltages = state.capacitor_voltages.clone();
@@ -270,13 +213,13 @@ pub fn run_transient(
 
         let branch_currents = compute_branch_currents(
             circuit, &x, Some(dt), Some(&prev_cap_voltages),
-        );
+        )?;
 
-        let mut node_voltages = vec![0.0; circuit.nodes];
-        for i in 1..circuit.nodes {
-            node_voltages[i] = node_voltage(&x, crate::circuit::NodeId(i));
-        }
-        points.push(TranPoint { time: t, node_voltages, branch_currents });
+        points.push(TranPoint {
+            time: t,
+            node_voltages: extract_voltages(circuit, &x),
+            branch_currents,
+        });
 
         t += dt;
         step += 1;
@@ -374,8 +317,14 @@ pub fn run_ac_sweep(circuit: &Circuit, cmd: &AcCommand, dc_x: &nalgebra::DVector
                                               circuit.voltage_sources.len()
         )));
     }
-    let stim_branch = crate::mna::BranchLayout::for_circuit(circuit).src_branch(stim_idx);
+    let stim_branch = BranchLayout::for_circuit(circuit).src_branch(stim_idx);
     let stim_node = circuit.voltage_sources[stim_idx].n1;
+    let stim_amp = circuit.voltage_sources[stim_idx].ac.as_ref().ok_or_else(|| {
+        SimError::Analysis(format!(
+            "stimulus source '{}' has no AC magnitude; add an 'AC <amp>' field",
+            circuit.voltage_sources[stim_idx].name
+        ))
+    })?.mag;
 
     // Step 2 — sweep.
     let freqs = ac_frequencies(cmd);
@@ -383,18 +332,14 @@ pub fn run_ac_sweep(circuit: &Circuit, cmd: &AcCommand, dc_x: &nalgebra::DVector
 
     for &freq in &freqs {
         let mut sys = build_system::<Complex64>(circuit, Mode::Ac { freq, bias: dc_x })?;
-        let amp = circuit.voltage_sources[stim_idx].ac.unwrap().mag;
         // Drive the stimulus source with the AC amplitude.
         // All other sources remain at 0 V (short circuit in small-signal model).
-        sys.z[stim_branch] = num_complex::Complex64::new(amp, 0.0);
+        sys.z[stim_branch] = Complex64::new(stim_amp, 0.0);
 
         let x = sys.solve()?;
 
-        let mut node_voltages = vec![Complex64::new(0.0, 0.0); circuit.nodes];
-        for i in 1..circuit.nodes {
-            node_voltages[i] = node_voltage(&x, crate::circuit::NodeId(i));
-        }
-        let branch_currents = compute_ac_branch_currents(circuit, &x, freq, dc_x);
+        let node_voltages = extract_voltages(circuit, &x);
+        let branch_currents = compute_ac_branch_currents(circuit, &x, freq, dc_x)?;
 
         points.push(AcPoint { freq, node_voltages, branch_currents });
     }

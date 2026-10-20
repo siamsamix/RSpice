@@ -180,8 +180,8 @@ pub fn build_system<T: Field>(circuit: &Circuit, mode: Mode) -> Result<MnaSystem
 
     match mode {
         Mode::Dc { guess } => {
-            stamp_diodes(circuit, &mut sys, guess, true);
-            stamp_mosfets(circuit, &mut sys, guess, true);
+            stamp_diodes(circuit, &mut sys, guess, true)?;
+            stamp_mosfets(circuit, &mut sys, guess, true)?;
 
             // Inductors are shorts at DC — stamp as 0 V voltage sources.
             for (i, l) in circuit.inductors.iter().enumerate() {
@@ -202,8 +202,8 @@ pub fn build_system<T: Field>(circuit: &Circuit, mode: Mode) -> Result<MnaSystem
             if dt <= 0.0 {
                 return Err(SimError::Analysis("time step must be positive".into()));
             }
-            stamp_diodes(circuit, &mut sys, guess, true);
-            stamp_mosfets(circuit, &mut sys, guess, true);
+            stamp_diodes(circuit, &mut sys, guess, true)?;
+            stamp_mosfets(circuit, &mut sys, guess, true)?;
             stamp_capacitors(circuit, &mut sys, dt, state);
             stamp_inductors(circuit, &mut sys, dt, state);
             stamp_voltage_sources(circuit, &mut sys, |v| v.value_at(t));
@@ -236,8 +236,8 @@ pub fn build_system<T: Field>(circuit: &Circuit, mode: Mode) -> Result<MnaSystem
 
             // Small-signal stamps at the DC bias: linearisation only, no
             // Newton-Raphson companion currents.
-            stamp_diodes(circuit, &mut sys, bias, false);
-            stamp_mosfets(circuit, &mut sys, bias, false);
+            stamp_diodes(circuit, &mut sys, bias, false)?;
+            stamp_mosfets(circuit, &mut sys, bias, false)?;
 
             // Independent DC sources become short circuits (0 V); the caller
             // drives the stimulus source by writing sys.z[src_branch(s)].
@@ -266,9 +266,14 @@ fn stamp_diodes<T: Field>(
     sys: &mut MnaSystem<T>,
     guess: &DVector<f64>,
     with_companion: bool,
-) {
+) -> Result<()> {
     for d in &circuit.diodes {
-        let model = circuit.diode_models.get(&d.model).expect("Diode model not found");
+        let model = circuit.diode_models.get(&d.model).ok_or_else(|| {
+            SimError::Circuit(format!(
+                "diode '{}' references unknown model '{}'",
+                d.name, d.model
+            ))
+        })?;
         let v_anode = node_voltage(guess, d.anode);
         let v_cathode = node_voltage(guess, d.cathode);
         // Linearization, clamp, and companion current all come from the model —
@@ -280,6 +285,8 @@ fn stamp_diodes<T: Field>(
             stamp_current_source(sys, d.anode, d.cathode, T::lift(ev.i_eq));
         }
     }
+
+    Ok(())
 }
 
 /// Stamp a single MOSFET using the level-1 Shichman-Hodges model.
@@ -298,9 +305,14 @@ fn stamp_mosfets<T: Field>(
     sys: &mut MnaSystem<T>,
     guess: &DVector<f64>,
     with_companion: bool,
-) {
+) -> Result<()> {
     for m in &circuit.mosfets {
-        let model = circuit.mosfet_models.get(&m.model).expect("MOSFET model not found");
+        let model = circuit.mosfet_models.get(&m.model).ok_or_else(|| {
+            SimError::Circuit(format!(
+                "MOSFET '{}' references unknown model '{}'",
+                m.name, m.model
+            ))
+        })?;
 
         // Raw node voltages from the current Newton-Raphson guess.
         let vd_raw = node_voltage(guess, m.nd);
@@ -386,6 +398,8 @@ fn stamp_mosfets<T: Field>(
             stamp_current_source(sys, drain, source, T::lift(s * ev.i_eq));
         }
     }
+
+    Ok(())
 }
 
 /// Backward-Euler capacitors: companion conductance `C/dt` plus the current
@@ -499,7 +513,7 @@ pub fn compute_branch_currents(
     solution: &DVector<f64>,
     dt: Option<f64>,
     prev_cap_voltages: Option<&[f64]>,
-) -> BranchCurrents {
+) -> Result<BranchCurrents> {
     let branch = BranchLayout::for_circuit(circuit);
 
     let resistors = circuit.resistors.iter().map(|r| {
@@ -529,18 +543,28 @@ pub fn compute_branch_currents(
         -branch.src_row(solution, i)
     }).collect();
 
-    let diodes = circuit.diodes.iter().map(|d| {
-        let model = circuit.diode_models.get(&d.model)
-            .expect("diode model not found in compute_branch_currents");
+    let mut diodes = Vec::with_capacity(circuit.diodes.len());
+    for d in &circuit.diodes {
+        let model = circuit.diode_models.get(&d.model).ok_or_else(|| {
+            SimError::Circuit(format!(
+                "diode '{}' references unknown model '{}'",
+                d.name, d.model
+            ))
+        })?;
         let v_a = node_voltage(solution, d.anode);
         let v_c = node_voltage(solution, d.cathode);
-        model.eval(v_a - v_c).i_d
-    }).collect();
+        diodes.push(model.eval(v_a - v_c).i_d);
+    }
 
     // MOSFET: re-evaluate Ids at the converged solution.
-    let mosfets = circuit.mosfets.iter().map(|m| {
-        let model = circuit.mosfet_models.get(&m.model)
-            .expect("MOSFET model not found in compute_branch_currents");
+    let mut mosfets = Vec::with_capacity(circuit.mosfets.len());
+    for m in &circuit.mosfets {
+        let model = circuit.mosfet_models.get(&m.model).ok_or_else(|| {
+            SimError::Circuit(format!(
+                "MOSFET '{}' references unknown model '{}'",
+                m.name, m.model
+            ))
+        })?;
         let sign = if model.kind == MosfetType::Pmos { -1.0 } else { 1.0 };
         let vd = sign * node_voltage(solution, m.nd);
         let vg = sign * node_voltage(solution, m.ng);
@@ -548,10 +572,10 @@ pub fn compute_branch_currents(
         let vb = sign * node_voltage(solution, m.nb);
         let beta = model.kp * (m.w / m.l);
         // Raw Vds here: reports the physical model current, as before.
-        sign * model.eval(beta, vg - vs, vd - vs, vb - vs).ids
-    }).collect();
+        mosfets.push(sign * model.eval(beta, vg - vs, vd - vs, vb - vs).ids);
+    }
 
-    BranchCurrents { resistors, capacitors, inductors, voltage_sources, diodes, mosfets }
+    Ok(BranchCurrents { resistors, capacitors, inductors, voltage_sources, diodes, mosfets })
 }
 
 pub fn update_transient_state(
@@ -602,7 +626,7 @@ pub fn compute_ac_branch_currents(
     solution: &DVector<Complex64>,
     freq: f64,
     dc_solution: &DVector<f64>,
-) -> AcBranchCurrents {
+) -> Result<AcBranchCurrents> {
     let omega = 2.0 * std::f64::consts::PI * freq;
     let branch = BranchLayout::for_circuit(circuit);
     let one = Complex64::new(1.0, 0.0);
@@ -633,16 +657,21 @@ pub fn compute_ac_branch_currents(
     }).collect();
 
     // ── Diodes: linearised small-signal conductance gd * (V_a - V_c) ─────
-    let diodes = circuit.diodes.iter().map(|d| {
-        let model = circuit.diode_models.get(&d.model)
-            .expect("diode model not found in compute_ac_branch_currents");
+    let mut diodes = Vec::with_capacity(circuit.diodes.len());
+    for d in &circuit.diodes {
+        let model = circuit.diode_models.get(&d.model).ok_or_else(|| {
+            SimError::Circuit(format!(
+                "diode '{}' references unknown model '{}'",
+                d.name, d.model
+            ))
+        })?;
         let gd = model
             .eval(node_voltage(dc_solution, d.anode) - node_voltage(dc_solution, d.cathode))
             .gd;
         let va_ac = node_voltage(solution, d.anode);
         let vc_ac = node_voltage(solution, d.cathode);
-        Complex64::new(gd, 0.0) * (va_ac - vc_ac)
-    }).collect();
+        diodes.push(Complex64::new(gd, 0.0) * (va_ac - vc_ac));
+    }
 
     // ── MOSFETs: small-signal drain current phasor ────────────────────────
     //
@@ -650,9 +679,14 @@ pub fn compute_ac_branch_currents(
     //
     // Conductances come from model.rs's single copy of the level-1 equations,
     // linearised at the DC bias point, so this stays self-contained.
-    let mosfets = circuit.mosfets.iter().map(|m| {
-        let model = circuit.mosfet_models.get(&m.model)
-            .expect("MOSFET model not found in compute_ac_branch_currents");
+    let mut mosfets = Vec::with_capacity(circuit.mosfets.len());
+    for m in &circuit.mosfets {
+        let model = circuit.mosfet_models.get(&m.model).ok_or_else(|| {
+            SimError::Circuit(format!(
+                "MOSFET '{}' references unknown model '{}'",
+                m.name, m.model
+            ))
+        })?;
 
         let sign = if model.kind == MosfetType::Pmos { -1.0 } else { 1.0 };
 
@@ -679,25 +713,75 @@ pub fn compute_ac_branch_currents(
         let vbs_ac = vb_ac - vs_ac;
 
         // Id = sign·(gm·Vgs + gds·Vds + gbs·Vbs).
-        Complex64::new(sign, 0.0)
-            * (Complex64::new(gm, 0.0) * vgs_ac
-                + Complex64::new(gds, 0.0) * vds_ac
-                + Complex64::new(gbs, 0.0) * vbs_ac)
-    }).collect();
+        mosfets.push(
+            Complex64::new(sign, 0.0)
+                * (Complex64::new(gm, 0.0) * vgs_ac
+                    + Complex64::new(gds, 0.0) * vds_ac
+                    + Complex64::new(gbs, 0.0) * vbs_ac),
+        );
+    }
 
-    AcBranchCurrents { resistors, capacitors, inductors, voltage_sources, diodes, mosfets }
+    Ok(AcBranchCurrents { resistors, capacitors, inductors, voltage_sources, diodes, mosfets })
 }
 
-// ─── Public helpers used by analysis::seed_initial_guess ─────────────────────
+// ─── Operating-point seed ────────────────────────────────────────────────────
 
-/// Public wrapper around the private `node_index` — maps NodeId → MNA row index.
-#[inline]
-pub fn node_index_pub(node: NodeId) -> Option<usize> {
-    node_index(node)
-}
+/// Build a reasonable initial guess for the Newton-Raphson iteration.
+///
+/// Stamps only the linear elements (resistors + voltage sources) plus a small
+/// conductance stub for every nonlinear device, then solves once. This gives a
+/// voltage profile close to the final answer without any nonlinear maths, and
+/// avoids cut-off initialisation issues with MOSFETs.
+///
+/// If the matrix is still singular (e.g. an all-floating island), the guess
+/// falls back to zero rather than failing.
+pub fn initial_guess(circuit: &Circuit) -> DVector<f64> {
+    let mut sys = MnaSystem::<f64>::for_circuit(circuit);
 
-/// Public wrapper around the private `stamp_admittance`.
-#[inline]
-pub fn stamp_conductance_pub<T: Field>(sys: &mut MnaSystem<T>, n1: NodeId, n2: NodeId, g: f64) {
-    stamp_admittance(sys, n1, n2, T::lift(g));
+    // Resistors.
+    for r in &circuit.resistors {
+        stamp_admittance(&mut sys, r.n1, r.n2, 1.0 / r.resistance);
+    }
+
+    // Voltage sources at their DC value.
+    for (i, v) in circuit.voltage_sources.iter().enumerate() {
+        let branch = sys.branch.src_branch(i);
+        if let Some(i1) = node_index(v.n1) {
+            sys.a[(i1, branch)] += 1.0;
+            sys.a[(branch, i1)] += 1.0;
+        }
+        if let Some(i2) = node_index(v.n2) {
+            sys.a[(i2, branch)] -= 1.0;
+            sys.a[(branch, i2)] -= 1.0;
+        }
+        sys.z[branch] = v.voltage;
+    }
+
+    // Inductors as 0 V shorts (same as the DC mode).
+    for (i, l) in circuit.inductors.iter().enumerate() {
+        let branch = sys.branch.ind_branch(i);
+        if let Some(i1) = node_index(l.n1) {
+            sys.a[(i1, branch)] += 1.0;
+            sys.a[(branch, i1)] += 1.0;
+        }
+        if let Some(i2) = node_index(l.n2) {
+            sys.a[(i2, branch)] -= 1.0;
+            sys.a[(branch, i2)] -= 1.0;
+        }
+    }
+
+    // Diodes and MOSFETs: small-conductance stub so every node has a path.
+    let g_stub = 1e-6;
+    for d in &circuit.diodes {
+        stamp_admittance(&mut sys, d.anode, d.cathode, g_stub);
+    }
+    for m in &circuit.mosfets {
+        // Stub between drain and source keeps the drain node from floating.
+        stamp_admittance(&mut sys, m.nd, m.ns, g_stub);
+    }
+
+    match sys.solve() {
+        Ok(x0) => x0,
+        Err(_) => DVector::zeros(sys.size),
+    }
 }

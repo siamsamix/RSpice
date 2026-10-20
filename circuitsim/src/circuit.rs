@@ -1,9 +1,10 @@
 use crate::error::{Result, SimError};
+use crate::behavior::{ProbeBinding, ProbeSpec};
 use std::collections::HashMap;
 
 // Device model cards live in `model.rs` together with the device equations —
 // one module owns the physics. Re-exported here for the historical paths.
-pub use crate::model::{BjtModel, BjtType, DiodeModel, GenericModel, ModelTolerance, MosfetModel, MosfetType};
+pub use crate::model::{BjtModel, BjtType, DiodeModel, GenericModel, JfetModel, JfetType, ModelTolerance, MosfetModel, MosfetType};
 
 #[derive(Debug, Clone)]
 pub struct Mosfet {
@@ -53,7 +54,8 @@ pub enum IntegrationMethod {
 pub struct NodeId(pub usize);
 
 /// Passive device model card (`.model … R/C/L`): an optional model-supplied
-/// value plus the quadratic temperature coefficients.
+/// value plus the quadratic temperature coefficients and the LTspice-style
+/// parasitic slots (`RSER`/`LSER` in series, `CPAR`/`RPAR` across terminals).
 #[derive(Debug, Clone, Default)]
 pub struct PassiveModel {
     /// Model-supplied nominal value (`R=`, `C=`, `L=`), used when the element
@@ -63,6 +65,30 @@ pub struct PassiveModel {
     pub tc1: f64,
     /// Second-order temperature coefficient TC2 (1/°C²).
     pub tc2: f64,
+    /// Series resistance RSER (Ω) split into a real resistor arm.
+    pub rser: f64,
+    /// Series inductance LSER (H) split into a real inductor arm.
+    pub lser: f64,
+    /// Parallel capacitance CPAR (F) stamped across the terminals.
+    pub cpar: f64,
+    /// Parallel resistance RPAR (Ω) stamped across the terminals.
+    pub rpar: f64,
+}
+
+impl PassiveModel {
+    /// True when the card carries at least one parasitic slot.
+    pub fn has_parasitics(&self) -> bool {
+        self.rser != 0.0 || self.lser != 0.0 || self.cpar != 0.0 || self.rpar != 0.0
+    }
+}
+
+/// Which physical element a generated series arm is (TODO §5 parasitics).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParasiticArmKind {
+    /// Series resistance arm (`RSER`).
+    SeriesResistor,
+    /// Series inductance arm (`LSER`).
+    SeriesInductor,
 }
 
 #[derive(Debug, Clone)]
@@ -132,6 +158,19 @@ pub struct Bjt {
     pub area: f64,
 }
 
+/// Junction field-effect transistor (`J` card):
+/// `Jname nd ng ns model [AREA=…]` — drain, gate, source.
+#[derive(Debug, Clone)]
+pub struct Jfet {
+    pub name: String,
+    pub nd: NodeId,
+    pub ng: NodeId,
+    pub ns: NodeId,
+    pub model: String,
+    /// Area multiplier AREA (default 1).
+    pub area: f64,
+}
+
 // ─── Controlled sources (E/F/G/H) ───────────────────────────────────────────
 
 /// What one term of a controlled source reads: a differential node voltage
@@ -156,6 +195,36 @@ pub struct ControlledSource {
     pub out_n: NodeId,
     pub controls: Vec<ControlVar>,
     pub coeffs: Vec<f64>,
+}
+
+/// Output flavour of a behavioral source (`B`): a voltage between its
+/// terminals (one MNA branch row) or a current drawn from `out_p` and
+/// delivered into `out_n` (no branch row).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BehavioralKind {
+    /// `B… V=<expr>` — output voltage `V(out_p) − V(out_n) = f(…)`.
+    Voltage,
+    /// `B… I=<expr>` — output current `f(…)` flowing `out_p → out_n`.
+    Current,
+}
+
+/// Behavioral source, SPICE `B` card: `out = f(probes, time)` for an
+/// arbitrary expression of node voltages and branch currents (TODO §5).
+///
+/// The expression text is kept verbatim (it is what `emit` reprints); its
+/// compiled form lives in `behavior`. Probes bind late — [Circuit::
+/// resolve_behavioral] replaces the name forms with node ids / branch indices
+/// after node compaction, and must never *create* the probed node.
+#[derive(Debug, Clone)]
+pub struct BehavioralSource {
+    pub name: String,
+    pub out_p: NodeId,
+    pub out_n: NodeId,
+    pub kind: BehavioralKind,
+    /// Expression text as written (after probe-name flattening).
+    pub expr: String,
+    /// Compiled AST; probe indices refer to `behavior.probes`.
+    pub behavior: crate::behavior::Behavior,
 }
 
 impl ControlledSource {
@@ -667,6 +736,8 @@ pub struct Circuit {
     pub mosfets: Vec<Mosfet>,
     pub bjt_models: HashMap<String, BjtModel>,
     pub bjts: Vec<Bjt>,
+    pub jfet_models: HashMap<String, JfetModel>,
+    pub jfets: Vec<Jfet>,
     /// Voltage-controlled voltage sources (`E`), one branch row each.
     pub vcvs: Vec<ControlledSource>,
     /// Voltage-controlled current sources (`G`), no branch row.
@@ -677,9 +748,11 @@ pub struct Circuit {
     pub cccs: Vec<ControlledSource>,
     pub switch_models: HashMap<String, SwitchModel>,
     pub switches: Vec<Switch>,
+    /// Behavioral sources (`B` cards) with compiled expressions.
+    pub behavioral: Vec<BehavioralSource>,
     /// `.model` cards of device types RSpice does not model yet (NPN, PNP,
-    /// JFET, RES, …). Parsed so third-party decks import cleanly; no element
-    /// kind consumes them yet.
+    /// RES, …). Parsed so third-party decks import cleanly; no element kind
+    /// consumes them yet.
     pub generic_models: HashMap<String, GenericModel>,
 }
 
@@ -806,6 +879,280 @@ impl Circuit {
         self.resistors.extend(additions);
     }
 
+    /// Split the JFET `RD`/`RS` model parasitics the same way the diode `RS`
+    /// expansion does: each nonzero slot becomes a real resistor between the
+    /// external terminal and a fresh internal node, and the carrier's
+    /// terminal rewires to the internal side. Runs after the deck walk so the
+    /// model tables are final, and before node compaction so the fresh nodes
+    /// join the hole-free renumbering. The card value divides by AREA like
+    /// the diode slot.
+    pub fn expand_jfet_series_resistance(&mut self) {
+        let mut additions = Vec::new();
+        for i in 0..self.jfets.len() {
+            let (nd, ns, name, area) = {
+                let j = &self.jfets[i];
+                (j.nd, j.ns, j.name.clone(), j.area)
+            };
+            let Some(model) = self.jfet_models.get(&self.jfets[i].model) else {
+                continue;
+            };
+            let rd = model.rd / area.max(1e-12);
+            let rs = model.rs / area.max(1e-12);
+            if rd <= 0.0 && rs <= 0.0 {
+                continue;
+            }
+            if rd > 0.0 {
+                let internal = self.nodes;
+                self.ensure_node(internal);
+                self.set_node_name(internal, &format!("{name}.dint"));
+                self.jfets[i].nd = NodeId(internal);
+                additions.push(Resistor {
+                    name: format!("{name}_RD"),
+                    n1: nd,
+                    n2: NodeId(internal),
+                    resistance: rd,
+                    model: None,
+                });
+            }
+            if rs > 0.0 {
+                let internal = self.nodes;
+                self.ensure_node(internal);
+                self.set_node_name(internal, &format!("{name}.sint"));
+                self.jfets[i].ns = NodeId(internal);
+                additions.push(Resistor {
+                    name: format!("{name}_RS"),
+                    n1: ns,
+                    n2: NodeId(internal),
+                    resistance: rs,
+                    model: None,
+                });
+            }
+        }
+        self.resistors.extend(additions);
+    }
+
+    /// Split the BJT `RE`/`RC`/`RB` model resistance slots exactly like the
+    /// diode `RS` and JFET `RD/RS` expansions: each nonzero slot becomes a
+    /// real resistor between the external terminal and a fresh internal node
+    /// (`{name}.eint`/`.cint`/`.bint`) and the carrier's terminal rewires to
+    /// the internal side. Runs after the deck walk so the model tables are
+    /// final, and before node compaction so the fresh nodes join the
+    /// hole-free renumbering. The card value divides by AREA; the optional
+    /// substrate node (`Q c b e [s] model`) is untouched.
+    pub fn expand_bjt_series_resistance(&mut self) {
+        let mut additions = Vec::new();
+        for i in 0..self.bjts.len() {
+            let (nc, nb, ne, name, area) = {
+                let q = &self.bjts[i];
+                (q.nc, q.nb, q.ne, q.name.clone(), q.area)
+            };
+            let Some(model) = self.bjt_models.get(&self.bjts[i].model) else {
+                continue;
+            };
+            let re = model.re / area.max(1e-12);
+            let rc = model.rc / area.max(1e-12);
+            let rb = model.rb / area.max(1e-12);
+            if re <= 0.0 && rc <= 0.0 && rb <= 0.0 {
+                continue;
+            }
+            for (series, slot, internal_suffix, terminal, arm_name) in [
+                (re, 0, "eint", ne, format!("{name}_RE")),
+                (rc, 1, "cint", nc, format!("{name}_RC")),
+                (rb, 2, "bint", nb, format!("{name}_RB")),
+            ] {
+                if series <= 0.0 {
+                    continue;
+                }
+                let internal = self.nodes;
+                self.ensure_node(internal);
+                self.set_node_name(internal, &format!("{name}.{internal_suffix}"));
+                match slot {
+                    0 => self.bjts[i].ne = NodeId(internal),
+                    1 => self.bjts[i].nc = NodeId(internal),
+                    _ => self.bjts[i].nb = NodeId(internal),
+                }
+                additions.push(Resistor {
+                    name: arm_name,
+                    n1: terminal,
+                    n2: NodeId(internal),
+                    resistance: series,
+                    model: None,
+                });
+            }
+        }
+        self.resistors.extend(additions);
+    }
+
+    /// Split passive-model parasitics (TODO §5): a nonzero `RSER`/`LSER` on a
+    /// model card becomes a real resistor/inductor arm in series with the
+    /// carrier device, and `CPAR`/`RPAR` become parallel arms across the
+    /// carrier's original terminals. Like the diode `RS` expansion this runs
+    /// after the model tables are final and before node compaction, so the
+    /// fresh internal nodes join the hole-free renumbering. Arms are only
+    /// generated for nonzero slots, which keeps `validate`'s value checks
+    /// (R > 0, C > 0, L > 0) true for every generated element.
+    pub fn expand_parasitics(&mut self) {
+        self.expand_resistor_parasitics();
+        self.expand_capacitor_parasitics();
+        self.expand_inductor_parasitics();
+    }
+
+    /// The parasitic slots of the carrier's model card, cloned so the caller
+    /// can borrow `&mut self` while working from them. `None` when the card
+    /// is absent or entirely parasitic-free.
+    fn resistor_parasitic_slot(&self, index: usize) -> Option<PassiveModel> {
+        let model = self.resistors[index].model.as_deref()?;
+        self.resistor_models
+            .get(model)
+            .cloned()
+            .filter(|m| m.has_parasitics())
+    }
+
+    fn capacitor_parasitic_slot(&self, index: usize) -> Option<PassiveModel> {
+        let model = self.capacitors[index].model.as_deref()?;
+        self.capacitor_models
+            .get(model)
+            .cloned()
+            .filter(|m| m.has_parasitics())
+    }
+
+    fn inductor_parasitic_slot(&self, index: usize) -> Option<PassiveModel> {
+        let model = self.inductors[index].model.as_deref()?;
+        self.inductor_models
+            .get(model)
+            .cloned()
+            .filter(|m| m.has_parasitics())
+    }
+
+    /// Build the `n`-th internal node of a carrier: the first hangs off
+    /// `.int` like the diode `RS` expansion, further stages count up.
+    fn new_parasitic_node(&mut self, carrier_name: &str, stage: usize) -> NodeId {
+        let internal = self.nodes;
+        self.ensure_node(internal);
+        let suffix = if stage == 1 {
+            "int".to_string()
+        } else {
+            format!("int{stage}")
+        };
+        self.set_node_name(internal, &format!("{carrier_name}.{suffix}"));
+        NodeId(internal)
+    }
+
+    /// Chain the series slots (RSER first, then LSER) left of the carrier:
+    /// each nonzero arm sits between the previous node and a fresh internal
+    /// node, and the returned node becomes the carrier's left terminal.
+    fn apply_series_slots(
+        &mut self,
+        slots: &PassiveModel,
+        carrier_name: &str,
+        external_left: NodeId,
+    ) -> NodeId {
+        let mut left = external_left;
+        let mut stage = 1;
+        for (value, kind) in [
+            (slots.rser, ParasiticArmKind::SeriesResistor),
+            (slots.lser, ParasiticArmKind::SeriesInductor),
+        ] {
+            if value <= 0.0 {
+                continue;
+            }
+            let right = self.new_parasitic_node(carrier_name, stage);
+            match kind {
+                ParasiticArmKind::SeriesResistor => self.resistors.push(Resistor {
+                    name: format!("R{carrier_name}_RSER"),
+                    n1: left,
+                    n2: right,
+                    resistance: value,
+                    model: None,
+                }),
+                ParasiticArmKind::SeriesInductor => self.inductors.push(Inductor {
+                    name: format!("L{carrier_name}_LSER"),
+                    n1: left,
+                    n2: right,
+                    inductance: value,
+                    model: None,
+                }),
+            }
+            left = right;
+            stage += 1;
+        }
+        left
+    }
+
+    /// Stamp the parallel slots (RPAR, then CPAR) across the carrier's
+    /// original external terminals.
+    fn apply_parallel_slots(
+        &mut self,
+        slots: &PassiveModel,
+        carrier_name: &str,
+        n1: NodeId,
+        n2: NodeId,
+    ) {
+        if slots.rpar > 0.0 {
+            self.resistors.push(Resistor {
+                name: format!("R{carrier_name}_RPAR"),
+                n1,
+                n2,
+                resistance: slots.rpar,
+                model: None,
+            });
+        }
+        if slots.cpar > 0.0 {
+            self.capacitors.push(Capacitor {
+                name: format!("C{carrier_name}_CPAR"),
+                n1,
+                n2,
+                capacitance: slots.cpar,
+                model: None,
+            });
+        }
+    }
+
+    fn expand_resistor_parasitics(&mut self) {
+        for i in 0..self.resistors.len() {
+            let Some(slots) = self.resistor_parasitic_slot(i) else {
+                continue;
+            };
+            let (n1, n2, name) = {
+                let r = &self.resistors[i];
+                (r.n1, r.n2, r.name.clone())
+            };
+            let left = self.apply_series_slots(&slots, &name, n1);
+            self.resistors[i].n1 = left;
+            self.apply_parallel_slots(&slots, &name, n1, n2);
+        }
+    }
+
+    fn expand_capacitor_parasitics(&mut self) {
+        for i in 0..self.capacitors.len() {
+            let Some(slots) = self.capacitor_parasitic_slot(i) else {
+                continue;
+            };
+            let (n1, n2, name) = {
+                let c = &self.capacitors[i];
+                (c.n1, c.n2, c.name.clone())
+            };
+            let left = self.apply_series_slots(&slots, &name, n1);
+            self.capacitors[i].n1 = left;
+            self.apply_parallel_slots(&slots, &name, n1, n2);
+        }
+    }
+
+    fn expand_inductor_parasitics(&mut self) {
+        for i in 0..self.inductors.len() {
+            let Some(slots) = self.inductor_parasitic_slot(i) else {
+                continue;
+            };
+            let (n1, n2, name) = {
+                let l = &self.inductors[i];
+                (l.n1, l.n2, l.name.clone())
+            };
+            let left = self.apply_series_slots(&slots, &name, n1);
+            self.inductors[i].n1 = left;
+            self.apply_parallel_slots(&slots, &name, n1, n2);
+        }
+    }
+
     /// Renumber the used node ids to `0,1,2,…` (ground stays 0, other ids keep
     /// their relative order) and move the names along.
     ///
@@ -855,6 +1202,11 @@ impl Circuit {
                 collect_used_node(&mut used, ns);
             }
         }
+        for j in &self.jfets {
+            collect_used_node(&mut used, j.nd);
+            collect_used_node(&mut used, j.ng);
+            collect_used_node(&mut used, j.ns);
+        }
         for c in self.vcvs.iter().chain(&self.vccs).chain(&self.ccvs).chain(&self.cccs) {
             collect_used_node(&mut used, c.out_p);
             collect_used_node(&mut used, c.out_n);
@@ -872,6 +1224,10 @@ impl Circuit {
                 collect_used_node(&mut used, a);
                 collect_used_node(&mut used, b);
             }
+        }
+        for b in &self.behavioral {
+            collect_used_node(&mut used, b.out_p);
+            collect_used_node(&mut used, b.out_n);
         }
         used.sort_unstable();
         // `used` is sorted and unique, so when the ids are already 0..n-1 in
@@ -909,6 +1265,11 @@ impl Circuit {
                 compact(ns);
             }
         }
+        for j in &mut self.jfets {
+            compact(&mut j.nd);
+            compact(&mut j.ng);
+            compact(&mut j.ns);
+        }
         for c in self
             .vcvs
             .iter_mut()
@@ -933,6 +1294,10 @@ impl Circuit {
                 compact(b);
             }
         }
+        for b in &mut self.behavioral {
+            compact(&mut b.out_p);
+            compact(&mut b.out_n);
+        }
         self.node_names = new_names;
         self.nodes = used.len();
     }
@@ -943,6 +1308,108 @@ impl Circuit {
             + self.inductors.len()
             + self.vcvs.len()
             + self.ccvs.len()
+            // Only voltage-flavour B sources carry a branch row.
+            + self
+                .behavioral
+                .iter()
+                .filter(|b| b.kind == BehavioralKind::Voltage)
+                .count()
+    }
+
+    // ─── Behavioral probe binding ────────────────────────────────────────
+
+    /// Bind the probes of every behavioral source against the final node
+    /// space and element tables (called after `compact_node_ids`).
+    ///
+    /// Bindings never create nodes: a probe names something the deck already
+    /// declared, so a missing name is a loud parse error, not a floating net.
+    /// Inside `subckt` bodies element/net names carry the instance path; a
+    /// probe that names one without its path falls back to the card's own
+    /// instance prefix (`B1` inside X1 reading `V(sum)` matches `X1.sum`).
+    pub fn resolve_behavioral(&mut self) -> Result<()> {
+        if self.behavioral.is_empty() {
+            return Ok(());
+        }
+        let node_names: Vec<String> = self.node_names.clone();
+        for i in 0..self.behavioral.len() {
+            let card = self.behavioral[i].name.clone();
+            let mut probes = std::mem::take(&mut self.behavioral[i].behavior.probes);
+            for probe in probes.iter_mut() {
+                match probe {
+                    ProbeBinding::Unresolved(ProbeSpec::Voltage(a, b)) => {
+                        let plus = self.probe_node_id(a, &card, &node_names)?;
+                        let minus = match b {
+                            Some(name) => self.probe_node_id(name, &card, &node_names)?,
+                            None => NodeId(0),
+                        };
+                        *probe = ProbeBinding::Voltage(plus, minus);
+                    }
+                    ProbeBinding::Unresolved(ProbeSpec::Current(src)) => {
+                        *probe = self.probe_branch(src, &card)?;
+                    }
+                    _ => {}
+                }
+            }
+            self.behavioral[i].behavior.probes = probes;
+        }
+        Ok(())
+    }
+
+    /// Resolve one probe node name: exact (case-insensitive) first, then the
+    /// probe spelled without its instance path.
+    fn probe_node_id(
+        &self,
+        token: &str,
+        card: &str,
+        node_names: &[String],
+    ) -> Result<NodeId> {
+        let lower = token.to_ascii_lowercase();
+        if lower == "0" || lower == "gnd" {
+            return Ok(NodeId(0));
+        }
+        if let Some(id) = node_names.iter().position(|n| n.eq_ignore_ascii_case(token)) {
+            return Ok(NodeId(id));
+        }
+        if let Some(dot) = card.rfind('.') {
+            let candidate = format!("{}.{}", &card[..dot], token);
+            if let Some(id) = node_names.iter().position(|n| n.eq_ignore_ascii_case(&candidate)) {
+                return Ok(NodeId(id));
+            }
+        }
+        Err(SimError::Parse(format!(
+            "behavioral source '{}' probes unknown node '{}'",
+            card, token
+        )))
+    }
+
+    /// Resolve `I(src)`: an independent voltage source or inductor, again
+    /// with the card's own instance prefix as the fallback spelling.
+    fn probe_branch(&self, src: &str, card: &str) -> Result<ProbeBinding> {
+        let mut spellings: Vec<String> = vec![src.to_string()];
+        if let Some(dot) = card.rfind('.') {
+            spellings.push(format!("{}.{}", &card[..dot], src));
+        }
+        for cand in &spellings {
+            if let Some(idx) = self
+                .voltage_sources
+                .iter()
+                .position(|v| v.name.eq_ignore_ascii_case(cand))
+            {
+                return Ok(ProbeBinding::SourceCurrent(idx));
+            }
+            if let Some(idx) = self
+                .inductors
+                .iter()
+                .position(|l| l.name.eq_ignore_ascii_case(cand))
+            {
+                return Ok(ProbeBinding::InductorCurrent(idx));
+            }
+        }
+        Err(SimError::Parse(format!(
+            "behavioral source '{}' reads current through '{}', which is not \
+             an independent voltage source or inductor",
+            card, src
+        )))
     }
 
     pub fn validate(&self) -> Result<()> {
@@ -1116,6 +1583,33 @@ impl Circuit {
             if !self.bjt_models.contains_key(&q.model) {
                 return Err(SimError::Circuit(format!(
                     "BJT {} references unknown model '{}'", q.name, q.model
+                )));
+            }
+        }
+        for j in &self.jfets {
+            if j.area <= 0.0 {
+                return Err(SimError::Circuit(format!(
+                    "JFET {} must have AREA > 0", j.name
+                )));
+            }
+            if !self.jfet_models.contains_key(&j.model) {
+                return Err(SimError::Circuit(format!(
+                    "JFET {} references unknown model '{}'", j.name, j.model
+                )));
+            }
+        }
+        for b in &self.behavioral {
+            if b.out_p == b.out_n {
+                return Err(SimError::Circuit(format!(
+                    "behavioral source {} has identical output terminals",
+                    b.name
+                )));
+            }
+            if b.behavior.probes.iter().any(|p| p.is_unresolved()) {
+                return Err(SimError::Circuit(format!(
+                    "behavioral source {} has unresolved probes — the parse \
+                     pipeline binds them via resolve_behavioral()",
+                    b.name
                 )));
             }
         }

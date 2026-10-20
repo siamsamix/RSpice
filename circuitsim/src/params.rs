@@ -39,10 +39,21 @@ pub struct FuncDef {
 /// The parameter environment built while the deck is read: parameter table,
 /// function table, and every element line expands against the current state
 /// (in-order evaluation, as in the reference tools).
+///
+/// `mc_seed` feeds the deterministic `random()`/`rand()`/`gauss()` draws
+/// (TODO §8, LTspice-style Monte Carlo faked through `.step`): one parse is
+/// stable — every expansion of the same draw lands on the same number, so a
+/// Newton solve never sees a moving parameter — and a stepped run re-rolls
+/// because the sweep machinery re-parses per step with that step's overrides
+/// mixed into the seed. A plain `parse()` keeps seed 0, so an unstepped deck
+/// is bit-reproducible.
 #[derive(Debug, Clone, Default)]
 pub struct ParamEnv {
     pub params: HashMap<String, ParamValue>,
     pub funcs: HashMap<String, FuncDef>,
+    /// Seed mixed into every pseudo-random draw; derived from the
+    /// step/sweep overrides by the caller.
+    pub mc_seed: u64,
 }
 
 /// Leaf failure of expression evaluation; callers wrap it with line context.
@@ -411,6 +422,16 @@ impl<'a> Parser<'a> {
                 }
                 nums.iter().cloned().fold(f64::NEG_INFINITY, f64::max)
             }
+            // Monte-Carlo draws (TODO §8). Each is fully determined by the
+            // parse seed (mixed from the step/sweep overrides) and the call's
+            // amplitude, so one netlist expansion is stable and a `.step`
+            // re-parse re-rolls the draw.
+            "random" => { need(1)?; unit01(draw_word(self.env.mc_seed, "random", num0)) * num0 }
+            "rand" => { need(1)?; signed_uniform(draw_word(self.env.mc_seed, "rand", num0), num0) }
+            "gauss" => {
+                need(1)?;
+                num0 * standard_normal(draw_word(self.env.mc_seed, "gauss", num0))
+            }
             _ => return Err(format!("unknown function '{name}'")),
         };
         Ok(ParamValue::Num(v))
@@ -441,6 +462,65 @@ fn arithmetic(l: ParamValue, r: ParamValue, op: char) -> Result<ParamValue, Eval
         return Err(format!("arithmetic overflow ({a} {op} {b})"));
     }
     Ok(ParamValue::Num(v))
+}
+
+// ─── Deterministic pseudo-random draws (TODO §8) ─────────────────────────────
+
+/// SplitMix64 finalizer: one avalanche step gives well-mixed 64-bit words
+/// from small inputs, without carrying generator state between calls.
+fn mix64(mut x: u64) -> u64 {
+    x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+/// Mix a string tag into the draw key (function-stand-in discrimination).
+fn mix_str(x: u64, tag: &str) -> u64 {
+    let mut h = x ^ 0x27D4_EB2F_1656_67C5;
+    for b in tag.bytes() {
+        h = mix64(h ^ (b as u64));
+    }
+    h
+}
+
+/// The draw word for one call site: function tag, amplitude, and the parse's
+/// random seed. Every equal call inside one netlist expansion gets the same
+/// word; a stepped re-parse (different seed) re-rolls it.
+fn draw_word(seed: u64, tag: &str, amplitude: f64) -> u64 {
+    mix64(mix_str(seed ^ amplitude.to_bits(), tag))
+}
+
+/// Uniform deviate in `[0, 1)`.
+fn unit01(word: u64) -> f64 {
+    (word >> 11) as f64 * 2f64.powi(-53)
+}
+
+/// Uniform deviate in `[-magnitude, magnitude]` (LTspice `rand(x)`).
+fn signed_uniform(word: u64, magnitude: f64) -> f64 {
+    (unit01(word) * 2.0 - 1.0) * magnitude
+}
+
+/// One standard normal via Box–Muller on two draw words (LTspice `gauss(x)`).
+fn standard_normal(word: u64) -> f64 {
+    let u = unit01(word).max(1e-12);
+    let v = unit01(mix64(word ^ 0xD1B5_4A32_D192_ED03));
+    (-2.0 * u.ln()).sqrt() * (std::f64::consts::TAU * v).cos()
+}
+
+/// Per-parse draw seed: the sorted (parameter, value) overrides mixed into
+/// one 64-bit word. A `.step` of `param run 1 100 1` therefore gives 100
+/// different, bit-reproducible Monte-Carlo runs; an empty override map
+/// hashes to 0, the constant of an unstepped deck.
+pub fn seed_from_overrides(overrides: &HashMap<String, f64>) -> u64 {
+    let mut keys: Vec<&String> = overrides.keys().collect();
+    keys.sort_unstable();
+    let mut h = 0u64;
+    for key in keys {
+        h = mix_str(h, &key.to_ascii_lowercase());
+        h = mix64(h ^ overrides[key].to_bits());
+    }
+    h
 }
 
 // ─── Substitution pass ───────────────────────────────────────────────────────
@@ -778,5 +858,77 @@ mod tests {
         assert!(env.eval_num("nope").is_err());
         assert!(env.eval("1 +").is_err());
         assert!(env.eval_num("sqrt(-1)").is_err());
+    }
+
+    // ─── Monte-Carlo draws (TODO §8) ─────────────────────────────────────────
+
+    #[test]
+    fn mc_draws_are_stable_within_a_parse_and_bounded() {
+        let mut env = ParamEnv::default();
+        env.mc_seed = 0x5EED_CAFE;
+        let a = env.eval_num("random(5)").unwrap();
+        assert_eq!(a, env.eval_num("random(5)").unwrap(), "stable within a parse");
+        assert!((0.0..5.0).contains(&a), "random(5) in [0,5): {a}");
+
+        let r = env.eval_num("rand(2)").unwrap();
+        assert!((-2.0..=2.0).contains(&r), "rand(2) inside ±2: {r}");
+
+        let g = env.eval_num("gauss(0.05)").unwrap();
+        assert!(g.abs() < 0.4, "gauss(0.05) within 8σ: {g}");
+        assert_eq!(env.eval_num("gauss(0)").unwrap(), 0.0);
+
+        // Wrong arity is still a loud error.
+        assert!(env.eval_num("random()").is_err());
+        assert!(env.eval_num("rand(1, 2)").is_err());
+    }
+
+    #[test]
+    fn mc_draws_shift_with_seed_and_are_reproducible() {
+        let mut e1 = ParamEnv::default();
+        e1.mc_seed = 1;
+        let mut e2 = ParamEnv::default();
+        e2.mc_seed = 2;
+        let draw = |e: &ParamEnv| e.eval_num("random(1)").unwrap();
+        assert_ne!(draw(&e1).to_bits(), draw(&e2).to_bits());
+        assert_eq!(draw(&e1), draw(&e1), "same seed reproduces the same draw");
+    }
+
+    /// Statistical shape over many independent seeds: zero mean, unit
+    /// standard deviation, bounded tails.
+    #[test]
+    fn mc_gauss_distribution_is_statistically_sane() {
+        let n = 2500u32;
+        let mut sum = 0.0f64;
+        let mut sum_sq = 0.0f64;
+        let mut max_abs = 0.0f64;
+        let mut env = ParamEnv::default();
+        for i in 0..n {
+            env.mc_seed = u64::from(i) * 0x9E37_79B9; // scattered seeds
+            let z = env.eval_num("gauss(1)").unwrap();
+            sum += z;
+            sum_sq += z * z;
+            max_abs = max_abs.max(z.abs());
+        }
+        let mean = sum / n as f64;
+        let var = sum_sq / n as f64;
+        // SE of the mean at n=2500 is ~0.02 → allow 3 SE.
+        assert!(mean.abs() < 0.06, "mean {mean}");
+        assert!((var - 1.0).abs() < 0.12, "variance {var}");
+        assert!(max_abs < 7.5, "tail |z| = {max_abs} exceeds the Box–Muller bound");
+    }
+
+    #[test]
+    fn mc_seed_mixes_override_map_deterministically() {
+        let mut one: HashMap<String, f64> = HashMap::new();
+        one.insert("run".into(), 3.0);
+        let mut two = one.clone();
+        two.insert("run".into(), 4.0);
+        assert_ne!(seed_from_overrides(&one), seed_from_overrides(&two));
+        assert_eq!(
+            seed_from_overrides(&one),
+            seed_from_overrides(&one),
+            "pure function of the map"
+        );
+        assert_eq!(seed_from_overrides(&HashMap::new()), 0);
     }
 }

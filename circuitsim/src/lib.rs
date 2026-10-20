@@ -6,6 +6,7 @@
 //! (`.ac`) analyses over a parameter language (`.param`, `.func`, `{expr}`).
 
 pub mod analysis;
+pub mod behavior;
 pub mod circuit;
 pub mod error;
 pub mod mna;
@@ -14,16 +15,19 @@ pub mod netlist;
 pub mod params;
 pub mod units;
 
+pub use behavior::{Behavior, BehavioralRuntime, BExpr, MathFn, ProbeBinding, ProbeSpec};
+
 pub use analysis::{AcResult, run, DcResult, DcSweepPoint, DcSweepResult, FourOutput, FourResult,
                    Harmonic, MeasureResult, NoisePoint, NoiseResult, SimulationResult, StepRun,
-                   TfResult, TranResult};
+                   TfResult, TranPoint, TranResult};
 pub use netlist::{AcCommand, AcScale, DcCommand, DcSweepSpec, DcSweepValues, MeasAnalysis,
                   FourCommand, NoiseCommand, MeasEdge, MeasFunc, MeasKind, Measurement, NodesetEntry,
                   ParseOptions, StepSpec, StepValues, TfCommand, TfOutput, parse,
                   parse_with_options};
-pub use circuit::{Circuit, ControlVar, ControlledSource, CurrentSource, Diode, DiodeModel,
-                  GenericModel, ModelTolerance, Mosfet, MosfetModel, MutualInductance, Switch,
-                  SwitchControl, SwitchModel, Waveform};
+pub use circuit::{BehavioralKind, BehavioralSource, Circuit, ControlVar, ControlledSource,
+                  CurrentSource, Diode, DiodeModel, GenericModel, Jfet, JfetModel, ModelTolerance,
+                  Mosfet, MosfetModel, MutualInductance, Switch, SwitchControl, SwitchModel,
+                  Waveform};
 pub use error::{Result, SimError};
 pub use netlist::{Netlist, parse_with_overrides};
 

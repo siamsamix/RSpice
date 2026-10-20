@@ -5,7 +5,7 @@ use crate::error::{Result, SimError};
 use crate::mna::{
     advance_transient_state, build_system, compute_ac_branch_currents, compute_branch_currents,
     compute_branch_currents_at, node_voltage, seed_transient_state, AcBranchCurrents,
-    BranchCurrents, BranchLayout, MnaSystem, Mode, TransientState,
+    BranchCurrents, BranchLayout, DcJunctionLimits, MnaSystem, Mode, TransientState,
 };
 use crate::circuit::IntegrationMethod;
 use crate::netlist::{
@@ -200,8 +200,6 @@ pub struct TfResult {
 
 /// Newton-Raphson convergence tolerance (max |Δx| between iterates).
 const NR_TOLERANCE: f64 = 1e-6;
-/// Newton-Raphson iteration budget per solve.
-const NR_MAX_ITERS: usize = 100;
 
 /// One Newton-Raphson solve, shared by `.op` and every transient step:
 /// stamp the system at the current iterate, solve, repeat until the iterate
@@ -209,16 +207,19 @@ const NR_MAX_ITERS: usize = 100;
 ///
 /// `build` receives the current iterate and MAINTAINS all other mode data
 /// (bias point, dt, transient state) by closure; the returned system owns its
-/// matrix, so no lifetimes leak through the seam.
+/// matrix, so no lifetimes leak through the seam. `max_iters` is the
+/// iteration budget the deck asked for (`itl1` at DC, `itl4` per transient
+/// point; both default to the pre-options 100).
 fn newton_raphson(
     mut build: impl FnMut(&nalgebra::DVector<f64>) -> Result<MnaSystem<f64>>,
     seed: &nalgebra::DVector<f64>,
     failure: &str,
+    max_iters: usize,
 ) -> Result<nalgebra::DVector<f64>> {
     let mut x = seed.clone();
     // Current linearization. The system is rebuilt after every accepted
     // iterate; the line search below reuses it when possible.
-    for _ in 0..NR_MAX_ITERS {
+    for _ in 0..max_iters {
         let sys = build(&x)?;
         let x_raw = sys.solve()?;
         let residual_at = |x: &nalgebra::DVector<f64>, sys: &MnaSystem<f64>| -> f64 {
@@ -459,8 +460,9 @@ fn run_single(netlist: &Netlist) -> Result<SimulationResult> {
     // and skips this one.)
     let needs_op = run_dc || run_ac || want_tf || run_noise || (run_tran && !uic);
     if needs_op {
+        let conv = DcConvergence::from_analysis(analysis);
         let seeds = resolve_seed(circuit, &seed_entries)?;
-        let (dc_result, dc_x) = solve_dc_op(circuit, &seeds)?;
+        let (dc_result, dc_x) = solve_dc_op(circuit, &seeds, conv, None)?;
         if run_dc {
             result.dc = Some(dc_result);
         }
@@ -484,7 +486,24 @@ fn run_single(netlist: &Netlist) -> Result<SimulationResult> {
         }
         if run_tran && !uic {
             let stop = analysis.tran_stop.unwrap();
-            result.tran = Some(run_transient(circuit, analysis, &dc_x, stop)?);
+            let startup = analysis.tran_startup;
+            // STARTUP seeds from the source-suppressed operating point: every
+            // independent V/I card starts at zero and ramps over the first
+            // 10 µs, so the pre-transient op must be solved the same way.
+            let x_seed = if startup {
+                let mut quiet = circuit.clone();
+                for v in &mut quiet.voltage_sources {
+                    v.voltage = 0.0;
+                }
+                for i in &mut quiet.current_sources {
+                    i.current = 0.0;
+                }
+                let (_, x0) = solve_dc_op(&quiet, &seeds, conv, None)?;
+                x0
+            } else {
+                dc_x.clone()
+            };
+            result.tran = Some(run_transient(circuit, analysis, &x_seed, stop, startup)?);
         }
     }
 
@@ -495,6 +514,7 @@ fn run_single(netlist: &Netlist) -> Result<SimulationResult> {
             analysis,
             uic_state.as_ref().unwrap(),
             stop,
+            false,
         )?);
     }
 
@@ -567,28 +587,143 @@ fn build_uic_state(
     Ok(x)
 }
 
+/// DC operating-point convergence knobs, from `.options` (TODO §3 convergence
+/// suite: the knobs LTspice and PSpice expose for hard-to-converge decks).
+#[derive(Debug, Clone, Copy)]
+pub struct DcConvergence {
+    /// Conductance floor kept across every pn junction and capacitor.
+    gmin: f64,
+    /// Depth of the gmin-stepping retry ladder (one decade per rung).
+    gminsteps: usize,
+    /// Depth of the source-stepping retry ladder (one equal fraction per rung).
+    srcsteps: usize,
+    /// Newton-Raphson iteration budget per DC solve.
+    itl1: usize,
+}
+
+impl DcConvergence {
+    fn from_analysis(analysis: &crate::netlist::AnalysisCommands) -> Self {
+        Self {
+            gmin: analysis.gmin,
+            gminsteps: analysis.gminsteps,
+            srcsteps: analysis.srcsteps,
+            itl1: analysis.itl1,
+        }
+    }
+}
+
+/// One DC Newton-Raphson solve at a given gmin floor and source scale, with
+/// the junction limiter's memory seeded from `x_seed`. Used by the plain
+/// operating point and every step of the gmin/source-stepping ladders.
+fn dc_stage(
+    circuit: &Circuit,
+    x_seed: &nalgebra::DVector<f64>,
+    gmin: f64,
+    src_scale: f64,
+    conv: DcConvergence,
+) -> Result<nalgebra::DVector<f64>> {
+    let mut prev = DcJunctionLimits::seed(circuit, x_seed);
+    // Fresh table with one slot per element so the stamps can record the
+    // limits they used; `Default` (empty vectors) would silently drop every
+    // record and reset the limiting memory after the first swap.
+    let mut used = DcJunctionLimits::zeroed(circuit);
+    newton_raphson(
+        |guess| {
+            let sys = build_system::<f64>(
+                circuit,
+                Mode::Dc {
+                    guess,
+                    limits: &prev,
+                    used: &mut used,
+                    gmin,
+                    src_scale,
+                },
+            )?;
+            // The next build limits against what this one actually used
+            // (the SPICE device-junction-state convention).
+            std::mem::swap(&mut prev, &mut used);
+            Ok(sys)
+        },
+        x_seed,
+        "DC operating point failed to converge",
+        conv.itl1,
+    )
+}
+
 /// Solve the DC operating point and return both the summary struct and the
 /// raw solution vector. The raw vector is needed by AC analysis (linearisation)
 /// and can seed transient initial conditions.
 ///
 /// `seeds` pin the Newton-Raphson starting iterate: `.nodeset` entries push
 /// the DC iteration toward the requested point without forcing the solution
-/// (the converged state is still the true operating point).
+/// (the converged state is still the true operating point). `warm` seeds from
+/// an already-solved point — what a `.dc` sweep hands on from the previous
+/// sweep value.
+///
+/// **The retry ladder** (TODO §3 convergence suite, the Autoconverge shape):
+/// first a plain solve; on failure, gmin stepping — the circuit is repeatedly
+/// solved with the conductance floor a decade higher per rung and the floor
+/// then walks back down to the deck's own `gmin`, each rung seeding the next;
+/// on failure, source stepping — the independent sources come up from a small
+/// fraction to full value, again each fraction seeding the next. A rung that
+/// fails to converge inside `itl1` iterations is simply left behind: the next
+/// rung starts from the last good iterate. If even the full-source final rung
+/// fails everywhere, the plain classic error is reported.
 fn solve_dc_op(
     circuit: &Circuit,
     seeds: &HashMap<usize, f64>,
+    conv: DcConvergence,
+    warm: Option<&nalgebra::DVector<f64>>,
 ) -> Result<(DcResult, nalgebra::DVector<f64>)> {
-    let mut seed = crate::mna::initial_guess(circuit);
-    for (&row, &value) in seeds {
-        seed[row] = value;
+    let plain = match warm {
+        Some(x) => x.clone(),
+        None => {
+            let mut seed = crate::mna::initial_guess(circuit);
+            for (&row, &value) in seeds {
+                seed[row] = value;
+            }
+            seed
+        }
+    };
+
+    // Stage 1: the plain operating point (the overwhelmingly common path).
+    if let Ok(x) = dc_stage(circuit, &plain, conv.gmin, 1.0, conv) {
+        let result = extract_dc(circuit, &x)?;
+        return Ok((result, x));
     }
-    let x = newton_raphson(
-        |guess| build_system::<f64>(circuit, Mode::Dc { guess }),
-        &seed,
-        "DC operating point failed to converge",
-    )?;
-    let result = extract_dc(circuit, &x)?;
-    Ok((result, x))
+
+    // Stage 2: gmin stepping. Rungs run from `gmin·10^gminsteps` down to the
+    // deck's own gmin, one decade per rung; the last rung IS the real circuit.
+    let mut x = plain.clone();
+    for rung in (1..=conv.gminsteps.max(1)).rev() {
+        let gmin_rung = conv.gmin * 10f64.powi(rung as i32);
+        if let Ok(solved) = dc_stage(circuit, &x, gmin_rung, 1.0, conv) {
+            x = solved;
+        }
+    }
+    if let Ok(x) = dc_stage(circuit, &x, conv.gmin, 1.0, conv) {
+        let result = extract_dc(circuit, &x)?;
+        return Ok((result, x));
+    }
+
+    // Stage 3: source stepping, restarted from the plain seed. Every fraction
+    // `k/srcsteps` of the independent sources is solved in order, each
+    // fraction seeded by the last converged one; the final fraction
+    // (`k = srcsteps`, scale exactly 1) is the full-reality deck.
+    let steps = conv.srcsteps.max(1);
+    let mut x = plain.clone();
+    for k in 1..=steps {
+        let scale = k as f64 / steps as f64;
+        if let Ok(solved) = dc_stage(circuit, &x, conv.gmin, scale, conv) {
+            x = solved;
+            if k == steps {
+                let result = extract_dc(circuit, &x)?;
+                return Ok((result, x));
+            }
+        }
+    }
+
+    Err(SimError::Analysis("DC operating point failed to converge".into()))
 }
 
 fn extract_dc(circuit: &Circuit, x: &nalgebra::DVector<f64>) -> Result<DcResult> {
@@ -733,6 +868,15 @@ fn run_dc_sweep(
 
     let mut points = Vec::new();
     let mut expected_nodes: Option<usize> = None;
+    // Each sweep point seeds from the previous point's solution (the SPICE
+    // DC-transfer convention): a stiff sweep walks smoothly and the retry
+    // ladder only fires on the first point if at all.
+    let mut warm: Option<nalgebra::DVector<f64>> = None;
+    let conv = DcConvergence::from_analysis(
+        // The sweep re-materialises the same deck, so the options it was
+        // parsed with carry the convergence knobs.
+        &netlist.analysis,
+    );
     for &pv in &primary {
         // The second sweep is the inner loop (SPICE nesting convention); a
         // single value stands in when there is no nested sweep.
@@ -745,7 +889,8 @@ fn run_dc_sweep(
             };
             let circuit = materialize_circuit(netlist, &targets, &values)?;
             let seeds = resolve_seed(&circuit, seed_entries)?;
-            let (dc, _) = solve_dc_op(&circuit, &seeds)?;
+            let (dc, x) = solve_dc_op(&circuit, &seeds, conv, warm.as_ref())?;
+            warm = Some(x);
             match expected_nodes {
                 None => expected_nodes = Some(dc.node_voltages.len()),
                 Some(n) if n != dc.node_voltages.len() => {
@@ -775,12 +920,15 @@ fn run_dc_sweep(
 /// Run the backward-Euler transient sweep, seeded from `x_start` — the DC
 /// operating-point solution, or the UIC pin-state vector when `.tran … UIC`
 /// puts the deck in charge of the initial state (then node voltages beyond
-/// the `.ic` entries start at 0 and inductor currents are 0).
+/// the `.ic` entries start at 0 and inductor currents are 0). With `startup`
+/// every independent V/I source is ramped from 0 to its card value over the
+/// first 10 µs and `x_start` arrived from the zero-source operating point.
 fn run_transient(
     circuit: &Circuit,
     analysis: &crate::netlist::AnalysisCommands,
     x_start: &nalgebra::DVector<f64>,
     t_stop: f64,
+    startup: bool,
 ) -> Result<TranResult> {
     let dt_out = analysis.tran_step.ok_or_else(|| {
         SimError::Analysis("transient needs a print interval (.tran <tstep> <tstop>)".into())
@@ -827,6 +975,9 @@ fn run_transient(
     let order = if method == IntegrationMethod::Gear1 { 1.0 } else { 2.0 };
     let mut iterations = 0usize;
     const MAX_STEPS: usize = 10_000_000;
+    // The transient path's iteration budget: `.options itl4=` (per time
+    // point; the defaults keep the pre-options 100).
+    let max_iters = analysis.itl4;
 
     while t < t_stop - eps {
         if iterations > MAX_STEPS {
@@ -848,10 +999,20 @@ fn run_transient(
         // estimates the local truncation error; the half-step solution (the
         // more accurate one) is what we advance with.
         let attempt = (|| -> Result<(nalgebra::DVector<f64>, TransientState, f64)> {
-            let (x_full, s_full) = transient_step(circuit, &x, &state, t, h_try, method)?;
-            let (x1, s1) = transient_step(circuit, &x, &state, t, h_try * 0.5, method)?;
-            let (x2, _s2) =
-                transient_step(circuit, &x1, &s1, t + h_try * 0.5, h_try * 0.5, method)?;
+            let (x_full, s_full) =
+                transient_step(circuit, &x, &state, t, h_try, method, startup, max_iters)?;
+            let (x1, s1) =
+                transient_step(circuit, &x, &state, t, h_try * 0.5, method, startup, max_iters)?;
+            let (x2, _s2) = transient_step(
+                circuit,
+                &x1,
+                &s1,
+                t + h_try * 0.5,
+                h_try * 0.5,
+                method,
+                startup,
+                max_iters,
+            )?;
             let err = transient_error(&x_full, &x2, circuit, analysis);
             if x_full.iter().any(|v| !v.is_finite()) {
                 return Ok((x_full, s_full, f64::INFINITY));
@@ -908,6 +1069,8 @@ fn transient_step(
     t: f64,
     dt: f64,
     method: IntegrationMethod,
+    startup: bool,
+    max_iters: usize,
 ) -> Result<(nalgebra::DVector<f64>, TransientState)> {
     // The step solves for the *end* of the interval; sources must be
     // evaluated there (the previous code sampled the start time).
@@ -916,13 +1079,14 @@ fn transient_step(
         |guess| {
             build_system::<f64>(
                 circuit,
-                Mode::Tran { dt, t: t_new, state, method, guess },
+                Mode::Tran { dt, t: t_new, state, method, guess, startup },
             )
         },
         x_guess,
         &format!("Transient failed to converge at t={t_new}"),
+        max_iters,
     )?;
-    let state = advance_transient_state(circuit, &x, state, dt, method);
+    let state = advance_transient_state(circuit, &x, state, dt, method, t_new);
     Ok((x, state))
 }
 
@@ -1220,6 +1384,8 @@ struct MeasCurrents {
     current_sources: Vec<f64>,
     diodes: Vec<f64>,
     mosfets: Vec<f64>,
+    jfets: Vec<f64>,
+    behavioral: Vec<f64>,
 }
 
 /// One point of the measured waveform: the abscissa plus every probed
@@ -1240,6 +1406,8 @@ fn currents_from_real(b: &BranchCurrents) -> MeasCurrents {
         current_sources: b.current_sources.clone(),
         diodes: b.diodes.clone(),
         mosfets: b.mosfets.clone(),
+        jfets: b.jfets.clone(),
+        behavioral: b.behavioral.clone(),
     }
 }
 
@@ -1253,6 +1421,8 @@ fn currents_from_ac(b: &AcBranchCurrents) -> MeasCurrents {
         current_sources: mag(&b.current_sources),
         diodes: mag(&b.diodes),
         mosfets: mag(&b.mosfets),
+        jfets: mag(&b.jfets),
+        behavioral: mag(&b.behavioral),
     }
 }
 
@@ -1390,6 +1560,14 @@ fn probe_value(
         }
         let m_names: Vec<String> = circuit.mosfets.iter().map(|m| m.name.clone()).collect();
         if let Ok(v) = pick(&m_names, &sample.currents.mosfets, "MOSFET") {
+            return Ok(v);
+        }
+        let j_names: Vec<String> = circuit.jfets.iter().map(|j| j.name.clone()).collect();
+        if let Ok(v) = pick(&j_names, &sample.currents.jfets, "JFET") {
+            return Ok(v);
+        }
+        let b_names: Vec<String> = circuit.behavioral.iter().map(|b| b.name.clone()).collect();
+        if let Ok(v) = pick(&b_names, &sample.currents.behavioral, "behavioral source") {
             return Ok(v);
         }
         Err(format!("measurement names no element '{name}' for I(…)"))
@@ -1581,6 +1759,7 @@ fn evaluate_measurement(
     let params = ParamEnv {
         params: netlist.params.clone(),
         funcs: Default::default(),
+        ..Default::default()
     };
     match &measurement.kind {
         MeasKind::Scalar { func, expr, from, to } => {
@@ -1705,6 +1884,7 @@ fn evaluate_fourier(
     let params = ParamEnv {
         params: netlist.params.clone(),
         funcs: Default::default(),
+        ..Default::default()
     };
     let mut outputs = Vec::with_capacity(cmd.outputs.len());
     for spec in &cmd.outputs {

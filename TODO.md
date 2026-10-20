@@ -96,9 +96,19 @@ below is written against that state.
 - [x] **[P1] (LT)** Discontinuity handling: zero-crossing refinement and pulse leading-edge thickening
   so narrow events are not sampled away — done: every source edge (`PULSE`/`EXP`/`PWL`, including
   repeated PWL blocks) is a hard step boundary, so 1 ns features are never skipped.
-- [ ] **[P1] (both)** Convergence suite: gmin stepping, source stepping, junction limiting
-  (pn-junction/FET limiters), PSpice's Autoconverge-style retry ladder; today only a diode voltage
-  clamp and a stub-conductance seed exist.
+- [x] **[P1] (both)** Convergence suite: gmin stepping, source stepping, junction limiting
+  (pn-junction/FET limiters), PSpice's Autoconverge-style retry ladder — done: at DC the engine
+  keeps the `gmin=1e-12` floor across diode/BJT/JFET junctions and capacitors (`.options gmin`),
+  and a failed plain solve retries over a stepped ladder of shrinking gmin (`gminsteps=` decades)
+  then source scale fractions (`srcsteps=`), every stage carrying the SPICE2 junction limiter
+  (`pnjlim` + `vcrit` at the emission-scaled thermal voltage, with the ngspice `arg > 0` guard so
+  backward excursions snap to the knee instead of a NaN) and the `.options itl1=`/`itl4=` Newton
+  budgets; the transient path keeps its pre-existing ±0.1 V clamp bit-exactly. MOSFETs are
+  excluded from the limiter table — their `gds` floor already plays the junction-damping role.
+  Two limiter bugs fixed along the way: the build-1 `used` table is now sized (`zeroed`) per
+  element so recorded limits survive the prev/used swap, and the `.options` knobs round-trip
+  through emit. An exhaustive hunt found no deck the plain stage fails but a stepped rung
+  solves, so the ladder is pinned structurally (budget-exhaustion errors) in tests.
 - [x] **[P1] (both)** Temperature system: `.temp`, `tnom`, per-device temperature coefficients, `VT`
   and bandgap terms recomputed from absolute temperature — done: diode `IS(T)`/`Vt` with
   `EG`/`XTI`/`TNOM`, MOSFET `TCV`/`BEX`/`TNOM`, passive `TC1`/`TC2` model cards, several
@@ -109,11 +119,12 @@ below is written against that state.
 - [x] **[P0] (both)** Real `.dc` sweep: sweep an independent V/I source (or model parameter) across
   start/stop/increment or a value LIST, with optional nested second sweeps. Under no circumstances may
   sweep arguments be silently ignored again.
-- [ ] **[P1] (both)** `.tran` completeness: adaptive stepping, `uic`, `tstart`, first argument as
+- [x] **[P1] (both)** `.tran` completeness: adaptive stepping, `uic`, `tstart`, first argument as
   output/print interval rather than timestep, startup suppression of sources; pulse sources must be
-  evaluated with edge refinement, not sampled at fixed instants. *(Adaptive stepping, UIC, tstart,
-  print-interval semantics, `tmax`, and edge breakpoints are done; source startup suppression is the
-  remaining piece.)*
+  evaluated with edge refinement, not sampled at fixed instants — done: adaptive stepping, UIC,
+  tstart, print-interval semantics, `tmax`, and edge breakpoints listed above; `.tran … STARTUP`
+  ramps every independent source by `value·t/10µs` over the first 10 µs (waveform sources included,
+  behavioral sources deliberately not) starting from a zero-source operating point.
 - [x] **[P1] (both)** `.noise`: input-referred and output noise density vs frequency over `.ac`
   sweeps, integrated RMS totals; requires noise models for R (thermal), diode (shot/flicker), BJT, MOS,
   JFET — done for R/diode/MOSFET (adjoint method); BJT/JFET noise arrives with those devices.
@@ -140,7 +151,7 @@ below is written against that state.
   blocks in LTspice); noise stimulus sources (LTspice's white/flicker functions) `(LT)`; PSpice
   synthesizes noise via `.noise` + IBIS interface nets instead `(PS)`.
 - [x] **[P1] (both)** Controlled sources `E/F/G/H` including `POLY(n)` multivariate forms.
-- [ ] **[P1] (LT)** Behavioral sources `B` (arbitrary expressions of node voltages/branch currents,
+- [x] **[P1] (LT)** Behavioral sources `B` (arbitrary expressions of node voltages/branch currents,
   `time()`, `idt()`/`sdt()`, `delay()`, `table()`, Laplace/frequency-domain hybrids).
 - [ ] **[P1] (PS)** ABM extensions on E/F/G/H: `VALUE=`, `TABLE=`, `FREQ=`, `LAPLACE=`, `CHEBYSHEV=`,
   `EQUATION=` blocks.
@@ -149,8 +160,13 @@ below is written against that state.
   done: `RS` splits into an internal junction node, `CJO`/`TT` are stamped as charge-based
   transient capacitances and AC susceptances, `BV`/`IBV`/`NBV` implement reverse breakdown,
   `EG/XTI/TNOM` drive the temperature law, and `KF/AF` feed `.noise`.
-- [ ] **[P1] (both)** BJT Gummel-Poon: full parameter set, PNP polarity, junction capacitances,
-  Early effect, temperature; device capacitance models are mandatory for transient use.
+- [x] **[P1] (both)** BJT Gummel-Poon: full parameter set, PNP polarity, junction capacitances, Early
+  effect, temperature — done: Ebers–Moll/GP port equations with the IKF/IKR high-current quadrature
+  (`qb = ½(q1 + √(q1² + 4q2))`), XTB beta-temperature exponent, Early effect, ISE/ISC leakages,
+  CJE/CJC (+TF/TR) capacitances stamped in transient (companion history) and AC, `EG/XTI/XTB/TNOM`
+  temperature law, RB/RC/RE expanded to internal-node resistor arms, parse/emit round-trip, and
+  analytic operating-point tests for the stiff forward-active corner, IKF knee, XTB warmth and all
+  three series slots.
 - [ ] **[P2] (LT)** Advanced BJT models: VBIC and Mextram (level/type naming per LTspice's help).
 - [ ] **[P1] (both)** MOSFET levels 2 and 3; BSIM3/BSIM4 families per tool coverage (level numbering
   differs between LTspice and PSpice — verify per target).
@@ -158,17 +174,25 @@ below is written against that state.
   (CJ/CJSW/MJSW/PB), so switching transients carry realistic charge — done: overlap and zero-bias
   junction capacitances are stamped in transient (companion history) and AC; grading parameters are
   parsed for the bias-dependent upgrade.
-- [ ] **[P1] (both)** JFET with capacitance; `[P2] (LT/PS letters differ)` MESFET/GaAs FET (LTspice
-  letter `Z`, PSpice letter `B`; Curtice/Statz/Raytheon variants).
+- [x] **[P1] (both)** JFET with capacitance — done: `J` element with NJF/PJF model cards (quadratic
+  channel in saturation/triode, λ modulation, AREA scaling, gate-junction diodes with IS/XTI/EG and
+  0.8 V relaxation), depletion-law CGS/CGD (PB grading + Fc linearization) stated in tran (companion
+  history) and AC, RD/RS expanded as internal node arms, `I(J1)`/`Id(J1)` probes, parse/emit
+  round-trip. Integration tests pin NJF sink, PJF mirror, RD/RS degradation, AREA and capacitance
+  loading, and the gate-step cutoff transient.
+- [ ] `[P2] (LT/PS letters differ)` MESFET/GaAs FET (LTspice letter `Z`, PSpice letter `B`;
+  Curtice/Statz/Raytheon variants).
 - [ ] **[P2] (PS)** IGBT model; SCR/TRIAC/GTO/thyristor macromodels from the standard libraries.
 - [x] **[P1] (both)** Switches: voltage-controlled (`S`) and current-controlled switch primitives with
   model cards (on/off resistance thresholds, hysteresis).
 - [x] **[P1] (both)** Mutual inductance `K` and ideal transformers; `[P2] (PS)` nonlinear magnetic core
   models (XFRM_NONLINEAR/RM); `[P2] (LT)` behavioral inductor via `flux=` control equation.
 - [ ] **[P1] (both)** Transmission lines: lossless `T` and lossy `O` (LTRA with RLCG parameterization).
-- [ ] **[P1] (both)** Passive model cards: `.model R/L/C` with temperature coefficients `TC1/TC2`;
-  LTspice-style intrinsic parasitics on every R/L/C (`rser`, `cpar`, `lser`, `rpar`). *(Model cards
-  and TC1/TC2 are done; intrinsic parasitics are the remaining piece.)*
+- [x] **[P1] (both)** Passive model cards: `.model R/L/C` with temperature coefficients `TC1/TC2`;
+  LTspice-style intrinsic parasitics on every R/L/C (`rser`, `cpar`, `lser`, `rpar`). *(Model cards and
+  TC1/TC2 plus the parasitic split were done: nonzero slots materialize into real series/parallel arms
+  with internal nodes after the deck walk, so stamps/AC/noise see plain elements; emitted decks keep
+  the expanded arms and drop the slots to stay round-trip stable.)*
 - [ ] **[P1] (both)** Opamp primitives/macromodels: ideal op-amp element and universal/multi-pole
   macromodel library entries, plus vendor `.subckt` opamps loadable from the library system.
 - [ ] **[P2] (PS)** Measurement/utility devices: wattmeter, fuse, varistor from the special libraries.
@@ -217,7 +241,10 @@ below is written against that state.
 
 - [ ] **[P1] (PS; LT approximates)** Monte Carlo: statistical runs over `LOT`/`DEV` tolerances, seed
   control, multiple runs, histogram/yield readouts. First land the parametric `random()`/`gauss()`
-  functions that LTspice uses to fake MC via `.step` `(LT)`.
+  functions that LTspice uses to fake MC via `.step` `(LT)`. *(The parametric layer is landed:
+  `random(x)` ∈ [0,x), `rand(x)` ∈ ±x, `gauss(x)` = x·N(0,1) as deterministic draws keyed off the
+  sweep overrides — `.step param …` re-rolls them per run bit-reproducibly. Remaining: consumers of
+  the `LOT`/`DEV` model tolerance slots, run histograms/yield, and a seed-control directive.)*
 - [ ] **[P2] (PS AA)** Worst-case analysis from component/model tolerances with sensitivity ranking.
 - [ ] **[P2] (PS AA)** Sensitivity analysis: ranked parameter sensitivities of a target measurement.
 - [ ] **[P2] (PS AA)** Optimizer: curve-fitting parameter tuning against measurement goals

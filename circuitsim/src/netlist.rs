@@ -2,13 +2,16 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use crate::circuit::{
-    Ac, Am, Bjt, BjtModel, BjtType, Capacitor, Circuit, ControlVar, ControlledSource, CurrentSource,
-    Diode, DiodeModel, Exp, GenericModel, Inductor, Mosfet, MosfetModel, MosfetType, NodeId, Pwl,
-    Pulse, Resistor, Sffm, Sine, Switch, SwitchControl, SwitchModel, VoltageSource, Waveform,
+    Ac, Am, BehavioralKind, BehavioralSource, Bjt, BjtModel, BjtType, Capacitor, Circuit,
+    ControlVar, ControlledSource, CurrentSource, Diode, DiodeModel, Exp, GenericModel, Inductor,
+    Jfet, JfetModel, JfetType, Mosfet, MosfetModel, MosfetType, NodeId, Pwl, Pulse, Resistor,
+    Sffm, Sine, Switch, SwitchControl, SwitchModel, VoltageSource, Waveform,
 };
 use crate::error::{Result, SimError};
 use crate::model::ModelTolerance;
-use crate::params::{expand_line, parse_func_body, parse_param_body, ParamEnv, ParamValue};
+use crate::params::{
+    expand_line, parse_func_body, parse_param_body, seed_from_overrides, ParamEnv, ParamValue,
+};
 use crate::units::parse_value;
 
 /// Supported sweep scale (mirrors SPICE `.ac` syntax).
@@ -214,6 +217,10 @@ pub struct AnalysisCommands {
     /// `.tran … UIC`: the operating point is skipped and the transient
     /// starts from the `.ic` values (everything else at 0).
     pub tran_uic: bool,
+    /// `.tran … STARTUP`: the DC operating point is solved and run with every
+    /// source suppressed (zero) and the sources ramp to their card values
+    /// over the first 10 µs of the transient (the LTspice startup ramp).
+    pub tran_startup: bool,
     /// Optional `.tran … tmax` cap on the internal timestep.
     pub tran_maxstep: Option<f64>,
     /// `.options method=` integration method (trapezoidal default).
@@ -224,6 +231,23 @@ pub struct AnalysisCommands {
     pub abstol: f64,
     /// Absolute voltage tolerance (`vntol`, default 1e-6 V).
     pub vntol: f64,
+    /// `.options gmin=` — the conductance floor (S) the engine keeps across
+    /// every pn junction and capacitor at DC (TODO §3). Default 1e-12, the
+    /// classic SPICE value.
+    pub gmin: f64,
+    /// `.options gminsteps=` — depth of the DC gmin-stepping retry ladder
+    /// (one decade per rung). Default 10.
+    pub gminsteps: usize,
+    /// `.options srcsteps=` — depth of the DC source-stepping retry ladder
+    /// (one equal fraction per rung). Default 10.
+    pub srcsteps: usize,
+    /// `.options itl1=` — Newton-Raphson iteration budget per DC operating
+    /// point. Default 100, the SPICE classic.
+    pub itl1: usize,
+    /// `.options itl4=` — Newton-Raphson iteration budget per transient time
+    /// point. Default 100 (kept from the pre-options engine; the SPICE
+    /// classic default of 10 starved the damped-Newton line search).
+    pub itl4: usize,
     pub ac: Option<AcCommand>,
     /// `.tf <output> <input>` — DC transfer function.
     pub tf: Option<TfCommand>,
@@ -255,11 +279,17 @@ impl Default for AnalysisCommands {
             tran_stop: None,
             tran_start: 0.0,
             tran_uic: false,
+            tran_startup: false,
             tran_maxstep: None,
             method: crate::circuit::IntegrationMethod::Trapezoidal,
             reltol: 1e-3,
             abstol: 1e-12,
             vntol: 1e-6,
+            gmin: 1e-12,
+            gminsteps: 10,
+            srcsteps: 10,
+            itl1: 100,
+            itl4: 100,
             ac: None,
             tf: None,
             steps: Vec::new(),
@@ -372,6 +402,9 @@ fn parse_featured(
     // environments); `.global` is already registered; element cards come out
     // node-mangled and `{}`-expanded, dot commands just `{}`-expanded.
     let mut env = ParamEnv::default();
+    // Monte-Carlo draws key off the sweep overrides, so each stepped point
+    // re-rolls deterministically (TODO §8).
+    env.mc_seed = seed_from_overrides(overrides);
     let mut scope = ScopeCtx {
         defs: &defs,
         globals: &globals,
@@ -425,8 +458,10 @@ fn parse_featured(
                 parse_controlled_source(&tokens, &mut circuit, &plan, line_no, &mut warnings)?
             }
             'Q' => parse_bjt(&tokens, &mut circuit, &plan, &mut warnings, line_no)?,
+            'J' => parse_jfet(&tokens, &mut circuit, &plan, &mut warnings, line_no)?,
             'S' | 'W' => parse_switch(&tokens, &mut circuit, &plan, line_no)?,
             'K' => parse_mutual_inductance(&tokens, &mut circuit, line_no)?,
+            'B' => parse_behavioral_source(&tokens, &mut circuit, &plan, line_no)?,
             _ => {
                 // Device families RSpice does not model yet are skipped with
                 // a warning instead of failing the import (tolerant parsing).
@@ -440,10 +475,18 @@ fn parse_featured(
     // Series resistances need the final model table, so they split after the
     // card walk; the internal nodes then join compaction below.
     circuit.expand_diode_series_resistance();
+    circuit.expand_jfet_series_resistance();
+    circuit.expand_bjt_series_resistance();
+    // Passive parasitics (`RSER`/`LSER`/`CPAR`/`RPAR`) materialize into real
+    // element arms the same way, just before the node renumbering.
+    circuit.expand_parasitics();
     // Node ids must be hole-free: row addressing below assumes ids 0..n-1 are
     // all stamped (a named id above an unused numeric id would otherwise leave
     // a singular row). Compact first, then validate.
     circuit.compact_node_ids();
+    // Behavioral probes bind against the final node space / element tables;
+    // they never create nodes, so this runs before `validate`.
+    circuit.resolve_behavioral()?;
     circuit.validate()?;
     Ok(Netlist {
         circuit,
@@ -922,6 +965,7 @@ struct ScopeCtx<'a> {
 fn node_slot_indices(kind: char) -> Option<&'static [usize]> {
     match kind.to_ascii_uppercase() {
         'M' => Some(&[1, 2, 3, 4]),
+        'J' => Some(&[1, 2, 3]),
         'E' | 'G' | 'S' | 'T' => Some(&[1, 2, 3, 4]),
         'R' | 'C' | 'L' | 'V' | 'I' | 'D' | 'F' | 'H' | 'W' | 'B' => Some(&[1, 2]),
         'K' => Some(&[]),
@@ -1022,6 +1066,75 @@ fn scope_token(
         return token.to_string();
     }
     format!("{prefix}.{token}")
+}
+
+/// Rewrite the `V(…)`/`I(…)` probe arguments of one `B` expression into the
+/// current scope's naming.
+///
+/// A probe boundary check guards against rewriting function arguments (`int(`
+/// / `hypot(` do not become probes): a probe grabs only when the character
+/// before the letter is not a name character. `V(…)` arguments are nets —
+/// each top-level comma argument scopes like a node token; `I(…)` names an
+/// element and follows the element-reference rule (a path prefix rides along,
+/// a bare name gains the instance's own). Unbalanced text passes through for
+/// the expression parser to reject loudly.
+fn rewrite_b_probes(
+    expr: &str,
+    bindings: &HashMap<String, String>,
+    globals: &HashSet<String>,
+    prefix: &str,
+) -> String {
+    let chars: Vec<char> = expr.chars().collect();
+    let mut out = String::with_capacity(expr.len());
+    let mut i = 0usize;
+    while i < chars.len() {
+        let c = chars[i];
+        let boundary = i == 0
+            || !(chars[i - 1].is_ascii_alphanumeric() || chars[i - 1] == '_');
+        if (c == 'v' || c == 'V' || c == 'i' || c == 'I')
+            && chars.get(i + 1) == Some(&'(')
+            && boundary
+        {
+            let mut depth = 1usize;
+            let mut j = i + 2;
+            while j < chars.len() && depth > 0 {
+                match chars[j] {
+                    '(' => depth += 1,
+                    ')' => depth -= 1,
+                    _ => {}
+                }
+                j += 1;
+            }
+            j -= 1; // position of the balanced ')' (or last char when unbalanced)
+            if depth == 0 {
+                let inner: String = chars[i + 2..j].iter().collect();
+                let is_voltage = c.to_ascii_lowercase() == 'v';
+                let rewritten = if is_voltage {
+                    inner
+                        .split(',')
+                        .map(|arg| scope_token(arg.trim(), bindings, globals, prefix))
+                        .collect::<Vec<String>>()
+                        .join(",")
+                } else {
+                    let arg = inner.trim();
+                    if !prefix.is_empty() && !arg.contains('.') {
+                        format!("{prefix}.{arg}")
+                    } else {
+                        arg.to_string()
+                    }
+                };
+                out.push(c);
+                out.push('(');
+                out.push_str(&rewritten);
+                out.push(')');
+                i = j + 1;
+                continue;
+            }
+        }
+        out.push(c);
+        i += 1;
+    }
+    out
 }
 
 /// Expand one scope's lines into physical element/dot cards.
@@ -1128,6 +1241,32 @@ fn flatten_scope(
             let child = instantiate_subckt(&tokens, *line_no, prefix, label, bindings, env, scope)?;
             out.extend(child);
             continue;
+        }
+
+        // `B` cards carry an expression whose `V(…)`/`I(…)` probes name nets
+        // and elements of the same instance; those are rewritten here instead
+        // of the generic slot pass (which knows nothing about subexpressions).
+        if kind.eq_ignore_ascii_case(&'b') {
+            if let Ok(split) = split_b_card(&tokens) {
+                let mut head: Vec<String> = Vec::with_capacity(4);
+                head.push(if prefix.is_empty() {
+                    tokens[0].to_string()
+                } else {
+                    format!("{prefix}.{}", tokens[0])
+                });
+                head.push(scope_token(tokens[1], bindings, scope.globals, prefix));
+                head.push(scope_token(tokens[2], bindings, scope.globals, prefix));
+                let letter = match split.kind {
+                    BehavioralKind::Voltage => 'V',
+                    BehavioralKind::Current => 'I',
+                };
+                let expr = rewrite_b_probes(&split.expr, bindings, scope.globals, prefix);
+                head.push(format!("{letter}={expr}"));
+                out.push((*line_no, head.join(" ")));
+                continue;
+            }
+            // Malformed split: fall through with the generic rewrite so the
+            // card walk raises the loud parse error for it.
         }
 
         if node_slot_indices(kind).is_some() {
@@ -1525,6 +1664,10 @@ fn parse_dot_command(
             for tok in &tokens[3..] {
                 if tok.eq_ignore_ascii_case("uic") {
                     analysis.tran_uic = true;
+                    continue;
+                }
+                if tok.eq_ignore_ascii_case("startup") {
+                    analysis.tran_startup = true;
                     continue;
                 }
                 match parse_value(tok) {
@@ -1925,8 +2068,19 @@ fn parse_model_card(
         ));
     }
 
-    let (pairs, strays) = parse_model_params(&param_body);
+    let (mut pairs, strays) = parse_model_params(&param_body);
+    // A generic `JFET(NJF …)` card carries the polarity as a bare token —
+    // that spelling is legal, so it does not warn as a stray.
+    let type_word_lower = type_word.to_ascii_lowercase();
+    let jfet_polarity_in_body = type_word_lower == "jfet"
+        && strays
+            .iter()
+            .chain(pairs.iter().filter(|(k, _)| k == "type").map(|(_, v)| v))
+            .any(|s| matches!(s.to_ascii_lowercase().as_str(), "njf" | "pjf"));
     for stray in &strays {
+        if jfet_polarity_in_body && matches!(stray.to_ascii_lowercase().as_str(), "njf" | "pjf") {
+            continue;
+        }
         warnings.push(format!(
             "line {line_no}: .model '{name}': token '{stray}' is not a KEY=VALUE pair — ignored"
         ));
@@ -2048,6 +2202,8 @@ fn parse_model_card(
                 "nr" => model.nr = value(&raw)?,
                 "vaf" => model.vaf = value(&raw)?,
                 "var" => model.var = value(&raw)?,
+                "ikf" => model.ikf = value(&raw)?,
+                "ikr" => model.ikr = value(&raw)?,
                 "ise" => model.ise = value(&raw)?,
                 "ne" => model.ne = value(&raw)?,
                 "isc" => model.isc = value(&raw)?,
@@ -2064,6 +2220,7 @@ fn parse_model_card(
                 "tf" => model.tf = value(&raw)?,
                 "tr" => model.tr = value(&raw)?,
                 "xti" => model.xti = value(&raw)?,
+                "xtb" => model.xtb = value(&raw)?,
                 "eg" => model.eg = value(&raw)?,
                 "tnom" => model.tnom = value(&raw)?,
                 "kf" => model.kf = value(&raw)?,
@@ -2080,6 +2237,70 @@ fn parse_model_card(
         return Ok(());
     }
 
+    // JFET card: either bare `NJF`/`PJF`, or the generic `JFET(...)` spelling
+    // where the polarity arrives in the body (a leading stray `NJF`/`PJF`
+    // token, or a `TYPE=` pair), defaulting to NJF.
+    if type_lower == "njf" || type_lower == "pjf" || type_lower == "jfet" {
+        let mut rest_strays = strays;
+        let polarity_word = if type_lower == "jfet" {
+            // The bare-token spelling (`JFET(NJF VTO=…)`) lost the token in
+            // the pairs/strays split; the pairs-only variant keeps `TYPE=`.
+            let mut word = "njf".to_string();
+            let mut rest_pairs = pairs;
+            if let Some(idx) = rest_strays.iter().position(|s| {
+                matches!(s.to_ascii_lowercase().as_str(), "njf" | "pjf")
+            }) {
+                word = rest_strays.remove(idx).to_ascii_lowercase();
+            } else if let Some(idx) = rest_pairs.iter().position(|(k, _)| k == "type") {
+                let (_, v) = rest_pairs.remove(idx);
+                let v = v.to_ascii_lowercase();
+                if matches!(v.as_str(), "njf" | "pjf") {
+                    word = v;
+                }
+            }
+            // Only `pairs` are consumed by the parameter walk below; the
+            // remaining strays were already warned above and stay unread.
+            pairs = rest_pairs;
+            word
+        } else {
+            type_lower.clone()
+        };
+        let kind = if polarity_word == "pjf" {
+            JfetType::Pjf
+        } else {
+            JfetType::Njf
+        };
+        let mut model = JfetModel { kind, ..JfetModel::default() };
+        for (key, raw) in pairs {
+            match key.as_str() {
+                "vto" => model.vto = value(&raw)?,
+                "beta" => model.beta = value(&raw)?,
+                "lambda" => model.lambda = value(&raw)?,
+                "b" => model.b = value(&raw)?,
+                "is" => model.is = value(&raw)?,
+                "rd" => model.rd = value(&raw)?,
+                "rs" => model.rs = value(&raw)?,
+                "cgs" => model.cgs = value(&raw)?,
+                "cgd" => model.cgd = value(&raw)?,
+                "pb" => model.pb = value(&raw)?,
+                "fc" => model.fc = value(&raw)?,
+                "xti" => model.xti = value(&raw)?,
+                "eg" => model.eg = value(&raw)?,
+                "tnom" => model.tnom = value(&raw)?,
+                "kf" => model.kf = value(&raw)?,
+                "af" => model.af = value(&raw)?,
+                "dev" => model.tolerance.dev = Some(parse_tolerance_value(&raw, &value)),
+                "lot" => model.tolerance.lot = Some(parse_tolerance_value(&raw, &value)),
+                "level" => {}
+                other => warnings.push(format!(
+                    "line {line_no}: .model '{name}': JFET parameter '{other}' is not supported — ignored"
+                )),
+            }
+        }
+        circuit.jfet_models.insert(name, model);
+        return Ok(());
+    }
+
     // Passive model cards: `.model m R(R=1k TC1=…)`, `CAP(…)`, `IND(…)`.    // Passive model cards: `.model m R(R=1k TC1=…)`, `CAP(…)`, `IND(…)`.
     let passive = matches!(
         type_lower.as_str(),
@@ -2093,6 +2314,13 @@ fn parse_model_card(
                 | "inductance" => model.value = Some(value(&raw)?),
                 "tc1" => model.tc1 = value(&raw)?,
                 "tc2" => model.tc2 = value(&raw)?,
+                // LTspice-style parasitic slots (TODO §5). They are read
+                // here and materialized into element arms by
+                // `expand_parasitics` after the full deck walk.
+                "rser" => model.rser = value(&raw)?,
+                "lser" => model.lser = value(&raw)?,
+                "cpar" => model.cpar = value(&raw)?,
+                "rpar" => model.rpar = value(&raw)?,
                 "dev" | "lot" => {}
                 other => warnings.push(format!(
                     "line {line_no}: .model '{name}': passive parameter '{other}' is not supported — ignored"
@@ -2289,9 +2517,24 @@ fn parse_options(
             "maxstep" | "tmax" => {
                 analysis.tran_maxstep = Some(parse_value(value).map_err(SimError::Parse)?)
             }
+            // TODO §3 convergence suite knobs: they drive the DC operating
+            // point (gmin floor, the gmin/source-stepping ladder depths) and
+            // the Newton iteration budgets at DC (`itl1`) and per transient
+            // point (`itl4`).
+            "gmin" => analysis.gmin = parse_value(value).map_err(SimError::Parse)?,
+            "gminsteps" => {
+                analysis.gminsteps =
+                    parse_value(value).map_err(SimError::Parse)?.max(0.0) as usize
+            }
+            "srcsteps" => {
+                analysis.srcsteps =
+                    parse_value(value).map_err(SimError::Parse)?.max(0.0) as usize
+            }
+            "itl1" => analysis.itl1 = parse_value(value).map_err(SimError::Parse)?.max(1.0) as usize,
+            "itl4" => analysis.itl4 = parse_value(value).map_err(SimError::Parse)?.max(1.0) as usize,
             // Parsed but not applied yet; keep them as warnings instead of
             // pretending the engine honours them.
-            "gmin" | "itl1" | "itl2" | "itl4" | "itl6" | "maxord" | "tnom" | "temp"
+            "itl2" | "itl6" | "maxord" | "tnom" | "temp"
             | "accurate" | "solvehold" | "plotwinsize" | "numdgt" => {
                 warnings.push(format!(
                     "line {line_no}: .options {key}={value} is parsed but not applied yet"
@@ -3141,6 +3384,63 @@ fn parse_bjt(
     Ok(())
 }
 
+/// Parse a `J` card: `Jname nd ng ns model [AREA=…]`.
+///
+/// Trailing tokens mirror the BJT grammar: `AREA=` (also the `M=` multiplier
+/// spelling), a bare numeric area, and an ignored `OFF`.
+fn parse_jfet(
+    tokens: &[&str],
+    circuit: &mut Circuit,
+    plan: &HashMap<String, usize>,
+    warnings: &mut Vec<String>,
+    line_no: usize,
+) -> Result<()> {
+    if tokens.len() < 5 {
+        return Err(SimError::Parse(format!(
+            "line {line_no}: J requires: Jname drain gate source model [AREA=…]"
+        )));
+    }
+    let nd = parse_node(tokens[1], circuit, plan)?;
+    let ng = parse_node(tokens[2], circuit, plan)?;
+    let ns = parse_node(tokens[3], circuit, plan)?;
+    let model = tokens
+        .get(4)
+        .ok_or_else(|| {
+            SimError::Parse(format!("line {line_no}: J '{}' is missing its model", tokens[0]))
+        })?
+        .to_ascii_lowercase();
+    let mut area = 1.0;
+    for tok in &tokens[5..] {
+        let lower = tok.to_ascii_lowercase();
+        if let Some(rest) = lower.strip_prefix("area=") {
+            area = parse_value(rest).map_err(SimError::Parse)?;
+        } else if lower == "off" {
+            warnings.push(format!(
+                "line {line_no}: JFET '{}': OFF is parsed but not applied",
+                tokens[0]
+            ));
+        } else if let Some(rest) = lower.strip_prefix("m=") {
+            area = parse_value(rest).map_err(SimError::Parse)?;
+        } else if let Ok(a) = parse_value(tok) {
+            area = a;
+        } else {
+            warnings.push(format!(
+                "line {line_no}: JFET '{}': token '{tok}' is not supported — ignored",
+                tokens[0]
+            ));
+        }
+    }
+    circuit.jfets.push(Jfet {
+        name: tokens[0].to_string(),
+        nd,
+        ng,
+        ns,
+        model,
+        area,
+    });
+    Ok(())
+}
+
 /// Parse a voltage-controlled (`S`) or current-controlled (`W`) switch.
 ///
 /// `Sname n+ n- ctrl+ ctrl- model [ON|OFF]`
@@ -3646,6 +3946,92 @@ fn parse_current_source(
     Ok(())
 }
 
+// ─── Behavioral sources (`B`) ───────────────────────────────────────────────
+
+/// One `B` card split into its output flavour and its raw expression text.
+struct BCardSplit {
+    kind: BehavioralKind,
+    /// Expression as written after the `V=`/`I=` keyword (the keyword's own
+    /// letter is stripped: the compiled grammar treats `V(…)` as a probe).
+    expr: String,
+}
+
+/// Find the `V=`/`I=` keyword in a `B` card and rejoin the expression.
+///
+/// Both keyword shapes are legal: glued (`V=V(in)*2`, possibly the '=' with
+/// the expression in the same token) and split (`V = V(in) * V(out)`), and
+/// the expression itself may carry spaces — so everything after the keyword
+/// is rejoined with single spaces. Scanning starts at token 3 (name, and two
+/// nodes, come first); an expression can never contain '=' otherwise.
+fn split_b_card(tokens: &[&str]) -> Result<BCardSplit> {
+    for k in 3..tokens.len() {
+        let lower = tokens[k].to_ascii_lowercase();
+        let glued = if lower.starts_with("v=") {
+            Some(BehavioralKind::Voltage)
+        } else if lower.starts_with("i=") {
+            Some(BehavioralKind::Current)
+        } else {
+            None
+        };
+        if let Some(kind) = glued {
+            let mut expr_parts: Vec<&str> = Vec::with_capacity(tokens.len() - k);
+            let tail = &tokens[k][2..];
+            if !tail.is_empty() {
+                expr_parts.push(tail);
+            }
+            expr_parts.extend(tokens[k + 1..].iter().copied());
+            return Ok(BCardSplit { kind, expr: expr_parts.join(" ") });
+        }
+        // Split: bare `V` / `I`, then either a bare `=` or one starting with `=`.
+        if (lower == "v" || lower == "i")
+            && tokens.get(k + 1).is_some_and(|n| n.starts_with('='))
+        {
+            let kind = if lower == "v" { BehavioralKind::Voltage } else { BehavioralKind::Current };
+            let mut expr_parts: Vec<&str> = Vec::with_capacity(tokens.len() - k - 1);
+            let after_eq = &tokens[k + 1][1..];
+            if !after_eq.is_empty() {
+                expr_parts.push(after_eq);
+            }
+            expr_parts.extend(tokens[k + 2..].iter().copied());
+            return Ok(BCardSplit { kind, expr: expr_parts.join(" ") });
+        }
+    }
+    Err(SimError::Parse(format!(
+        "behavioral source '{}' has no V=<expr> or I=<expr> output",
+        tokens[0]
+    )))
+}
+
+fn parse_behavioral_source(
+    tokens: &[&str],
+    circuit: &mut Circuit,
+    plan: &HashMap<String, usize>,
+    line_no: usize,
+) -> Result<()> {
+    let split = split_b_card(tokens)
+        .map_err(|e| SimError::Parse(format!("line {line_no}: {e}")))?;
+    let expr = split.expr.trim();
+    if expr.is_empty() {
+        return Err(SimError::Parse(format!(
+            "line {line_no}: behavioral source '{}' has an empty expression",
+            tokens[0]
+        )));
+    }
+    let behavior =
+        crate::behavior::parse(expr).map_err(|e| SimError::Parse(format!("line {line_no}: {e}")))?;
+    let out_p = parse_node(tokens[1], circuit, plan)?;
+    let out_n = parse_node(tokens[2], circuit, plan)?;
+    circuit.behavioral.push(BehavioralSource {
+        name: tokens[0].to_string(),
+        out_p,
+        out_n,
+        kind: split.kind,
+        expr: expr.to_string(),
+        behavior,
+    });
+    Ok(())
+}
+
 /// Canonical text for one source waveform (the inverse of the source-card
 /// grammar). PWL repeat blocks are emitted as a linear point list — the
 /// waveform values are identical even though the block markers are lost.
@@ -3718,8 +4104,11 @@ pub fn emit(netlist: &Netlist) -> String {
     diode_names.sort();
     for name in diode_names {
         let m = &circuit.diode_models[name];
-        let mut fields = format!("IS={} N={} RS={} CJO={} VJ={} M={} TT={} BV={} IBV={}",
-            m.is, m.n, m.rs, m.cjo, m.vj, m.m, m.tt, m.bv, m.ibv);
+        // `RS` is deliberately not reprinted: `expand_diode_series_resistance`
+        // has already materialized it as resistor arms, and printing the slot
+        // a second time would make `parse(emit(…))` split it twice.
+        let mut fields = format!("IS={} N={} CJO={} VJ={} M={} TT={} BV={} IBV={}",
+            m.is, m.n, m.cjo, m.vj, m.m, m.tt, m.bv, m.ibv);
         if m.eg != 1.11 { fields.push_str(&format!(" EG={}", m.eg)); }
         if m.xti != 3.0 { fields.push_str(&format!(" XTI={}", m.xti)); }
         if m.kf != 0.0 { fields.push_str(&format!(" KF={} AF={}", m.kf, m.af)); }
@@ -3761,7 +4150,10 @@ pub fn emit(netlist: &Netlist) -> String {
         if let Some(v) = m.tpg { out.push_str(&format!(" TPG={v}")); }
         out.push_str(")\n");
     }
-    // Passive model cards.
+    // Passive model cards. Parasitic slots (`RSER`/`LSER`/`CPAR`/`RPAR`) are
+    // deliberately not reprinted: `expand_parasitics` has already materialized
+    // them as element arms, and printing the slots a second time would make
+    // `parse(emit(…))` split them twice.
     let mut passive_names: Vec<&String> = circuit
         .resistor_models
         .keys()
@@ -3792,7 +4184,9 @@ pub fn emit(netlist: &Netlist) -> String {
         out.push_str(&fields.join(" "));
         out.push_str(")\n");
     }
-    // BJT model cards.
+    // BJT model cards. `VAF`/`VAR` (and `IKF`/`IKR`) print only when finite —
+    // the infinite defaults would emit `inf`, which `parse_value` rejects —
+    // and `XTB` joins only when it moves β at all.
     let mut bjt_names: Vec<&String> = circuit.bjt_models.keys().collect();
     bjt_names.sort();
     for name in bjt_names {
@@ -3801,11 +4195,64 @@ pub fn emit(netlist: &Netlist) -> String {
             BjtType::Npn => "NPN",
             BjtType::Pnp => "PNP",
         };
+        let mut fields = vec![
+            format!("IS={}", m.is),
+            format!("BF={}", m.bf),
+            format!("BR={}", m.br),
+            format!("NF={}", m.nf),
+            format!("NR={}", m.nr),
+            format!("ISE={}", m.ise),
+            format!("NE={}", m.ne),
+            format!("ISC={}", m.isc),
+            format!("NC={}", m.nc),
+            // `RB`/`RC`/`RE` are deliberately not reprinted: the BJT
+            // series-resistance expansion has already materialized them as
+            // collector/base/emitter resistor arms, and printing the slots a
+            // second time would split them twice.
+        ];
+        for (label, val) in [("VAF", m.vaf), ("VAR", m.var), ("IKF", m.ikf), ("IKR", m.ikr)] {
+            if val.is_finite() {
+                fields.push(format!("{label}={val}"));
+            }
+        }
+        fields.extend([
+            format!("CJE={}", m.cje),
+            format!("VJE={}", m.vje),
+            format!("MJE={}", m.mje),
+            format!("CJC={}", m.cjc),
+            format!("VJC={}", m.vjc),
+            format!("MJC={}", m.mjc),
+            format!("TF={}", m.tf),
+            format!("TR={}", m.tr),
+            format!("XTI={}", m.xti),
+        ]);
+        if m.xtb != 0.0 {
+            fields.push(format!("XTB={}", m.xtb));
+        }
+        fields.extend([
+            format!("EG={}", m.eg),
+            format!("TNOM={}", m.tnom),
+            format!("KF={}", m.kf),
+            format!("AF={}", m.af),
+        ]);
+        out.push_str(&format!(".model {} {}({})\n", name, kind, fields.join(" ")));
+    }
+    // JFET model cards.
+    let mut jfet_names: Vec<&String> = circuit.jfet_models.keys().collect();
+    jfet_names.sort();
+    for name in jfet_names {
+        let m = &circuit.jfet_models[name];
+        let kind = match m.kind {
+            JfetType::Njf => "NJF",
+            JfetType::Pjf => "PJF",
+        };
         out.push_str(&format!(
-            ".model {} {}(IS={} BF={} BR={} NF={} NR={} VAF={} ISE={} NE={} ISC={} NC={} RB={} RC={} RE={} CJE={} VJE={} MJE={} CJC={} VJC={} MJC={} TF={} TR={} XTI={} EG={} TNOM={} KF={} AF={})\n",
-            name, kind, m.is, m.bf, m.br, m.nf, m.nr, m.vaf, m.ise, m.ne, m.isc, m.nc,
-            m.rb, m.rc, m.re, m.cje, m.vje, m.mje, m.cjc, m.vjc, m.mjc, m.tf, m.tr,
-            m.xti, m.eg, m.tnom, m.kf, m.af
+            // `RD`/`RS` are deliberately not reprinted: the series-resistance
+            // expansion has already materialized them as resistor arms, and
+            // printing the slots a second time would split them twice.
+            ".model {} {}(VTO={} BETA={} LAMBDA={} B={} IS={} CGS={} CGD={} PB={} FC={} XTI={} EG={} TNOM={} KF={} AF={})\n",
+            name, kind, m.vto, m.beta, m.lambda, m.b, m.is, m.cgs, m.cgd, m.pb,
+            m.fc, m.xti, m.eg, m.tnom, m.kf, m.af
         ));
     }
     // Switch model cards.
@@ -3842,31 +4289,37 @@ pub fn emit(netlist: &Netlist) -> String {
     // ── Element cards ────────────────────────────────────────────────────
     let name_of = |n: NodeId| circuit.node_name(n.0).to_string();
     for r in &circuit.resistors {
-        out.push_str(&format!(
-            "{} {} {} {}\n",
+        let mut card = format!(
+            "{} {} {} {}",
             r.name, name_of(r.n1), name_of(r.n2), r.resistance
-        ));
+        );
         if let Some(model) = &r.model {
-            out.push_str(&format!(" {}", model));
+            card.push_str(&format!(" {model}"));
         }
+        out.push_str(&card);
+        out.push('\n');
     }
     for c in &circuit.capacitors {
-        out.push_str(&format!(
-            "{} {} {} {}\n",
+        let mut card = format!(
+            "{} {} {} {}",
             c.name, name_of(c.n1), name_of(c.n2), c.capacitance
-        ));
+        );
         if let Some(model) = &c.model {
-            out.push_str(&format!(" {}", model));
+            card.push_str(&format!(" {model}"));
         }
+        out.push_str(&card);
+        out.push('\n');
     }
     for l in &circuit.inductors {
-        out.push_str(&format!(
-            "{} {} {} {}\n",
+        let mut card = format!(
+            "{} {} {} {}",
             l.name, name_of(l.n1), name_of(l.n2), l.inductance
-        ));
+        );
         if let Some(model) = &l.model {
-            out.push_str(&format!(" {}", model));
+            card.push_str(&format!(" {model}"));
         }
+        out.push_str(&card);
+        out.push('\n');
     }
     for d in &circuit.diodes {
         if d.area != 1.0 {
@@ -3912,6 +4365,22 @@ pub fn emit(netlist: &Netlist) -> String {
             area
         ));
     }
+    for j in &circuit.jfets {
+        let area = if j.area != 1.0 {
+            format!(" AREA={}", j.area)
+        } else {
+            String::new()
+        };
+        out.push_str(&format!(
+            "{} {} {} {} {}{}\n",
+            j.name,
+            name_of(j.nd),
+            name_of(j.ng),
+            name_of(j.ns),
+            j.model,
+            area
+        ));
+    }
     for v in &circuit.voltage_sources {
         // `DC <value>` is redundant for waveform sources (the value equals
         // their starting level) but keeps every source's operating point.
@@ -3947,6 +4416,22 @@ pub fn emit(netlist: &Netlist) -> String {
             out.push_str(&waveform_text(w));
         }
         out.push('\n');
+    }
+    // Behavioral sources: verbatim expressions (the compiled AST recompiles
+    // byte-for-byte; emitting any canonicalized form would risk double-scale).
+    for b in &circuit.behavioral {
+        let letter = match b.kind {
+            BehavioralKind::Voltage => 'V',
+            BehavioralKind::Current => 'I',
+        };
+        out.push_str(&format!(
+            "{} {} {} {}={}\n",
+            b.name,
+            name_of(b.out_p),
+            name_of(b.out_n),
+            letter,
+            b.expr
+        ));
     }
 
     // ── Controlled sources, switches, coupled inductors ──────────────────
@@ -4050,6 +4535,9 @@ pub fn emit(netlist: &Netlist) -> String {
         if analysis.tran_uic {
             line.push_str(" UIC");
         }
+        if analysis.tran_startup {
+            line.push_str(" STARTUP");
+        }
         out.push_str(&line);
         out.push('\n');
     }
@@ -4075,8 +4563,8 @@ pub fn emit(netlist: &Netlist) -> String {
         };
         out.push_str(&format!(".tf {} {}\n", output, tf.input));
     }
-    out.push_str(&format!(
-        ".options method={} reltol={} abstol={} vntol={}\n",
+    let mut options = format!(
+        ".options method={} reltol={} abstol={} vntol={}",
         match analysis.method {
             crate::circuit::IntegrationMethod::Trapezoidal => "trap",
             crate::circuit::IntegrationMethod::Gear1 => "gear1",
@@ -4085,7 +4573,26 @@ pub fn emit(netlist: &Netlist) -> String {
         analysis.reltol,
         analysis.abstol,
         analysis.vntol
-    ));
+    );
+    // Convergence knobs re-print only when they differ from the engine
+    // defaults, so an uncustomized deck's emitted options line is unchanged.
+    if analysis.gmin != 1e-12 {
+        options.push_str(&format!(" gmin={}", analysis.gmin));
+    }
+    if analysis.gminsteps != 10 {
+        options.push_str(&format!(" gminsteps={}", analysis.gminsteps));
+    }
+    if analysis.srcsteps != 10 {
+        options.push_str(&format!(" srcsteps={}", analysis.srcsteps));
+    }
+    if analysis.itl1 != 100 {
+        options.push_str(&format!(" itl1={}", analysis.itl1));
+    }
+    if analysis.itl4 != 100 {
+        options.push_str(&format!(" itl4={}", analysis.itl4));
+    }
+    out.push_str(&options);
+    out.push('\n');
     if !analysis.temperatures.is_empty() {
         let values: Vec<String> = analysis.temperatures.iter().map(|t| format!("{t}")).collect();
         out.push_str(&format!(".temp {}\n", values.join(" ")));
@@ -4143,6 +4650,7 @@ pub fn emit(netlist: &Netlist) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use approx::assert_relative_eq;
 
     /// `parse(emit(x))` preserves the language-relevant facts of a
     /// representative netlist: elements, model cards, waveforms, commands.
@@ -4151,13 +4659,19 @@ mod tests {
         let src = "* roundtrip\n\
                    .model dino D(IS=1e-14 N=1.05)\n\
                    .model nh NMOS(KP=2e-4 VTH0=0.7 LAMBDA=0.02 GAMMA=0.5 PHI=0.6)\n\
+                   .model jn JFET(NJF VTO=-2 BETA=1e-4 IS=1e-14 CGS=2p CGD=1p PB=1)\n\
+                   .model qp NPN(IS=1e-14 BF=150 NF=1.02 IKF=5m IKR=2m XTB=0.5\n\
+                   + VAF=50 VAR=2)\n\
                    R1 1 2 1k\n\
                    C1 1 2 1u\n\
                    L1 2 0 1m\n\
                    D1 1 0 dino\n\
                    M1 2 1 0 0 nh W=2u L=0.18u\n\
+                   J1 2 1 0 jn AREA=2\n\
+                   Q1 2 1 0 qp\n\
                    VS 1 0 DC 5 AC 1 30 PULSE(0 5 1u 2u 2u 5u 10u)\n\
                    IS 2 0 DC 1m AC 1u PULSE(0 1m 1u 2u 2u 5u 10u)\n\
+                   B1 2 0 V=V(1)*2\n\
                    .op\n\
                    .tran 1u 5m\n\
                    .ac DEC 10 1 10k\n\
@@ -4172,8 +4686,44 @@ mod tests {
         assert_eq!(second.circuit.inductors.len(), 1);
         assert_eq!(second.circuit.diodes.len(), 1);
         assert_eq!(second.circuit.mosfets.len(), 1);
+        assert_eq!(second.circuit.jfets.len(), 1);
+        assert_eq!(second.circuit.bjts.len(), 1);
         assert_eq!(second.circuit.voltage_sources.len(), 1);
         assert_eq!(second.circuit.current_sources.len(), 1);
+        assert_eq!(second.circuit.behavioral.len(), 1);
+
+        let q = &second.circuit.bjts[0];
+        assert_eq!(q.model, "qp");
+        let qm = &second.circuit.bjt_models["qp"];
+        assert!(matches!(qm.kind, crate::circuit::BjtType::Npn));
+        assert_eq!(qm.is, 1e-14);
+        assert_eq!(qm.bf, 150.0);
+        assert_eq!(qm.nf, 1.02);
+        assert_eq!(qm.ikf, 5e-3);
+        assert_eq!(qm.ikr, 2e-3);
+        assert_eq!(qm.xtb, 0.5);
+        assert_eq!(qm.vaf, 50.0);
+        assert_eq!(qm.var, 2.0);
+        // The infinite defaults survive an emit that skips them.
+        let bare = parse("Q2 1 0 2 qb\n.model qb PNP(RB=10)\n.op\n.end\n").unwrap();
+        assert_eq!(bare.circuit.bjt_models["qb"].vaf, f64::INFINITY);
+        assert_eq!(bare.circuit.bjt_models["qb"].ikf, f64::INFINITY);
+        assert_eq!(bare.circuit.bjt_models["qb"].xtb, 0.0);
+
+        let j = &second.circuit.jfets[0];
+        assert_eq!(j.model, "jn");
+        assert_eq!(j.area, 2.0);
+        let jm = &second.circuit.jfet_models["jn"];
+        assert!(matches!(jm.kind, JfetType::Njf));
+        assert_eq!(jm.vto, -2.0);
+        assert_eq!(jm.beta, 1e-4);
+        assert_eq!(jm.cgs, 2e-12);
+        assert_eq!(jm.cgd, 1e-12);
+
+        let bs = &second.circuit.behavioral[0];
+        assert_eq!(bs.kind, BehavioralKind::Voltage);
+        assert_eq!(bs.expr, "V(1)*2");
+        assert_eq!(bs.behavior.probes.len(), 1);
 
         let m = &second.circuit.mosfets[0];
         assert_eq!(m.model, "nh");
@@ -4210,6 +4760,48 @@ mod tests {
         assert_eq!(second.analysis.tran_step, Some(parse_value("1u").unwrap()));
         assert_eq!(second.analysis.tran_stop, Some(parse_value("5m").unwrap()));
         assert!(second.analysis.dc_op);
+    }
+
+    /// TODO §3: the `.options` convergence knobs survive `parse(emit(parse))`
+    /// — they re-emit only when they differ from the engine defaults (so an
+    /// untouched deck's emitted text is unchanged) and the re-parse recovers
+    /// the very same field values. Compared as values, not text: f64 Display
+    /// writes 1e-10 as `0.0000000001` and the re-parse must read it back
+    /// exactly.
+    #[test]
+    fn options_convergence_knobs_round_trip() {
+        let netlist = parse(
+            "* stepped convergence knobs\n\
+             V1 a 0 DC 1\n\
+             R1 a b 1k\n\
+             .options gmin=1e-10 gminsteps=12 srcsteps=3 itl1=200 itl4=5\n\
+             .op\n\
+             .end\n",
+        )
+        .unwrap();
+        assert_eq!(netlist.analysis.gmin, 1e-10);
+        assert_eq!(netlist.analysis.gminsteps, 12);
+        assert_eq!(netlist.analysis.srcsteps, 3);
+        assert_eq!(netlist.analysis.itl1, 200);
+        assert_eq!(netlist.analysis.itl4, 5);
+
+        let text = emit(&netlist);
+        for knob in ["gmin=", "gminsteps=", "srcsteps=", "itl1=", "itl4="] {
+            assert!(text.contains(knob), "emit lost {knob}: {text}");
+        }
+        let reparsed = parse(&text).unwrap();
+        assert_eq!(reparsed.analysis.gmin, netlist.analysis.gmin);
+        assert_eq!(reparsed.analysis.gminsteps, netlist.analysis.gminsteps);
+        assert_eq!(reparsed.analysis.srcsteps, netlist.analysis.srcsteps);
+        assert_eq!(reparsed.analysis.itl1, netlist.analysis.itl1);
+        assert_eq!(reparsed.analysis.itl4, netlist.analysis.itl4);
+
+        // Default knobs stay silent in the emitted options line.
+        let plain = parse("* plain deck\n.op\n.end\n").unwrap();
+        let text = emit(&plain);
+        for knob in ["gmin=", "gminsteps=", "srcsteps=", "itl1=", "itl4="] {
+            assert!(!text.contains(knob), "default deck emitted {knob}: {text}");
+        }
     }
 
     /// `*` only comments out a line from its start: mid-line `*` is data
@@ -4802,13 +5394,12 @@ mod tests {
         assert!(matches!(p.kind, MosfetType::Pmos));
         assert_eq!(p.vth0, -0.7);
 
-        // Unknown family: stored with its parameters and tolerance slot.
-        let g = &circuit.generic_models["npn1"];
-        assert_eq!(g.spice_type, "npn");
-        assert_eq!(g.level, Some(1));
-        assert!(g.params.contains(&("bf".into(), 100.0)));
-        assert!(g.params.contains(&("is".into(), 8e-15)));
-        assert_eq!(g.tolerance.dev, Some((5.0, true)));
+        // BJT cards land in the typed slot with their tolerance.
+        let b = &circuit.bjt_models["npn1"];
+        assert!(matches!(b.kind, BjtType::Npn));
+        assert_eq!(b.bf, 100.0);
+        assert_eq!(b.is, 8e-15);
+        assert_eq!(b.tolerance.dev, Some((5.0, true)));
 
         // Element cards reference models case-insensitively.
         assert_eq!(circuit.diodes[0].model, "dmod");
@@ -4847,6 +5438,92 @@ mod tests {
         assert!(parse(".model m1 D(IS=fuzzy)\n.op\n.end\n").is_err());
         // Garbage LEVEL.
         assert!(parse(".model m1 NMOS(K=1 LEVEL=high)\n.op\n.end\n").is_err());
+    }
+
+    /// Passive model parasitics (`RSER`/`LSER`/`CPAR`/`RPAR`) materialize
+    /// into real element arms with internal nodes, and the emitted deck keeps
+    /// the same graph without re-splitting (`parse(emit(…))` is stable).
+    #[test]
+    fn passive_parasitics_expand_to_arms() {
+        let netlist = parse(
+            ".model cm CAP(C=1n RSER=2 CPAR=4p)\n\
+             .model rm R(RES=10 LSER=1 RPAR=100 TC1=0.1)\n\
+             C1 a b cm\n\
+             R1 b 0 rm\n\
+             V1 a 0 5\n\
+             .op\n\
+             .end\n",
+        )
+        .unwrap();
+        let circuit = &netlist.circuit;
+        // One resistor arm carries the capacitor's RSER between the card
+        // terminal and an internal node; the carrier keeps the internal node.
+        let arm = circuit
+            .resistors
+            .iter()
+            .find(|r| r.name == "RC1_RSER")
+            .expect("capacitor RSER arm");
+        assert_relative_eq!(arm.resistance, 2.0, epsilon = 1e-15);
+        // Carrier capacitor now hangs off the arm's internal node.
+        let carrier = &circuit.capacitors[0];
+        assert_eq!(carrier.capacitance, 0.0, "value comes from the model card");
+        assert_relative_eq!(
+            circuit.capacitance_at(carrier),
+            parse_value("1n").unwrap(),
+            epsilon = 1e-24
+        );
+        assert_eq!(
+            circuit.node_name(carrier.n1.0),
+            "C1.int",
+            "carrier moved to the internal junction"
+        );
+        assert_eq!(circuit.node_name(arm.n1.0), "a");
+        assert_eq!(circuit.node_name(arm.n2.0), "C1.int");
+        // CPAR rides the untouched external pair as a real capacitor.
+        let cpar = circuit
+            .capacitors
+            .iter()
+            .find(|c| c.name == "CC1_CPAR")
+            .expect("CPAR arm");
+        assert_relative_eq!(cpar.capacitance, parse_value("4p").unwrap(), epsilon = 1e-24);
+
+        // Inductor arm for the resistor carrier (LSER), parallel R.
+        let lser = circuit
+            .inductors
+            .iter()
+            .find(|l| l.name == "LR1_LSER")
+            .expect("resistor LSER arm");
+        assert_relative_eq!(lser.inductance, 1.0, epsilon = 1e-15);
+        let rpar = circuit
+            .resistors
+            .iter()
+            .find(|r| r.name == "RR1_RPAR")
+            .expect("RPAR arm");
+        assert_relative_eq!(rpar.resistance, 100.0, epsilon = 1e-15);
+        assert_eq!(circuit.node_name(rpar.n1.0), "b");
+        assert_eq!(circuit.node_name(rpar.n2.0), "0");
+        assert_eq!(
+            circuit.resistance_at(&circuit.resistors[0]),
+            10.0,
+            "carrier resistance unchanged"
+        );
+
+        // Round trip: the arms re-parse as plain cards and the parasitic
+        // slots are not reprinted, so the graph is stable.
+        let text = emit(&netlist);
+        assert!(text.contains("RC1_RSER"), "{text}");
+        assert!(!text.contains("RSER=2"), "slots must not double-print: {text}");
+        let second = parse(&text).unwrap();
+        let arm2 = second
+            .circuit
+            .resistors
+            .iter()
+            .find(|r| r.name == "RC1_RSER")
+            .expect("arm survives the round trip");
+        assert_relative_eq!(arm2.resistance, 2.0, epsilon = 1e-15);
+        assert_eq!(second.circuit.resistors.len(), circuit.resistors.len());
+        assert_eq!(second.circuit.capacitors.len(), circuit.capacitors.len());
+        assert_eq!(second.circuit.inductors.len(), circuit.inductors.len());
     }
 
     /// Unsupported parameters are carried as warnings, never fatal.
@@ -4934,12 +5611,13 @@ mod tests {
         .unwrap();
         assert_eq!(netlist.circuit.resistors.len(), 1);
         assert!(netlist.analysis.dc_op);
-        assert_eq!(netlist.warnings.len(), 3, "{:?}", netlist.warnings);
+        assert_eq!(netlist.warnings.len(), 2, "{:?}", netlist.warnings);
         assert!(netlist.warnings[0].contains(".probe"));
-        assert!(netlist.warnings[1].contains("'Q'"));
-        assert!(netlist.warnings[2].contains("stray"));
-        // The NPN card still imports into the generic slot.
-        assert!(netlist.circuit.generic_models.contains_key("qmod"));
+        assert!(netlist.warnings[1].contains("stray"));
+        // The `Q` card now parses as a real BJT against its model.
+        assert_eq!(netlist.circuit.bjts.len(), 1);
+        assert_eq!(netlist.circuit.bjts[0].model, "qmod");
+        assert!(netlist.circuit.bjt_models.contains_key("qmod"));
     }
 
     // ─── .ic / .nodeset ───────────────────────────────────────────────────────

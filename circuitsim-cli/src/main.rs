@@ -270,11 +270,17 @@ fn print_dc(report: &mut String, netlist: &Netlist, result: &SimulationResult) {
     for (cur, cs) in dc.branch_currents.current_sources.iter().zip(&net.current_sources) {
         let _ = writeln!(report, "  I({}) = {cur:.6e} A", cs.name);
     }
+    for (cur, b) in dc.branch_currents.behavioral.iter().zip(&net.behavioral) {
+        let _ = writeln!(report, "  I({}) = {cur:.6e} A", b.name);
+    }
     for (cur, d) in dc.branch_currents.diodes.iter().zip(&net.diodes) {
         let _ = writeln!(report, "  I({}) = {cur:.6e} A", d.name);
     }
     for (cur, q) in dc.branch_currents.bjts.iter().zip(&net.bjts) {
         let _ = writeln!(report, "  Ic({}) = {cur:.6e} A", q.name);
+    }
+    for (cur, j) in dc.branch_currents.jfets.iter().zip(&net.jfets) {
+        let _ = writeln!(report, "  Id({}) = {cur:.6e} A", j.name);
     }
     for (cur, r) in dc.branch_currents.resistors.iter().zip(&net.resistors) {
         let _ = writeln!(report, "  I({}) = {cur:.6e} A", r.name);
@@ -578,11 +584,17 @@ fn waveform_csv(netlist: &Netlist, result: &SimulationResult) -> String {
         for i in &net.current_sources {
             let _ = write!(out, ",I({})", i.name);
         }
+        for b in &net.behavioral {
+            let _ = write!(out, ",I({})", b.name);
+        }
         for d in &net.diodes {
             let _ = write!(out, ",I({})", d.name);
         }
         for m in &net.mosfets {
             let _ = write!(out, ",I({})", m.name);
+        }
+        for j in &net.jfets {
+            let _ = write!(out, ",Id({})", j.name);
         }
         for q in &net.bjts {
             let _ = write!(out, ",Ic({})", q.name);
@@ -608,10 +620,16 @@ fn waveform_csv(netlist: &Netlist, result: &SimulationResult) -> String {
             for v in &pt.branch_currents.current_sources {
                 let _ = write!(out, ",{v:.9e}");
             }
+            for v in &pt.branch_currents.behavioral {
+                let _ = write!(out, ",{v:.9e}");
+            }
             for v in &pt.branch_currents.diodes {
                 let _ = write!(out, ",{v:.9e}");
             }
             for v in &pt.branch_currents.mosfets {
+                let _ = write!(out, ",{v:.9e}");
+            }
+            for v in &pt.branch_currents.jfets {
                 let _ = write!(out, ",{v:.9e}");
             }
             for v in &pt.branch_currents.bjts {

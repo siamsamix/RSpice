@@ -24,7 +24,7 @@ pub struct ModelTolerance {
 }
 
 /// A `.model` card for a device family RSpice does not model yet (NPN/PNP
-/// transistors, JFETs, RES/CAP/IND cards, …). The full parameter list is
+/// transistors, RES/CAP/IND cards, …). The full parameter list is
 /// parsed and stored so third-party decks import cleanly; a future device
 /// letter consumes it through the same grammar.
 #[derive(Debug, Clone)]
@@ -258,6 +258,20 @@ impl DiodeModel {
         self.eval_for_at(vd, area, 27.0)
     }
 
+    /// Temperature-scaled saturation current:
+    /// `IS·(T/Tnom)^(XTI/N)·exp(EG/(N·Vt)·(T/Tnom − 1))` — the same law
+    /// [`Self::eval_for_at`] applies, published so the convergence limiter
+    /// can size the junction's critical voltage at the running temperature.
+    pub fn is_at(&self, temp_c: f64) -> f64 {
+        let vt = thermal_voltage(temp_c);
+        let t = ZERO_CELSIUS_K + temp_c;
+        let tnom = ZERO_CELSIUS_K + self.tnom;
+        let ratio = t / tnom;
+        self.is
+            * ratio.powf(self.xti / self.n)
+            * (self.eg / (self.n * vt) * (ratio - 1.0)).exp()
+    }
+
     /// Temperature-aware evaluation: the saturation current follows the
     /// SPICE temperature law
     /// `IS(T) = IS·(T/Tnom)^(XTI/N)·exp(EG/(N·Vt)·(T/Tnom − 1))`,
@@ -276,13 +290,7 @@ impl DiodeModel {
         };
         let vd = vd.clamp(lower, VD_CLAMP_MAX);
         let vt_n = self.n * vt;
-        let t = ZERO_CELSIUS_K + temp_c;
-        let tnom = ZERO_CELSIUS_K + self.tnom;
-        let ratio = t / tnom;
-        let is_t = self.is
-            * ratio.powf(self.xti / self.n)
-            * (self.eg / (self.n * vt) * (ratio - 1.0)).exp();
-        let is_eff = is_t * area;
+        let is_eff = self.is_at(temp_c) * area;
         let exp_term = (vd / vt_n).exp();
         let mut i_d = is_eff * (exp_term - 1.0);
         let mut gd = (is_eff / vt_n) * exp_term;
@@ -404,6 +412,12 @@ pub struct BjtModel {
     pub vaf: f64,
     /// Reverse Early voltage VAR (V).
     pub var: f64,
+    /// Forward knee current IKF (A): for finite values the Gummel–Poon base
+    /// charge gains the high-current quadrature `q₂ = I_f/IKF`, which rolls
+    /// βF off as βF even rolls off below the knee. Infinite = disabled.
+    pub ikf: f64,
+    /// Reverse knee current IKR (A); mirrors IKF for the reverse junction.
+    pub ikr: f64,
     /// B-E leakage saturation current ISE (A).
     pub ise: f64,
     /// B-E leakage emission coefficient NE.
@@ -436,6 +450,9 @@ pub struct BjtModel {
     pub tr: f64,
     /// Saturation-current temperature exponent XTI.
     pub xti: f64,
+    /// Beta temperature exponent XTB: at device temperature T the forward
+    /// and reverse betas scale as β·(T/Tnom)^XTB. 0 = no beta drift.
+    pub xtb: f64,
     /// Bandgap energy EG (eV).
     pub eg: f64,
     /// Nominal temperature TNOM (°C).
@@ -459,6 +476,8 @@ impl Default for BjtModel {
             nr: 1.0,
             vaf: f64::INFINITY,
             var: f64::INFINITY,
+            ikf: f64::INFINITY,
+            ikr: f64::INFINITY,
             ise: 0.0,
             ne: 1.5,
             isc: 0.0,
@@ -475,6 +494,7 @@ impl Default for BjtModel {
             tf: 0.0,
             tr: 0.0,
             xti: 3.0,
+            xtb: 0.0,
             eg: 1.11,
             tnom: 27.0,
             kf: 0.0,
@@ -501,6 +521,17 @@ impl BjtModel {
         let tnom = ZERO_CELSIUS_K + self.tnom;
         let ratio = t / tnom;
         self.is * ratio.powf(self.xti) * (self.eg / vt * (ratio - 1.0)).exp()
+    }
+
+    /// Temperature-scaled betas: the XTB exponent multiplies both the forward
+    /// and the reverse gain with `(T/Tnom)^XTB`, evaluated at the device
+    /// temperature like every other model temperature effect.
+    fn beta_at(&self, temp_c: f64) -> (f64, f64) {
+        let t = ZERO_CELSIUS_K + temp_c;
+        let tnom = ZERO_CELSIUS_K + self.tnom;
+        let ratio = t / tnom;
+        let mult = ratio.powf(self.xtb);
+        (self.bf * mult, self.br * mult)
     }
 
     /// Junction capacitance at `v` for one junction, area-scaled and
@@ -543,6 +574,16 @@ impl BjtModel {
     ///
     /// PNP devices are mirrored into the NPN normalization and their terminal
     /// currents are negated back, exactly as the MOSFET path does.
+    ///
+    /// **Base charge.** `qb` is the Gummel number: the Early-effect line
+    /// `q1 = 1 − Vbc/VAF − Vbe/VAR` plus the high-current quadrature
+    /// `q2 = I_f/IKF + I_r/IKR` (each term only when its knee is finite and
+    /// positive; knee values scale with AREA like `IS`). The full quadratic
+    /// `qb = ½(q1 + √(q1² + 4·q2))` keeps the Early effect smooth and rolls
+    /// β off above the knee currents, and q2 = 0 reduces it bit-exactly to
+    /// `q1`. Sub-`1e-3`/non-finite results clamp to `1e-3`, which caps the
+    /// transport current when a bias has driven the base empty or a
+    /// degenerate Early value makes q1 go non-positive.
     pub fn currents(
         &self,
         vbe_real: f64,
@@ -555,24 +596,223 @@ impl BjtModel {
         let vbc = (sign * vbc_real).clamp(-100.0, 0.8);
         let vt = thermal_voltage(temp_c);
         let is = self.is_at(temp_c) * area;
+        let (bf, br) = self.beta_at(temp_c);
 
         let i_f = is * ((vbe / (self.nf * vt)).exp() - 1.0);
         let i_r = is * ((vbc / (self.nr * vt)).exp() - 1.0);
         let i_se = self.ise * area * ((vbe / (self.ne * vt)).exp() - 1.0);
         let i_sc = self.isc * area * ((vbc / (self.nc * vt)).exp() - 1.0);
 
-        // Gummel-Poon base charge factor; clamped so a bias outside the Early
-        // voltages cannot flip the transport current's sign.
-        let mut qb = 1.0 - vbc / self.vaf - vbe / self.var;
+        // High-current quadrature: each knee joins only when finite and
+        // positive, and it scales with AREA so a bigger device keeps the same
+        // β-rolloff shape.
+        let mut q2 = 0.0;
+        if self.ikf > 0.0 && self.ikf.is_finite() {
+            q2 += i_f / (self.ikf * area);
+        }
+        if self.ikr > 0.0 && self.ikr.is_finite() {
+            q2 += i_r / (self.ikr * area);
+        }
+        let q1 = 1.0 - vbc / self.vaf - vbe / self.var;
+        let mut qb = 0.5 * (q1 + (q1 * q1 + 4.0 * q2).sqrt());
         if !qb.is_finite() || qb <= 1e-3 {
             qb = 1e-3;
         }
-        let i_ct = (i_f - i_r) / qb;
 
-        let ib = i_f / self.bf + i_r / self.br + i_se + i_sc;
-        let ic = i_ct - i_r / self.br - i_sc;
+        let i_ct = (i_f - i_r) / qb;
+        let ib = i_f / bf + i_r / br + i_se + i_sc;
+        let ic = i_ct - i_r / br - i_sc;
         let ie = -(ic + ib);
         BjtCurrents { ic: sign * ic, ib: sign * ib, ie: sign * ie }
+    }
+}
+
+// ─── JFET ───────────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum JfetType {
+    /// N-channel JFET (`NJF` model keyword).
+    Njf,
+    /// P-channel JFET (`PJF` model keyword).
+    Pjf,
+}
+
+/// Level-1 (quadratic channel) JFET model parameters, per the standard SPICE
+/// `.MODEL NJF/PJF` card syntax.
+///
+/// The complete common parameter list is parsed (TODO §2 "full model-card
+/// grammar"); the doping-tail shaping term `B` is stored for round-tripping,
+/// the quadratic equations themselves use [`JfetModel::beta`] directly (a
+/// `B = 1` steel default behaves identically either way).
+#[derive(Debug, Clone)]
+pub struct JfetModel {
+    pub kind: JfetType,
+    /// Pinch-off threshold VTO (V), stored with its card sign (negative,
+    /// default −2.0 — for both NJF and PJF; the polarity mapping below makes
+    /// the same value sensible for either channel type).
+    pub vto: f64,
+    /// Transconductance parameter β (A/V²).
+    pub beta: f64,
+    /// Channel-length modulation λ (1/V). 0 = ideal.
+    pub lambda: f64,
+    /// Doping-tail shaping B — parsed and round-tripped, not consumed.
+    pub b: f64,
+    /// Gate-junction saturation current IS (A).
+    pub is: f64,
+    /// Drain parasitic resistance RD (Ω) — materialized into a follower
+    /// resistor arm by `Circuit::expand_jfet_series_resistance`.
+    pub rd: f64,
+    /// Source parasitic resistance RS (Ω) — same expansion.
+    pub rs: f64,
+    /// Zero-bias gate–source capacitance CGS (F).
+    pub cgs: f64,
+    /// Zero-bias gate–drain capacitance CGD (F).
+    pub cgd: f64,
+    /// Gate-junction potential PB (V).
+    pub pb: f64,
+    /// Forward-bias depletion-capacitance linearization fraction FC.
+    pub fc: f64,
+    /// Saturation-current temperature exponent XTI.
+    pub xti: f64,
+    /// Activation energy EG (eV).
+    pub eg: f64,
+    /// Nominal temperature TNOM (°C).
+    pub tnom: f64,
+    /// Flicker noise coefficient KF.
+    pub kf: f64,
+    /// Flicker noise exponent AF.
+    pub af: f64,
+    /// Reserved Monte-Carlo tolerance slots.
+    pub tolerance: ModelTolerance,
+}
+
+impl Default for JfetModel {
+    fn default() -> Self {
+        Self {
+            kind: JfetType::Njf,
+            vto: -2.0,
+            beta: 1e-4,
+            lambda: 0.0,
+            b: 1.0,
+            is: 1e-14,
+            rd: 0.0,
+            rs: 0.0,
+            cgs: 0.0,
+            cgd: 0.0,
+            pb: 1.0,
+            fc: 0.5,
+            xti: 3.0,
+            eg: 1.11,
+            tnom: 27.0,
+            kf: 0.0,
+            af: 1.0,
+            tolerance: ModelTolerance::default(),
+        }
+    }
+}
+
+/// Terminal currents at one bias, in the element convention
+/// (`Id` into the drain, `Ig` into the gate, `Is` into the source).
+#[derive(Debug, Clone, Copy)]
+pub struct JfetCurrents {
+    pub id: f64,
+    pub ig: f64,
+    pub is: f64,
+}
+
+impl JfetModel {
+    /// Temperature-scaled gate-junction saturation current (same law as the
+    /// diode and BJT IS).
+    pub fn is_at(&self, temp_c: f64) -> f64 {
+        let vt = thermal_voltage(temp_c);
+        let t = ZERO_CELSIUS_K + temp_c;
+        let tnom = ZERO_CELSIUS_K + self.tnom;
+        let ratio = t / tnom;
+        self.is * ratio.powf(self.xti) * (self.eg / vt * (ratio - 1.0)).exp()
+    }
+
+    /// Gate-junction depletion capacitance at the *normalized* bias `v`,
+    /// area-scaled and linearized above `FC·PB` (grading coefficient 0.5).
+    fn gate_cap(c0: f64, pb: f64, v: f64, area: f64, fc: f64) -> f64 {
+        if c0 <= 0.0 {
+            return 0.0;
+        }
+        let pb = pb.max(1e-9);
+        let fc = fc.clamp(0.0, 0.99);
+        let cap0 = c0 * area;
+        if v < fc * pb {
+            cap0 * (1.0 - v / pb).max(1e-9).powf(-0.5)
+        } else {
+            cap0 * (1.0 - fc).powf(-0.5)
+        }
+    }
+
+    /// Gate–source capacitance at the card-space bias `vgs`.
+    pub fn cgs_at(&self, vgs_real: f64, area: f64) -> f64 {
+        let v = if self.kind == JfetType::Pjf { -vgs_real } else { vgs_real };
+        Self::gate_cap(self.cgs, self.pb, v, area, self.fc)
+    }
+
+    /// Gate–drain capacitance at the card-space bias `vgd`.
+    pub fn cgd_at(&self, vgd_real: f64, area: f64) -> f64 {
+        let v = if self.kind == JfetType::Pjf { -vgd_real } else { vgd_real };
+        Self::gate_cap(self.cgd, self.pb, v, area, self.fc)
+    }
+
+    /// Evaluate the level-1 JFET terminal currents at real gate biases.
+    ///
+    /// **Polarity mapping.** The quadratic is written for an n-channel device.
+    /// A `PJF` mirrors its two gate biases (`vgs`, `vgd`) into that space and
+    /// the returned terminal currents are negated back, exactly like the BJT
+    /// PNP path. VTO keeps its card sign in both spaces: with the default
+    /// negative VTO an NJF conducts when `vgs > VTO` and a PJF conducts when
+    /// `vgs < −VTO` (its gate below the pinch-off level), so one card value
+    /// and one set of region tests cover both polarities.
+    ///
+    /// **Conventions.** Internal branch currents: the channel `Ids` flows
+    /// drain → source, the gate junctions conduct gate → source and gate →
+    /// drain. Terminal currents (element convention, positive *into* the
+    /// device) then read `Id = Ids − Igd`, `Ig = Igs + Igd`,
+    /// `Is = −(Ids + Igs)`, and the mirror flips all three.
+    pub fn currents(
+        &self,
+        vgs_real: f64,
+        vgd_real: f64,
+        area: f64,
+        temp_c: f64,
+    ) -> JfetCurrents {
+        let sign = if self.kind == JfetType::Pjf { -1.0 } else { 1.0 };
+        let vgs = sign * vgs_real;
+        let vgd = sign * vgd_real;
+        let vt = thermal_voltage(temp_c);
+        let is = self.is_at(temp_c) * area;
+        let beta = self.beta * area;
+
+        // Quadratic channel: piecewise on the normalized overdrive
+        // `vgst = vgs − vto` and the drain bias. A negative `vds` falls into
+        // the triode branch, which keeps the reverse quadrant smooth (same
+        // treatment as the level-1 MOSFET).
+        let vgst = vgs - self.vto;
+        let cid = if vgst <= 0.0 {
+            0.0
+        } else if vgd <= self.vto {
+            // Constant-current region: vds ≥ vgst (a positive vds is implied).
+            0.5 * beta * vgst * vgst * (1.0 + self.lambda * (vgs - vgd))
+        } else {
+            let vds = vgs - vgd;
+            beta * (vgst - 0.5 * vds) * vds * (1.0 + self.lambda * vds)
+        };
+
+        // Gate junctions: two diodes with emission coefficient 1, relaxed
+        // above 0.8 V like the diode model (keeps exp() finite; phase 7's
+        // junction limiting will generalize this).
+        let igs = is * ((vgs.min(0.8) / vt).exp() - 1.0);
+        let igd = is * ((vgd.min(0.8) / vt).exp() - 1.0);
+
+        let id = sign * (cid - igd);
+        let ig = sign * (igs + igd);
+        let is_src = sign * -(cid + igs);
+        JfetCurrents { id, ig, is: is_src }
     }
 }
 
@@ -860,5 +1100,322 @@ mod tests {
         assert_relative_eq!(ev.gds, 3.6e-4, max_relative = 1e-12);
         assert_eq!(ev.gbs, 0.0); // γ = 0 here; other tests cover γ < 0 corners
         assert_relative_eq!(ev.i_eq, 2.5e-5, max_relative = 1e-12);
+    }
+
+    // NJF card: VTO = −2, BETA = 1e-4 (area 1), λ = 0, IS = 1e-14 — see
+    // test_jfet(). Igs/Igd at these reverse biases are −IS to double
+    // precision; the 15-digit references below carry the junction terms so
+    // the quadratic and the gate diodes are both exercised.
+
+    /// Test JFET card (NJF defaults with β pinned to 1e-4).
+    fn test_jfet() -> JfetModel {
+        JfetModel {
+            kind: JfetType::Njf,
+            vto: -2.0,
+            beta: 1e-4,
+            lambda: 0.0,
+            b: 1.0,
+            is: 1e-14,
+            rd: 0.0,
+            rs: 0.0,
+            cgs: 0.0,
+            cgd: 0.0,
+            pb: 1.0,
+            fc: 0.5,
+            xti: 3.0,
+            eg: 1.11,
+            tnom: 27.0,
+            kf: 0.0,
+            af: 1.0,
+            tolerance: ModelTolerance { dev: None, lot: None },
+        }
+    }
+
+    #[test]
+    fn jfet_cutoff_reports_leakage_only() {
+        // Deep-cutoff gate (vgst = vgs − vto = −0.9): channel current zero,
+        // both gate junctions reverse to −IS·area.
+        let model = test_jfet();
+        let c = model.currents(-2.9, -8.9, 1.0, 27.0);
+        assert_eq!(c.id, 1e-14); // −Igd: the drain-gate junction leaks into the drain
+        assert_relative_eq!(c.ig, -2.0e-14, max_relative = 1e-12);
+        assert_relative_eq!(c.is, 1e-14, max_relative = 1e-12);
+    }
+
+    #[test]
+    fn jfet_saturation_ideal_lambda_zero() {
+        // vgs = −1.5 → vgst = 0.5; vgd = −6.5 ≤ vto: saturated.
+        // cid = ½·β·vgst² = 1.25e-5; Id adds the −Igd leakage (+1e-14).
+        let model = test_jfet();
+        let c = model.currents(-1.5, -6.5, 1.0, 27.0);
+        assert_relative_eq!(c.id, 1.250000001e-5, max_relative = 1e-12);
+        assert_relative_eq!(c.ig, -2.0e-14, max_relative = 1e-12);
+        assert_relative_eq!(c.is, -1.249999999e-5, max_relative = 1e-12);
+    }
+
+    #[test]
+    fn jfet_triode_ideal_lambda_zero() {
+        // vgs = −1.5, vgd = −1.8: vds = 0.3 < vgst = 0.5 → triode,
+        // cid = β·(vgst − vds/2)·vds = 1.05e-5.
+        let model = test_jfet();
+        let c = model.currents(-1.5, -1.8, 1.0, 27.0);
+        assert_relative_eq!(c.id, 1.050000001e-5, max_relative = 1e-12);
+        assert_relative_eq!(c.ig, -2.0e-14, max_relative = 1e-12);
+        assert_relative_eq!(c.is, -1.049999999e-5, max_relative = 1e-12);
+    }
+
+    #[test]
+    fn jfet_reverse_vds_flows_source_to_drain() {
+        // vgs = −1.5, vgd = −1.0: vds = −0.5 → the triode quadrilateral
+        // evaluated directly: cid = β·(0.5 − (−0.25))·(−0.5) = −3.75e-5,
+        // i.e. the normalized channel current reverses sign continuously.
+        let model = test_jfet();
+        let c = model.currents(-1.5, -1.0, 1.0, 27.0);
+        assert_relative_eq!(c.id, -3.749999999e-5, max_relative = 1e-12);
+        assert_relative_eq!(c.ig, -2.0e-14, max_relative = 1e-12);
+        assert_relative_eq!(c.is, 3.750000001e-5, max_relative = 1e-12);
+    }
+
+    #[test]
+    fn jfet_lambda_scales_the_saturation_current() {
+        // λ = 0.1: cid = ½·β·vgst²·(1 + λ·vds) with vds = vgs − vgd = 4.5:
+        // 1.25e-5·1.45 = 1.8125e-5.
+        let mut model = test_jfet();
+        model.lambda = 0.1;
+        let c = model.currents(-1.5, -6.0, 1.0, 27.0);
+        assert_relative_eq!(c.id, 1.812500001e-5, max_relative = 1e-12);
+        assert_relative_eq!(c.is, -1.812499999e-5, max_relative = 1e-12);
+    }
+
+    #[test]
+    fn jfet_area_scales_both_channel_and_junction() {
+        // AREA = 2: β and IS both double — cid = 2.5e-5, one junction
+        // contributes −2e-14 per gate branch.
+        let model = test_jfet();
+        let c = model.currents(-1.5, -6.5, 2.0, 27.0);
+        assert_relative_eq!(c.id, 2.500000002e-5, max_relative = 1e-12);
+    }
+
+    #[test]
+    fn pjf_mirrors_njf_terminal_currents() {
+        // PJF with VTO = −2 conducting at card-space vgs < 2: a vgs = +1.5,
+        // vgd = +6.5 bias mirrors to the saturated NJF case, and every
+        // terminal current flips sign.
+        let njf = test_jfet();
+        let mut pjf = test_jfet();
+        pjf.kind = JfetType::Pjf;
+        let n = njf.currents(-1.5, -6.5, 1.0, 27.0);
+        let p = pjf.currents(1.5, 6.5, 1.0, 27.0);
+        assert_relative_eq!(p.id, -n.id, max_relative = 1e-14);
+        assert_relative_eq!(p.ig, -n.ig, max_relative = 1e-14);
+        assert_relative_eq!(p.is, -n.is, max_relative = 1e-14);
+    }
+
+    #[test]
+    fn jfet_gate_capacitance_follows_the_depletion_law() {
+        // CGS = 4p, PB = 1, FC = 0.5: unbiased (1+0)^−0.5 = 4p, reverse at
+        // −3 V ((1+3)^−0.5 = ½), forward-saturated above FC·PB = 0.5 V
+        // ((1−0.5)^−0.5 = √2), area-scaled across both.
+        let mut model = test_jfet();
+        model.cgs = 4e-12;
+        assert_relative_eq!(model.cgs_at(0.0, 1.0), 4e-12, max_relative = 1e-15);
+        assert_relative_eq!(model.cgs_at(-3.0, 1.0), 2e-12, max_relative = 1e-15);
+        assert_relative_eq!(model.cgs_at(1.0, 1.0), 5.65685424949238e-12, max_relative = 1e-13);
+        assert_relative_eq!(model.cgs_at(0.0, 2.0), 8e-12, max_relative = 1e-15);
+        // PJF reads the mirrored bias: card-space +3 has the same depletion.
+        model.kind = JfetType::Pjf;
+        assert_relative_eq!(model.cgs_at(3.0, 1.0), 2e-12, max_relative = 1e-15);
+        // CGD shares the same law on its own zero-bias slot.
+        let mut model = test_jfet();
+        model.cgd = 4e-12;
+        assert_relative_eq!(model.cgd_at(-3.0, 1.0), 2e-12, max_relative = 1e-15);
+    }
+
+    #[test]
+    fn jfet_temperature_scales_the_gate_junction() {
+        // Same XTI/EG law as the diode/BJT IS (EG referenced against VT at
+        // *the* device temperature, hence the cubic+exponential timing):
+        // 15-digit reference at 127 °C.
+        let model = test_jfet();
+        let hot = model.is_at(127.0);
+        assert_relative_eq!(hot, 1.0773873327818624e-9, max_relative = 1e-12);
+        assert_relative_eq!(model.is_at(27.0), 1e-14, max_relative = 1e-14);
+    }
+
+    // NPN card: IS = 1e-14, BF = 100, BR = 1, NF = NR = 1, no Early/Ik/XTB —
+    // see test_bjt(). The 15-digit references below were derived from the
+    // same op order the evaluator uses (VT(27 °C) = 0.025864925786328753).
+
+    /// Test BJT card (NPN defaults with IS pinned to 1e-14).
+    fn test_bjt() -> BjtModel {
+        BjtModel {
+            kind: BjtType::Npn,
+            is: 1e-14,
+            bf: 100.0,
+            br: 1.0,
+            nf: 1.0,
+            nr: 1.0,
+            vaf: f64::INFINITY,
+            var: f64::INFINITY,
+            ikf: f64::INFINITY,
+            ikr: f64::INFINITY,
+            ise: 0.0,
+            ne: 1.5,
+            isc: 0.0,
+            nc: 2.0,
+            rb: 0.0,
+            rc: 0.0,
+            re: 0.0,
+            cje: 0.0,
+            vje: 0.75,
+            mje: 0.33,
+            cjc: 0.0,
+            vjc: 0.75,
+            mjc: 0.33,
+            tf: 0.0,
+            tr: 0.0,
+            xti: 3.0,
+            xtb: 0.0,
+            eg: 1.11,
+            tnom: 27.0,
+            kf: 0.0,
+            af: 1.0,
+            tolerance: ModelTolerance { dev: None, lot: None },
+        }
+    }
+
+    #[test]
+    fn bjt_forward_active_default_matches_ebers_moll() {
+        // vbe = 0.65, vbc = −1 (inverse junction off): I_f = 8.20469366005e-4,
+        // qb = 1 with all extras off, and the terminal split follows the
+        // classic gp form ic = (I_f − I_r) − I_r/BR.
+        let model = test_bjt();
+        let c = model.currents(0.65, -1.0, 1.0, 27.0);
+        assert_relative_eq!(c.ic, 0.0008204693660249209, max_relative = 1e-12);
+        assert_relative_eq!(c.ib, 8.204693650049208e-6, max_relative = 1e-12);
+        assert_relative_eq!(c.ie, -0.0008286740596749701, max_relative = 1e-12);
+    }
+
+    #[test]
+    fn bjt_saturation_and_cutoff_corners() {
+        // Both junctions forward (vbe = 0.7, vbc = 0.4): I_f = 5.67e-3 and
+        // I_r = 5.204e-8 — the collector absorbs the reverse inject.
+        let model = test_bjt();
+        let c = model.currents(0.7, 0.4, 1.0, 27.0);
+        assert_relative_eq!(c.ic, 0.00567019060143509, max_relative = 1e-12);
+        assert_relative_eq!(c.ib, 5.675498787803647e-5, max_relative = 1e-12);
+        // Both junctions reverse: nothing but the −IS dribbles.
+        let c = model.currents(-0.5, -3.0, 1.0, 27.0);
+        assert_relative_eq!(c.ic, 1.000000004023161e-14, max_relative = 1e-12);
+        assert_relative_eq!(c.ib, -1.0099999999597683e-14, max_relative = 1e-12);
+        assert_relative_eq!(c.ie, 9.99999593660738e-17, max_relative = 1e-12);
+    }
+
+    #[test]
+    fn bjt_reverse_active_beta_r_shows_up_in_the_emitter() {
+        // Reverse active (vbe = 0, vbc = 0.7): the emitter becomes the output
+        // terminal, so |Ie/Ib| = BR — while the collector terminal carries the
+        // transport plus its own junction inject: ic = −2·I_r at BR = 1.
+        let model = test_bjt();
+        let c = model.currents(0.0, 0.7, 1.0, 27.0);
+        assert_relative_eq!(c.ic, -0.011340589367041498, max_relative = 1e-12);
+        assert_relative_eq!(c.ib, 0.005670294683520749, max_relative = 1e-12);
+        assert_relative_eq!(c.ie, 0.005670294683520749, max_relative = 1e-12);
+    }
+
+    #[test]
+    fn bjt_early_effect_scales_the_transport() {
+        // VAF = 10 with vbc = −1: q1 = 1.1 — the graded base stretches the
+        // transport current down by exactly that factor.
+        let mut model = test_bjt();
+        model.vaf = 10.0;
+        let c = model.currents(0.65, -1.0, 1.0, 27.0);
+        assert_relative_eq!(c.ic, 0.0007458812418417462, max_relative = 1e-12);
+    }
+
+    #[test]
+    fn bjt_base_charge_clamps_past_the_early_collapse() {
+        // VAF = 0.5 with vbc = +2 (clamped to the 0.8 V exponential guard):
+        // q1 = −0.6, so the clamp drops qb to the 1e-3 floor and the
+        // transport current runs a fixed 1000× — the degenerate-corner answer
+        // both the old linear form and the quadratic agree on.
+        let mut model = test_bjt();
+        model.vaf = 0.5;
+        let c = model.currents(0.65, 2.0, 1.0, 27.0);
+        assert_relative_eq!(c.ic, -270.2774757068337, max_relative = 1e-12);
+        assert_relative_eq!(c.ib, 0.2708353226485438, max_relative = 1e-12);
+    }
+
+    #[test]
+    fn bjt_ikf_rolls_beta_off_above_the_knee() {
+        // IKF = 1 mA with vbe = 0.7: I_f = 5.67e-3 pushes the quadrature to
+        // q2 = 5.67 → qb = 2.933… and the transport lands at 1.93 mA instead
+        // of the qb = 1 value 5.66 mA.
+        let mut model = test_bjt();
+        model.ikf = 1e-3;
+        let c = model.currents(0.7, -1.0, 1.0, 27.0);
+        assert_relative_eq!(c.ic, 0.0019331655684696023, max_relative = 1e-12);
+        assert_relative_eq!(c.ib, 5.6702946825207485e-5, max_relative = 1e-12);
+        // Well below the knee (vbe = 0.6 → I_f = 1.19e-4): q2 = 1.19e-4 lifts
+        // qb to 1.1072 — already a 10% rolloff tail against the no-knee
+        // value: pin it, then check that a knee a billion times bigger lands
+        // back on the no-knee transport current to 1e-9.
+        let below = model.currents(0.6, -1.0, 1.0, 27.0);
+        assert_relative_eq!(below.ic, 0.00010722211275203386, max_relative = 1e-12);
+        let mut wide_knee = test_bjt();
+        wide_knee.ikf = 1e9;
+        let wide = wide_knee.currents(0.6, -1.0, 1.0, 27.0);
+        assert_relative_eq!(wide.ic, 0.00011871869421193088, max_relative = 1e-9);
+    }
+
+    #[test]
+    fn bjt_ikr_mirrors_ikf_into_reverse_mode() {
+        // IKR = 1 mA, reverse driven (vbe = 0, vbc = 0.7): the quadrature
+        // grows on I_r exactly like IKF does on I_f.
+        let mut model = test_bjt();
+        model.ikr = 1e-3;
+        let c = model.currents(0.0, 0.7, 1.0, 27.0);
+        assert_relative_eq!(c.ic, -0.007603460251976942, max_relative = 1e-12);
+        assert_relative_eq!(c.ib, 0.005670294683520749, max_relative = 1e-12);
+    }
+
+    #[test]
+    fn bjt_ikf_scales_with_area() {
+        // AREA = 2 doubles I_f and IKF together, so qb (and hence the
+        // rolloff *shape*) is size-independent: the transport current just
+        // doubles.
+        let mut model = test_bjt();
+        model.ikf = 1e-3;
+        let c = model.currents(0.7, -1.0, 2.0, 27.0);
+        assert_relative_eq!(c.ic, 0.0038663311369392045, max_relative = 1e-12);
+    }
+
+    #[test]
+    fn bjt_xtb_pulls_beta_with_temperature() {
+        // XTB = 1 at 127 °C: β_f = 100·(400.15/300.15) = 133.3167 — I_b drops
+        // accordingly while the transport current (IS law) is untouched by
+        // XTB. At nominal temperature the powf is exactly 1: xtb = 1 matches
+        // the default forward-active pin bit-for-bit.
+        let mut model = test_bjt();
+        model.xtb = 1.0;
+        let cold = model.currents(0.65, -1.0, 1.0, 27.0);
+        assert_relative_eq!(cold.ic, 0.0008204693660249209, max_relative = 1e-14);
+        let hot = model.currents(0.65, -1.0, 1.0, 127.0);
+        assert_relative_eq!(hot.ic, 0.16555467718751848, max_relative = 1e-12);
+        assert_relative_eq!(hot.ib, 0.0012418144059505537, max_relative = 1e-12);
+    }
+
+    #[test]
+    fn pnp_mirrors_npn_terminal_currents() {
+        // The PNP path mirrors both junction biases and negates every
+        // terminal current back, like the PNP/PJF element paths.
+        let npn = test_bjt();
+        let mut pnp = test_bjt();
+        pnp.kind = BjtType::Pnp;
+        let n = npn.currents(0.65, -1.0, 1.0, 27.0);
+        let p = pnp.currents(-0.65, 1.0, 1.0, 27.0);
+        assert_relative_eq!(p.ic, -n.ic, max_relative = 1e-14);
+        assert_relative_eq!(p.ib, -n.ib, max_relative = 1e-14);
+        assert_relative_eq!(p.ie, -n.ie, max_relative = 1e-14);
     }
 }

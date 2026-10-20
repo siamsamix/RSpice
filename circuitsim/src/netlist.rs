@@ -503,3 +503,64 @@ pub fn emit(netlist: &Netlist) -> String {
     out.push_str(".end\n");
     out
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `parse(emit(x))` preserves the language-relevant facts of a
+    /// representative netlist: elements, model cards, waveforms, commands.
+    #[test]
+    fn emit_round_trips_through_parse() {
+        let src = "* roundtrip\n\
+                   .model dino D(IS=1e-14 N=1.05)\n\
+                   .model nh NMOS(KP=2e-4 VTH0=0.7 LAMBDA=0.02 GAMMA=0.5 PHI=0.6)\n\
+                   R1 1 0 1k\n\
+                   C1 1 2 1u\n\
+                   L1 2 0 1m\n\
+                   D1 1 0 dino\n\
+                   M1 2 1 0 0 nh W=2u L=0.18u\n\
+                   VS 1 0 DC 5 AC 1 30 PULSE(0 5 1u 2u 2u 5u 10u)\n\
+                   .op\n\
+                   .tran 1u 5m\n\
+                   .ac DEC 10 1 10k\n\
+                   .end\n";
+        let first = parse(src).expect("first parse");
+        let text = emit(&first);
+        let second = parse(&text).expect("re-parse of emitted text");
+
+        assert_eq!(second.circuit.nodes, first.circuit.nodes);
+        assert_eq!(second.circuit.resistors.len(), 1);
+        assert_eq!(second.circuit.capacitors.len(), 1);
+        assert_eq!(second.circuit.inductors.len(), 1);
+        assert_eq!(second.circuit.diodes.len(), 1);
+        assert_eq!(second.circuit.mosfets.len(), 1);
+        assert_eq!(second.circuit.voltage_sources.len(), 1);
+
+        let m = &second.circuit.mosfets[0];
+        assert_eq!(m.model, "nh");
+        assert_eq!(m.w, parse_value("2u").unwrap());
+        assert_eq!(m.l, parse_value("0.18u").unwrap());
+
+        let v = &second.circuit.voltage_sources[0];
+        assert_eq!(v.voltage, 5.0);
+        let ac = v.ac.as_ref().unwrap();
+        assert_eq!(ac.mag, 1.0);
+        assert_eq!(ac.phase, 30.0);
+        let pulse = v.pulse.as_ref().unwrap();
+        assert_eq!(pulse.v1, 0.0);
+        assert_eq!(pulse.v2, 5.0);
+        // 10×1e-6 is not bit-identical to the 10e-6 literal, so compare against
+        // what the parser actually produced: the round trip must be exact.
+        assert_eq!(pulse.per, parse_value("10u").unwrap());
+
+        let a = second.analysis.ac.as_ref().unwrap();
+        assert!(matches!(a.scale, AcScale::Dec));
+        assert_eq!(a.points, 10);
+        assert_eq!(a.f_start, 1.0);
+        assert_eq!(a.f_stop, parse_value("10k").unwrap());
+        assert_eq!(second.analysis.tran_step, Some(parse_value("1u").unwrap()));
+        assert_eq!(second.analysis.tran_stop, Some(parse_value("5m").unwrap()));
+        assert!(second.analysis.dc_op);
+    }
+}

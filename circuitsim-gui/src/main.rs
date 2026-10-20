@@ -1,4 +1,5 @@
 mod app;
+mod schematic;
 mod theme;
 
 use app::CircuitSimApp;

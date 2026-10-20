@@ -1,11 +1,13 @@
+use circuitsim::circuit::{Capacitor as CsCapacitor, Circuit as CsCircuit, Inductor as CsInductor, NodeId, Resistor as CsResistor, VoltageSource as CsVoltageSource};
+use circuitsim::netlist::{emit as netlist_emit, AcCommand, AcScale, AnalysisCommands, Netlist};
+use circuitsim::units::parse_value;
 use circuitsim::{parse, run, AcResult, DcResult, SimulationResult, TranResult};
 use egui;
 use egui_plot::{Legend, Line, Plot, PlotPoints};
 
-use std::collections::{HashMap, HashSet};
+use crate::schematic::{CompKind, Component, GridPt, NodeAssignment, Wire, GRID_SIZE};
+use std::collections::HashMap;
 use egui::{Color32, Pos2, Rect, Stroke, Vec2};
-
-const GRID_SIZE: f32 = 20.0;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum Direction { Right, Down, Left, Up }
@@ -28,35 +30,6 @@ impl Direction {
             Direction::Up => (0, -length),
         }
     }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
-struct GridPt(i32, i32);
-
-impl GridPt {
-    fn from_pos(pos: Pos2) -> Self {
-        Self((pos.x / GRID_SIZE).round() as i32, (pos.y / GRID_SIZE).round() as i32)
-    }
-    fn to_pos(self) -> Pos2 {
-        Pos2::new(self.0 as f32 * GRID_SIZE, self.1 as f32 * GRID_SIZE)
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum CompKind { Resistor, Capacitor, Inductor, Voltage, Ground }
-
-#[derive(Clone)]
-struct Component {
-    kind: CompKind,
-    p1: GridPt,
-    p2: GridPt,
-    val: String,
-}
-
-#[derive(Clone)]
-struct Wire {
-    p1: GridPt,
-    p2: GridPt,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -115,34 +88,6 @@ impl Default for SchematicState {
 
 #[derive(PartialEq, Eq)]
 enum EditorMode { Text, Schematic }
-
-// --- Node Extraction (Union-Find) ---
-struct Dsu {
-    parent: Vec<usize>,
-}
-
-impl Dsu {
-    fn new(size: usize) -> Self {
-        Self { parent: (0..size).collect() }
-    }
-    fn find(&mut self, i: usize) -> usize {
-        if self.parent[i] == i {
-            i
-        } else {
-            let p = self.parent[i];
-            let root = self.find(p);
-            self.parent[i] = root;
-            root
-        }
-    }
-    fn union(&mut self, i: usize, j: usize) {
-        let root_i = self.find(i);
-        let root_j = self.find(j);
-        if root_i != root_j {
-            self.parent[root_i] = root_j;
-        }
-    }
-}
 
 
 use crate::theme::{
@@ -356,95 +301,113 @@ impl CircuitSimApp {
         Self::default()
     }
     fn generate_netlist_from_schematic(&mut self) {
-        let mut points = HashSet::new();
-
-        // Collect all unique grid points
-        for c in &self.schematic.components {
-            points.insert(c.p1);
-            points.insert(c.p2);
-        }
-        for w in &self.schematic.wires {
-            points.insert(w.p1);
-            points.insert(w.p2);
-        }
-
-        let mut pt_list: Vec<GridPt> = points.into_iter().collect();
-        pt_list.sort_by_key(|p| (p.0, p.1));
-        let mut pt_to_idx: HashMap<GridPt, usize> = HashMap::new();
-        for (i, &pt) in pt_list.iter().enumerate() {
-            pt_to_idx.insert(pt, i);
-        }
-
-        let mut dsu = Dsu::new(pt_list.len());
-
-        // Wires connect nodes
-        for w in &self.schematic.wires {
-            let i1 = pt_to_idx[&w.p1];
-            let i2 = pt_to_idx[&w.p2];
-            dsu.union(i1, i2);
-        }
-
-        // Identify ground components to force Node 0
-        let mut ground_roots = HashSet::new();
-        for c in &self.schematic.components {
-            if c.kind == CompKind::Ground {
-                let root = dsu.find(pt_to_idx[&c.p1]);
-                ground_roots.insert(root);
+        match self.build_schematic_netlist() {
+            Ok(netlist) => {
+                self.netlist = netlist_emit(&netlist);
+                self.status = Some((true, "Generated netlist from schematic".into()));
+            }
+            Err(e) => {
+                self.status = Some((false, format!("Cannot generate netlist: {e}")));
             }
         }
+    }
 
-        // Map DSU roots to SPICE node numbers
-        let mut root_to_spicenode: HashMap<usize, usize> = HashMap::new();
-        let mut next_node_id = 1;
+    /// Build the typed netlist IR from the schematic. The editor and the
+    /// simulator then speak one language, and the emitted text comes from the
+    /// canonical [`netlist_emit`] writer instead of hand-built format strings.
+    ///
+    /// Element values are user text with optional SPICE suffixes, so they parse
+    /// through the shared value grammar — a bad literal is reported here
+    /// instead of silently becoming 0.
+    fn build_schematic_netlist(&self) -> Result<Netlist, String> {
+        let assignment = NodeAssignment::of(&self.schematic.components, &self.schematic.wires);
 
-        for i in 0..pt_list.len() {
-            let root = dsu.find(i);
-            if !root_to_spicenode.contains_key(&root) {
-                if ground_roots.contains(&root) {
-                    root_to_spicenode.insert(root, 0);
-                } else {
-                    root_to_spicenode.insert(root, next_node_id);
-                    next_node_id += 1;
-                }
-            }
-        }
-
-        // Generate Text
-        let mut out = String::from("* Auto-generated from Schematic\n");
+        let mut circuit = CsCircuit::new("schematic");
         let mut r_idx = 1; let mut c_idx = 1; let mut l_idx = 1; let mut v_idx = 1;
 
         for c in &self.schematic.components {
             if c.kind == CompKind::Ground { continue; }
 
-            let n1 = root_to_spicenode[&dsu.find(pt_to_idx[&c.p1])];
-            let n2 = root_to_spicenode[&dsu.find(pt_to_idx[&c.p2])];
+            let n1 = NodeId(assignment.node_of(c.p1));
+            let n2 = NodeId(assignment.node_of(c.p2));
+            circuit.ensure_node(n1.0);
+            circuit.ensure_node(n2.0);
 
             match c.kind {
-                CompKind::Resistor => { out.push_str(&format!("R{} {} {} {}\n", r_idx, n1, n2, c.val)); r_idx += 1; },
-                CompKind::Capacitor => { out.push_str(&format!("C{} {} {} {}\n", c_idx, n1, n2, c.val)); c_idx += 1; },
-                CompKind::Inductor => { out.push_str(&format!("L{} {} {} {}\n", l_idx, n1, n2, c.val)); l_idx += 1; },
-                CompKind::Voltage => { out.push_str(&format!("V{} {} {} {}\n", v_idx, n1, n2, c.val)); v_idx += 1; },
+                CompKind::Resistor => {
+                    let resistance = parse_value(&c.val)
+                        .map_err(|e| format!("R{r_idx} value '{}': {e}", c.val))?;
+                    circuit.resistors.push(CsResistor {
+                        name: format!("R{r_idx}"), n1, n2, resistance,
+                    });
+                    r_idx += 1;
+                }
+                CompKind::Capacitor => {
+                    let capacitance = parse_value(&c.val)
+                        .map_err(|e| format!("C{c_idx} value '{}': {e}", c.val))?;
+                    circuit.capacitors.push(CsCapacitor {
+                        name: format!("C{c_idx}"), n1, n2, capacitance,
+                    });
+                    c_idx += 1;
+                }
+                CompKind::Inductor => {
+                    let inductance = parse_value(&c.val)
+                        .map_err(|e| format!("L{l_idx} value '{}': {e}", c.val))?;
+                    circuit.inductors.push(CsInductor {
+                        name: format!("L{l_idx}"), n1, n2, inductance,
+                    });
+                    l_idx += 1;
+                }
+                CompKind::Voltage => {
+                    let voltage = parse_value(&c.val)
+                        .map_err(|e| format!("V{v_idx} value '{}': {e}", c.val))?;
+                    circuit.voltage_sources.push(CsVoltageSource {
+                        name: format!("V{v_idx}"),
+                        n1, n2, voltage,
+                        pulse: None, sine: None, ac: None,
+                    });
+                    v_idx += 1;
+                }
                 CompKind::Ground => unreachable!(),
             }
         }
 
-        out.push_str(".op\n");
+        let mut analysis = AnalysisCommands::default();
+        analysis.dc_op = true;
         match self.schematic.analysis_type {
             AnalysisType::Tran => {
-                out.push_str(&format!(".tran {} {}\n", self.schematic.tran_step, self.schematic.tran_stop));
+                let step = parse_value(&self.schematic.tran_step)
+                    .map_err(|e| format!(".tran step '{}': {e}", self.schematic.tran_step))?;
+                let stop = parse_value(&self.schematic.tran_stop)
+                    .map_err(|e| format!(".tran stop '{}': {e}", self.schematic.tran_stop))?;
+                analysis.tran_step = Some(step);
+                analysis.tran_stop = Some(stop);
+                analysis.tran_start = 0.0;
             }
             AnalysisType::Ac => {
-                out.push_str(&format!(".ac {} {} {} {}\n",
-                                      self.schematic.ac_variation,
-                                      self.schematic.ac_points,
-                                      self.schematic.ac_fstart,
-                                      self.schematic.ac_fstop,
-                ));
+                let scale = match self.schematic.ac_variation.to_ascii_lowercase().as_str() {
+                    "dec" => AcScale::Dec,
+                    "oct" => AcScale::Oct,
+                    "lin" => AcScale::Lin,
+                    other => {
+                        return Err(format!(
+                            ".ac sweep type '{other}' must be dec, oct, or lin"
+                        ));
+                    }
+                };
+                let points = self.schematic.ac_points.trim().parse::<usize>()
+                    .map_err(|_| {
+                        format!(".ac points '{}' must be a whole number", self.schematic.ac_points)
+                    })?;
+                let f_start = parse_value(&self.schematic.ac_fstart)
+                    .map_err(|e| format!(".ac start '{}': {e}", self.schematic.ac_fstart))?;
+                let f_stop = parse_value(&self.schematic.ac_fstop)
+                    .map_err(|e| format!(".ac stop '{}': {e}", self.schematic.ac_fstop))?;
+                analysis.ac = Some(AcCommand { scale, points, f_start, f_stop, stimulus_source: None });
             }
         }
-        out.push_str(".end\n");
-        self.netlist = out;
-        self.status = Some((true, "Generated netlist from schematic".into()));
+
+        Ok(Netlist { circuit, analysis })
     }
 
     /// Parse the current netlist text and build a schematic layout from it.
@@ -457,7 +420,9 @@ impl CircuitSimApp {
     ///   • A vertical wire runs along each node spine connecting all the pins.
     ///   • Node 0 (ground) gets a Ground symbol instead of a spine wire.
     fn generate_schematic_from_netlist(&mut self) {
-        // ── 1. Parse component lines ──────────────────────────────────────────
+        // ── 1. Parse the netlist through the one shared grammar ──────────────
+        // (The schematic previously re-tokenised the text by hand, silently
+        // dropping every diode/MOSFET card and whatever else it misread.)
         #[derive(Clone)]
         struct ParsedComp {
             kind:   CompKind,
@@ -466,33 +431,68 @@ impl CircuitSimApp {
             val:    String,
         }
 
-        let mut parsed: Vec<ParsedComp> = vec![];
-
-        for raw_line in self.netlist.lines() {
-            let line = raw_line.trim();
-            if line.is_empty() || line.starts_with('*') || line.starts_with('.') {
-                continue;
+        let netlist = match parse(&self.netlist) {
+            Ok(n) => n,
+            Err(e) => {
+                self.status = Some((false, format!("Netlist error: {e}")));
+                return;
             }
-            let tokens: Vec<&str> = line.split_whitespace().collect();
-            if tokens.len() < 4 { continue; }
+        };
+        let circuit = &netlist.circuit;
 
-            let kind = match tokens[0].to_ascii_uppercase().chars().next() {
-                Some('R') => CompKind::Resistor,
-                Some('C') => CompKind::Capacitor,
-                Some('L') => CompKind::Inductor,
-                Some('V') => CompKind::Voltage,
-                _ => continue,
-            };
+        // Display of an f64 prints plain decimal notation, which parse_value
+        // always re-parses — the round trip never loses the number.
+        let fmt_val = |v: f64| format!("{v}");
 
-            let node_a = match tokens[1].parse::<usize>() { Ok(n) => n, Err(_) => continue };
-            let node_b = match tokens[2].parse::<usize>() { Ok(n) => n, Err(_) => continue };
-            let val    = tokens[3..].join(" ");
-
-            parsed.push(ParsedComp { kind, node_a, node_b, val });
+        let mut parsed: Vec<ParsedComp> = vec![];
+        for r in &circuit.resistors {
+            parsed.push(ParsedComp {
+                kind:   CompKind::Resistor,
+                node_a: r.n1.0,
+                node_b: r.n2.0,
+                val:    fmt_val(r.resistance),
+            });
         }
+        for c in &circuit.capacitors {
+            parsed.push(ParsedComp {
+                kind:   CompKind::Capacitor,
+                node_a: c.n1.0,
+                node_b: c.n2.0,
+                val:    fmt_val(c.capacitance),
+            });
+        }
+        for l in &circuit.inductors {
+            parsed.push(ParsedComp {
+                kind:   CompKind::Inductor,
+                node_a: l.n1.0,
+                node_b: l.n2.0,
+                val:    fmt_val(l.inductance),
+            });
+        }
+        for v in &circuit.voltage_sources {
+            // Only the DC level is drawn; PULSE/SIN parameters stay in the
+            // netlist (the schematic has no waveform editing yet).
+            parsed.push(ParsedComp {
+                kind:   CompKind::Voltage,
+                node_a: v.n1.0,
+                node_b: v.n2.0,
+                val:    fmt_val(v.voltage),
+            });
+        }
+        // Diodes and MOSFETs have no schematic symbol yet — count them instead
+        // of silently dropping them like the old hand-parser did.
+        let skipped = circuit.diodes.len() + circuit.mosfets.len();
 
         if parsed.is_empty() {
-            self.status = Some((false, "No recognised components found in netlist".into()));
+            let msg = if skipped > 0 {
+                format!(
+                    "No supported components (R/C/L/V) found in netlist — {} diode/MOSFET element(s) have no schematic symbol",
+                    skipped
+                )
+            } else {
+                "No supported components (R/C/L/V) found in netlist".into()
+            };
+            self.status = Some((false, msg));
             return;
         }
 
@@ -631,22 +631,24 @@ impl CircuitSimApp {
             }
         }
 
-        // ── 5. Parse .tran / .ac directives ──────────────────────────────────
-        for raw_line in self.netlist.lines() {
-            let line = raw_line.trim().to_ascii_lowercase();
-            if line.starts_with(".tran") {
-                let toks: Vec<&str> = line.split_whitespace().collect();
-                self.schematic.analysis_type = AnalysisType::Tran;
-                if toks.len() > 1 { self.schematic.tran_step = toks[1].to_string(); }
-                if toks.len() > 2 { self.schematic.tran_stop = toks[2].to_string(); }
-            } else if line.starts_with(".ac") {
-                let toks: Vec<&str> = line.split_whitespace().collect();
-                self.schematic.analysis_type = AnalysisType::Ac;
-                if toks.len() > 1 { self.schematic.ac_variation = toks[1].to_string(); }
-                if toks.len() > 2 { self.schematic.ac_points    = toks[2].to_string(); }
-                if toks.len() > 3 { self.schematic.ac_fstart    = toks[3].to_string(); }
-                if toks.len() > 4 { self.schematic.ac_fstop     = toks[4].to_string(); }
-            }
+        // ── 5. Analysis directives from the typed parse ──────────────────────
+        // (The editor radio is single-choice; when a netlist carries both
+        // sweeps, AC wins the UI — the simulation itself still runs both.)
+        let a = &netlist.analysis;
+        if let Some(ac) = &a.ac {
+            self.schematic.analysis_type = AnalysisType::Ac;
+            self.schematic.ac_variation = match ac.scale {
+                AcScale::Dec => "dec",
+                AcScale::Oct => "oct",
+                AcScale::Lin => "lin",
+            }.to_string();
+            self.schematic.ac_points = ac.points.to_string();
+            self.schematic.ac_fstart = format!("{}", ac.f_start);
+            self.schematic.ac_fstop  = format!("{}", ac.f_stop);
+        } else if a.tran_step.is_some() {
+            self.schematic.analysis_type = AnalysisType::Tran;
+            self.schematic.tran_step = format!("{}", a.tran_step.unwrap());
+            self.schematic.tran_stop = format!("{}", a.tran_stop.unwrap_or(0.0));
         }
 
         // ── 6. Commit ─────────────────────────────────────────────────────────
@@ -658,7 +660,11 @@ impl CircuitSimApp {
         self.schematic.zoom               = 1.0;
 
         let n = parsed.len();
-        self.status = Some((true, format!("Imported {} component(s) from netlist", n)));
+        let mut status = format!("Imported {} component(s) from netlist", n);
+        if skipped > 0 {
+            status.push_str(&format!(" ({} D/M element(s) not drawn)", skipped));
+        }
+        self.status = Some((true, status));
     }
 
     fn run_simulation(&mut self) {
@@ -1418,71 +1424,18 @@ impl CircuitSimApp {
         }
 
         // ── Compute and draw node number labels ─────────────────────────
-        // Replicate the DSU node-assignment logic so labels always match
-        // what generate_netlist_from_schematic would produce.
+        // The same NodeAssignment the netlist writer uses, so the on-canvas
+        // labels can never drift away from the emitted netlist.
         {
-            // 1. Collect all unique grid points touched by components or wires.
-            let mut points = HashSet::new();
-            for c in &self.schematic.components {
-                points.insert(c.p1);
-                if c.kind != CompKind::Ground { points.insert(c.p2); }
-            }
-            for w in &self.schematic.wires {
-                points.insert(w.p1);
-                points.insert(w.p2);
-            }
+            let assignment = NodeAssignment::of(&self.schematic.components, &self.schematic.wires);
 
-            let mut pt_list: Vec<GridPt> = points.into_iter().collect();
-            // Sort deterministically so DSU root assignment never changes between frames.
-            pt_list.sort_by_key(|p| (p.0, p.1));
-            let mut pt_to_idx: HashMap<GridPt, usize> = HashMap::new();
-            for (i, &pt) in pt_list.iter().enumerate() {
-                pt_to_idx.insert(pt, i);
-            }
-
-            let mut dsu = Dsu::new(pt_list.len());
-
-            // 2. Wires merge nodes.
-            for w in &self.schematic.wires {
-                if let (Some(&a), Some(&b)) = (pt_to_idx.get(&w.p1), pt_to_idx.get(&w.p2)) {
-                    dsu.union(a, b);
-                }
-            }
-
-            // 3. Identify ground roots.
-            let mut ground_roots = HashSet::new();
-            for c in &self.schematic.components {
-                if c.kind == CompKind::Ground {
-                    if let Some(&idx) = pt_to_idx.get(&c.p1) {
-                        ground_roots.insert(dsu.find(idx));
-                    }
-                }
-            }
-
-            // 4. Assign SPICE node numbers (ground = 0, others 1..n).
-            let mut root_to_node: HashMap<usize, usize> = HashMap::new();
-            let mut next_id = 1usize;
-            for i in 0..pt_list.len() {
-                let root = dsu.find(i);
-                root_to_node.entry(root).or_insert_with(|| {
-                    if ground_roots.contains(&root) {
-                        0
-                    } else {
-                        let id = next_id;
-                        next_id += 1;
-                        id
-                    }
-                });
-            }
-
-            // 5. Collect one representative screen position per node number.
+            // Collect one representative screen position per node number.
             //    Pick the point with the smallest (x, y) grid coords for stability —
             //    deterministic and never flickers regardless of mouse position.
             let mut node_positions: HashMap<usize, (Pos2, GridPt)> = HashMap::new();
 
-            for (i, pt) in pt_list.iter().enumerate() {
-                let root = dsu.find(i);
-                let node_num = root_to_node[&root];
+            for pt in &assignment.pt_list {
+                let node_num = assignment.node_of(*pt);
                 let screen_pos = to_screen(*pt);
                 let entry = node_positions.entry(node_num).or_insert((screen_pos, *pt));
                 // Keep the point with the smallest grid coords (already sorted, so

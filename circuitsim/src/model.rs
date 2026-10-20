@@ -1,8 +1,8 @@
 //! Device equations — the single copy of nonlinear device physics.
 //!
 //! Every linearization formula for diodes and MOSFETs lives here. `mna.rs`
-//! (DC / transient stamping), `ac_mna.rs` (small-signal stamping), and both
-//! branch-current extraction paths call [`DiodeModel::eval`] and
+//! (DC / transient / AC stamping), and both branch-current extraction paths
+//! call [`DiodeModel::eval`] and
 //! [`MosfetModel::eval`] instead of re-deriving the equations. A physics
 //! fix lands once, here.
 

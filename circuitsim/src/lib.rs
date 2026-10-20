@@ -10,7 +10,6 @@ pub mod mna;
 pub mod model;
 pub mod netlist;
 pub mod units;
-pub mod ac_mna;
 
 pub use analysis::{AcResult, AcCommand, AcScale, run, DcResult, SimulationResult, TranResult};
 pub use circuit::Circuit;

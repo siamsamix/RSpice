@@ -1,9 +1,9 @@
-use crate::ac_mna::{build_ac, compute_ac_branch_currents, node_voltage_complex, AcBranchCurrents};
 use crate::circuit::Circuit;
 use crate::error::{Result, SimError};
 use crate::mna::{
-    build_dc, build_transient, compute_branch_currents, node_voltage, update_transient_state,
-    BranchCurrents, TransientState,
+    build_system, compute_ac_branch_currents, compute_branch_currents, node_voltage,
+    update_transient_state, AcBranchCurrents, BranchCurrents, BranchLayout, MnaSystem, Mode,
+    TransientState,
 };
 use crate::netlist::AnalysisCommands;
 use num_complex::Complex64;
@@ -106,7 +106,7 @@ pub fn solve_dc_op(circuit: &Circuit) -> Result<(DcResult, nalgebra::DVector<f64
     let tol = 1e-6;
     let mut converged = false;
     for _ in 0..100 {
-        let sys = build_dc(circuit, &x)?;
+        let sys = build_system::<f64>(circuit, Mode::Dc { guess: &x })?;
         let x_next = sys.solve()?;
         let diff = (&x_next - &x).amax();
         x = x_next;
@@ -131,7 +131,7 @@ pub fn solve_dc_op(circuit: &Circuit) -> Result<(DcResult, nalgebra::DVector<f64
 fn seed_initial_guess(circuit: &Circuit) -> Result<nalgebra::DVector<f64>> {
     use crate::mna::MnaSystem;
 
-    let mut sys = MnaSystem::for_circuit(circuit);
+    let mut sys = MnaSystem::<f64>::for_circuit(circuit);
 
     // Resistors.
     for r in &circuit.resistors {
@@ -248,7 +248,7 @@ pub fn run_transient(
         let mut converged = false;
 
         for _ in 0..100 { // Newton-Raphson loop for this specific time step
-            let sys = build_transient(circuit, dt, t, &state, &x)?;
+            let sys = build_system::<f64>(circuit, Mode::Tran { dt, t, state: &state, guess: &x })?;
             let x_next = sys.solve()?;
 
             let diff = (&x_next - &x).amax();
@@ -382,7 +382,7 @@ pub fn run_ac_sweep(circuit: &Circuit, cmd: &AcCommand, dc_x: &nalgebra::DVector
     let mut points = Vec::with_capacity(freqs.len());
 
     for &freq in &freqs {
-        let mut sys = build_ac(circuit, freq, &dc_x)?;
+        let mut sys = build_system::<Complex64>(circuit, Mode::Ac { freq, bias: dc_x })?;
         let amp = circuit.voltage_sources[stim_idx].ac.unwrap().mag;
         // Drive the stimulus source with the AC amplitude.
         // All other sources remain at 0 V (short circuit in small-signal model).
@@ -392,7 +392,7 @@ pub fn run_ac_sweep(circuit: &Circuit, cmd: &AcCommand, dc_x: &nalgebra::DVector
 
         let mut node_voltages = vec![Complex64::new(0.0, 0.0); circuit.nodes];
         for i in 1..circuit.nodes {
-            node_voltages[i] = node_voltage_complex(&x, crate::circuit::NodeId(i));
+            node_voltages[i] = node_voltage(&x, crate::circuit::NodeId(i));
         }
         let branch_currents = compute_ac_branch_currents(circuit, &x, freq, dc_x);
 

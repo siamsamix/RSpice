@@ -1,4 +1,4 @@
-use circuitsim::circuit::{Capacitor as CsCapacitor, Circuit as CsCircuit, Inductor as CsInductor, NodeId, Resistor as CsResistor, VoltageSource as CsVoltageSource};
+use circuitsim::circuit::{CURRENT_FAMILIES, Capacitor as CsCapacitor, Circuit as CsCircuit, ElementFamily, Inductor as CsInductor, NodeId, Resistor as CsResistor, VoltageSource as CsVoltageSource};
 use circuitsim::netlist::{emit as netlist_emit, AcCommand, AcScale, AnalysisCommands, Netlist, ParseOptions};
 use circuitsim::units::parse_value;
 use circuitsim::{parse, run, AcResult, DcResult, DcSweepResult, SimulationResult, TranResult};
@@ -211,6 +211,9 @@ pub struct CircuitSimApp {
     ac: Option<AcResult>,
     /// Deck-spelling node names (indexed by node id) for trace labels.
     node_names: Vec<String>,
+    /// The circuit the last run parsed, source of the honest element labels
+    /// (`I(RLOAD)`); `None` before the first successful parse.
+    circuit: Option<CsCircuit>,
     plot_nodes: Vec<bool>,
     dc_plot_nodes: Vec<bool>,
     ac_plot_nodes: Vec<bool>,
@@ -239,6 +242,7 @@ impl Default for CircuitSimApp {
             tran: None,
             ac: None,
             node_names: vec!["0".to_string()],
+            circuit: None,
             plot_nodes: vec![false; 16],
             dc_plot_nodes: vec![false; 16],
             ac_plot_nodes: vec![false; 16],
@@ -690,6 +694,7 @@ impl CircuitSimApp {
                 }
                 self.circuit_summary = Some(summary);
                 self.node_names = netlist.circuit.node_names.clone();
+                self.circuit = Some(netlist.circuit.clone());
 
                 match run(&netlist) {
                     Ok(result) => {
@@ -715,24 +720,9 @@ impl CircuitSimApp {
         self.tran = result.tran.clone();
         self.ac = result.ac.clone();
 
-        let max_nodes = self
-        .tran
-        .as_ref()
-        .and_then(|t| t.points.first())
-        .map(|p| p.node_voltages.len())
-        .or_else(|| self.dc.as_ref().map(|d| d.node_voltages.len()))
-        .or_else(|| {
-            self.dc_sweep
-            .as_ref()
-            .and_then(|s| s.points.first())
-            .map(|p| p.node_voltages.len())
-        })
-        .or_else(|| {
-            self.ac.as_ref()
-            .and_then(|a| a.points.first())
-            .map(|p| p.node_voltages.len())
-        })
-        .unwrap_or(8);
+        // Node count is the deck's node table — one fact, one place, no
+        // result-structure digging.
+        let max_nodes = self.node_names.len();
 
         self.plot_nodes.resize(max_nodes, false);
         for i in 1..max_nodes.min(self.plot_nodes.len()) {
@@ -2083,6 +2073,15 @@ impl CircuitSimApp {
         ui.end_row();
     }
 
+    /// Deck element names of one family from the run's circuit; empty when
+    /// nothing has parsed yet (labels fall back to the family letter).
+    fn circuit_element_names(&self, family: ElementFamily) -> Vec<String> {
+        self.circuit
+            .as_ref()
+            .map(|c| c.element_names(family))
+            .unwrap_or_default()
+    }
+
     fn dc_tab(&mut self, ui: &mut egui::Ui) {
         if self.dc.is_none() && self.dc_sweep.is_none() {
             ui.label(
@@ -2129,28 +2128,20 @@ impl CircuitSimApp {
 
                 let b = &dc.branch_currents;
 
-                for (i, &cur) in b.resistors.iter().enumerate() {
-                    Self::dc_branch_row(ui, format!("R{}", i + 1), cur);
-                }
-                for (i, &cur) in b.capacitors.iter().enumerate() {
-                    Self::dc_branch_row(ui, format!("C{}", i + 1), cur);
-                }
-                for (i, &cur) in b.inductors.iter().enumerate() {
-                    Self::dc_branch_row(ui, format!("L{}", i + 1), cur);
-                }
-                for (i, &cur) in b.voltage_sources.iter().enumerate() {
-                    Self::dc_branch_row(ui, format!("V{}", i + 1), cur);
-                }
-                for (i, &cur) in b.diodes.iter().enumerate() {
-                    Self::dc_branch_row(ui, format!("D{}", i + 1), cur);
-                }
-                // MOSFETs and independent current sources report their branch
-                // current like every other element (drain n1→n2 convention).
-                for (i, &cur) in b.mosfets.iter().enumerate() {
-                    Self::dc_branch_row(ui, format!("M{}", i + 1), cur);
-                }
-                for (i, &cur) in b.current_sources.iter().enumerate() {
-                    Self::dc_branch_row(ui, format!("I{}", i + 1), cur);
+                // Canonical family walk through the named lookup: labels are
+                // the deck's element names, and Q/J/B show like every other
+                // family instead of being silently skipped.
+                for family in CURRENT_FAMILIES {
+                    let values = b.slice(family).filter(|v| !v.is_empty());
+                    if values.is_none() {
+                        continue;
+                    }
+                    let names = self.circuit_element_names(family);
+                    for (i, &cur) in values.unwrap().iter().enumerate() {
+                        let label = names.get(i).cloned()
+                            .unwrap_or_else(|| format!("{}{}", family.letter(), i + 1));
+                        Self::dc_branch_row(ui, format!("{}({label})", family.probe_prefix()), cur);
+                    }
                 }
             });
         });
@@ -2171,11 +2162,7 @@ impl CircuitSimApp {
                 .size(12.0),
             );
 
-            let n_nodes = sweep
-                .points
-                .first()
-                .map(|p| p.node_voltages.len())
-                .unwrap_or(1);
+            let n_nodes = self.node_names.len();
 
             if sweep.targets.len() == 1 {
                 // Flat sweep: a plot with one V(node) trace per enabled node.
@@ -2344,7 +2331,12 @@ impl CircuitSimApp {
                     .allow_drag(true)
                     .allow_boxed_zoom(true);
 
-                    let series = tran_current_series(tran, x_mult, y_mult);
+                    let series = tran_current_series(
+                        tran,
+                        self.circuit.as_ref().unwrap_or(&CsCircuit::default()),
+                        x_mult,
+                        y_mult,
+                    );
                     let apply_b = self.plot.tran_apply;
                     let bounds = self.plot.tran_bounds;
                     if apply_b {
@@ -2362,9 +2354,7 @@ impl CircuitSimApp {
 
             TranSubTab::Differential => {
                 // ── Node selector controls ────────────────────────────────────
-                let n_nodes = tran.points.first()
-                    .map(|p| p.node_voltages.len())
-                    .unwrap_or(1);
+                let n_nodes = self.node_names.len();
 
                 // Clamp stored indices to valid range whenever n_nodes changes
                 self.diff_node_a = self.diff_node_a.clamp(0, n_nodes.saturating_sub(1));
@@ -2458,7 +2448,7 @@ impl CircuitSimApp {
             return;
         };
 
-        let n_nodes = ac.points.first().map(|p| p.node_voltages.len()).unwrap_or(1);
+        let n_nodes = self.node_names.len();
 
         // ── Controls row ────────────────────────────────────────────────────
         ui.horizontal_wrapped(|ui| {
@@ -2498,14 +2488,15 @@ impl CircuitSimApp {
         };
         let ac_plot_nodes = self.ac_plot_nodes.clone();
         let node_names = self.node_names.clone();
+        let circuit = self.circuit.clone().unwrap_or_default();
 
         // All series are built up front by the one plot adapter; the show
         // closures only draw. (The old code cloned the whole result per frame
         // into a snapshot so its in-closure loops could hold it.)
         let node_mag_series = ac_voltage_series(ac, &ac_plot_nodes, &node_names, mag_qty, self.plot.ac_x, self.plot.ac_mag_y, log_x);
         let node_phase_series = ac_voltage_series(ac, &ac_plot_nodes, &node_names, AcQuantity::Phase, self.plot.ac_x, self.plot.ac_phase_y, log_x);
-        let cur_mag_series = ac_current_series(ac, mag_qty, self.plot.ac_x, self.plot.ac_mag_y, log_x);
-        let cur_phase_series = ac_current_series(ac, AcQuantity::Phase, self.plot.ac_x, self.plot.ac_phase_y, log_x);
+        let cur_mag_series = ac_current_series(ac, &circuit, mag_qty, self.plot.ac_x, self.plot.ac_mag_y, log_x);
+        let cur_phase_series = ac_current_series(ac, &circuit, AcQuantity::Phase, self.plot.ac_x, self.plot.ac_phase_y, log_x);
 
         let apply_b = self.plot.ac_apply;
         let mag_bounds = self.plot.ac_mag_bounds.x_through_log10();

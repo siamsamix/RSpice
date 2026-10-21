@@ -237,6 +237,58 @@ impl BehavioralRuntime {
             delay_queues: vec![VecDeque::new(); behavior.delay.len()],
         }
     }
+
+    /// Seed for the first accepted step: each `idt` site's previous value is
+    /// its argument at the DC/IC operating point (so the first trapezoid
+    /// starts from the real operating point), and every `delay` queue opens
+    /// with the argument's DC value at t = 0 (delays then interpolate from
+    /// the true initial history instead of the zero-order hold).
+    ///
+    /// `probe_values` is the converged probe snapshot at that operating
+    /// point, in `behavior.probes` order.
+    pub fn seeded(behavior: &Behavior, probe_values: &[f64]) -> Self {
+        let mut runtime = Self::sized_for(behavior);
+        for (site, arg) in behavior.idt.iter().enumerate() {
+            runtime.idt_prev[site] = behavior.eval_expr(arg, probe_values, 0.0, 0.0, &runtime);
+        }
+        for (site, (arg, _td)) in behavior.delay.iter().enumerate() {
+            let value = behavior.eval_expr(arg, probe_values, 0.0, 0.0, &runtime);
+            runtime.delay_queues[site].push_back((0.0, value));
+        }
+        runtime
+    }
+
+    /// Advance the history through one accepted step of `dt` ending at
+    /// `t_end`: each `idt` site completes one trapezoid with its argument
+    /// evaluated at the *converged* end-of-step probe values, and each
+    /// `delay` site records the accepted sample (queues capped at
+    /// [`MAX_DELAY_SAMPLES`]).
+    ///
+    /// Sites are walked in parse order and `self` is updated as the walk
+    /// proceeds, so a nested `idt` evaluation reads the just-completed
+    /// accumulator (dt = 0 in the inner evaluation collapses the inner node
+    /// to exactly that).
+    pub fn advance(&mut self, behavior: &Behavior, probe_values: &[f64], t_end: f64, dt: f64) {
+        for (site, arg) in behavior.idt.iter().enumerate() {
+            // dt = 0 on the argument evaluation: a nested `idt` site
+            // collapses to its (already updated) accumulator — the
+            // step-end value of the inner integral, which is exactly the
+            // outer site's argument value at `t_end`.
+            let now = behavior.eval_expr(arg, probe_values, t_end, 0.0, self);
+            let prev = self.idt_prev.get(site).copied().unwrap_or(now);
+            self.idt_acc[site] =
+                self.idt_acc.get(site).copied().unwrap_or(0.0) + 0.5 * dt * (now + prev);
+            self.idt_prev[site] = now;
+        }
+        for (site, (arg, _td)) in behavior.delay.iter().enumerate() {
+            let value = behavior.eval_expr(arg, probe_values, t_end, 0.0, self);
+            let queue = &mut self.delay_queues[site];
+            queue.push_back((t_end, value));
+            while queue.len() > MAX_DELAY_SAMPLES {
+                queue.pop_front();
+            }
+        }
+    }
 }
 
 // ─── Lexer ───────────────────────────────────────────────────────────────────
@@ -947,9 +999,8 @@ mod tests {
 
     #[test]
     fn delayed_value_queue_cap() {
-        // The advance pass caps queues at MAX_DELAY_SAMPLES — the helper is
-        // only the lookup, but the walker in mna uses this constant; keep the
-        // bound meaningful here as documentation.
+        // `advance` caps delay queues at MAX_DELAY_SAMPLES — the constant
+        // lives next to the queue law it enforces.
         assert!(MAX_DELAY_SAMPLES >= 2);
     }
 }

@@ -2229,26 +2229,16 @@ pub fn seed_transient_state(circuit: &Circuit, solution: &DVector<f64>) -> Trans
     state.jfet_cap_currents = vec![[0.0; 2]; circuit.jfets.len()];
     state.switch_states = switch_states_after(circuit, solution, &[]);
 
-    // Behavioral sources: sized runtime, `idt` previous values read from the
-    // DC solution (so the first accepted step's trapezoid starts from the
-    // real operating point), and every `delay` queue seeded with the arg's
-    // DC value at t = 0 (delays then interpolate from the true initial
-    // history instead of the zero-order hold).
+    // Behavioral sources: the runtime module seeds its own history from the
+    // DC operating point — `idt` previous values and every `delay` queue's
+    // t = 0 sample. mna only provides the converged operating-point probes.
     state.behavioral = circuit
         .behavioral
         .iter()
         .map(|b| {
-            let mut runtime = BehavioralRuntime::sized_for(&b.behavior);
             let snapshot = behavioral_probe_snapshot(circuit, b, solution)
                 .unwrap_or_else(|_| vec![0.0; b.behavior.probes.len()]);
-            for (site, arg) in b.behavior.idt.iter().enumerate() {
-                runtime.idt_prev[site] = b.behavior.eval_expr(arg, &snapshot, 0.0, 0.0, &runtime);
-            }
-            for (site, (arg, _td)) in b.behavior.delay.iter().enumerate() {
-                let value = b.behavior.eval_expr(arg, &snapshot, 0.0, 0.0, &runtime);
-                runtime.delay_queues[site].push_back((0.0, value));
-            }
-            runtime
+            BehavioralRuntime::seeded(&b.behavior, &snapshot)
         })
         .collect();
     state
@@ -2500,12 +2490,9 @@ pub fn advance_transient_state(
         mutual_voltages.push(v);
     }
 
-    // Behavioral sources: each `idt` site completes one trapezoid over the
-    // just-accepted step (arg evaluated at the *converged* end-of-step
-    // values); each `delay` site records its accepted sample. Sites are
-    // walked in parse order and the inflight runtime is updated as we go, so
-    // a nested `idt` evaluation reads the just-completed accumulator (dt = 0
-    // in the inner evaluation collapses the inner node to exactly that).
+    // Behavioral sources: the runtime module owns the history law — `idt`
+    // trapezoids complete on the converged end-of-step probes, `delay` sites
+    // record their accepted sample. mna only carries the snapshot across.
     let behavioral: Vec<BehavioralRuntime> = circuit
         .behavioral
         .iter()
@@ -2516,28 +2503,9 @@ pub fn advance_transient_state(
                 .get(i)
                 .cloned()
                 .unwrap_or_else(|| BehavioralRuntime::sized_for(&b.behavior));
-            let snapshot =
-                behavioral_probe_snapshot(circuit, b, solution)
-                    .unwrap_or_else(|_| vec![0.0; b.behavior.probes.len()]);
-            for (site, arg) in b.behavior.idt.iter().enumerate() {
-                // dt = 0 on the argument evaluation: a nested `idt` site
-                // collapses to its (already updated) accumulator — the
-                // step-end value of the inner integral, which is exactly the
-                // outer site's argument value at `t_end`.
-                let now = b.behavior.eval_expr(arg, &snapshot, t_end, 0.0, &runtime);
-                let prev = runtime.idt_prev.get(site).copied().unwrap_or(now);
-                runtime.idt_acc[site] =
-                    runtime.idt_acc.get(site).copied().unwrap_or(0.0) + 0.5 * dt * (now + prev);
-                runtime.idt_prev[site] = now;
-            }
-            for (site, (arg, _td)) in b.behavior.delay.iter().enumerate() {
-                let value = b.behavior.eval_expr(arg, &snapshot, t_end, 0.0, &runtime);
-                let queue = &mut runtime.delay_queues[site];
-                queue.push_back((t_end, value));
-                while queue.len() > crate::behavior::MAX_DELAY_SAMPLES {
-                    queue.pop_front();
-                }
-            }
+            let snapshot = behavioral_probe_snapshot(circuit, b, solution)
+                .unwrap_or_else(|_| vec![0.0; b.behavior.probes.len()]);
+            runtime.advance(&b.behavior, &snapshot, t_end, dt);
             runtime
         })
         .collect();

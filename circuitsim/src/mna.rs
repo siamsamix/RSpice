@@ -11,8 +11,8 @@ use num_complex::Complex64;
 
 use crate::behavior::BehavioralRuntime;
 use crate::circuit::{
-    BehavioralKind, BjtType, Circuit, ControlVar, CurrentSource, IntegrationMethod, JfetType,
-    MosfetType, NodeId, SwitchControl, VoltageSource,
+    BehavioralKind, BjtType, Circuit, ControlVar, CurrentSource, ElementFamily,
+    IntegrationMethod, JfetType, MosfetType, NodeId, SwitchControl, VoltageSource,
 };
 use crate::error::{Result, SimError};
 use crate::model::thermal_voltage;
@@ -298,12 +298,13 @@ pub struct BranchLayout {
 
 impl BranchLayout {
     pub fn for_circuit(circuit: &Circuit) -> Self {
+        let [vsrc, ind, vcvs, ccvs, _behavioral] = circuit.branch_family_counts();
         let n_nodes = circuit.nodes.saturating_sub(1);
         let vsrc_base = n_nodes;
-        let ind_base = vsrc_base + circuit.voltage_sources.len();
-        let vcvs_base = ind_base + circuit.inductors.len();
-        let ccvs_base = vcvs_base + circuit.vcvs.len();
-        let behavioral_base = ccvs_base + circuit.ccvs.len();
+        let ind_base = vsrc_base + vsrc;
+        let vcvs_base = ind_base + ind;
+        let ccvs_base = vcvs_base + vcvs;
+        let behavioral_base = ccvs_base + ccvs;
         Self { n_nodes, vsrc_base, ind_base, vcvs_base, ccvs_base, behavioral_base }
     }
 
@@ -1943,6 +1944,26 @@ pub struct BranchCurrents {
     pub behavioral: Vec<f64>,
 }
 
+impl BranchCurrents {
+    /// The current values of one element family, positioned exactly as
+    /// `Circuit::element_names(family)`. Family identity is resolved in one
+    /// place instead of per-consumer `match` towers.
+    pub fn slice(&self, family: ElementFamily) -> Option<&[f64]> {
+        match family {
+            ElementFamily::Resistors => Some(&self.resistors),
+            ElementFamily::Capacitors => Some(&self.capacitors),
+            ElementFamily::Inductors => Some(&self.inductors),
+            ElementFamily::VoltageSources => Some(&self.voltage_sources),
+            ElementFamily::CurrentSources => Some(&self.current_sources),
+            ElementFamily::Diodes => Some(&self.diodes),
+            ElementFamily::Mosfets => Some(&self.mosfets),
+            ElementFamily::Bjts => Some(&self.bjts),
+            ElementFamily::Jfets => Some(&self.jfets),
+            ElementFamily::Behavioral => Some(&self.behavioral),
+        }
+    }
+}
+
 pub fn compute_branch_currents(
     circuit: &Circuit,
     solution: &DVector<f64>,
@@ -2651,6 +2672,25 @@ pub struct AcBranchCurrents {
     /// complex branch unknown; current flavour: `Σ dk·(probe phasor)` with the
     /// real-difference Jacobian evaluated at the DC bias.
     pub behavioral: Vec<Complex64>,
+}
+
+impl AcBranchCurrents {
+    /// The current phasors of one element family, positioned exactly as
+    /// `Circuit::element_names(family)`.
+    pub fn slice(&self, family: ElementFamily) -> Option<&[Complex64]> {
+        match family {
+            ElementFamily::Resistors => Some(&self.resistors),
+            ElementFamily::Capacitors => Some(&self.capacitors),
+            ElementFamily::Inductors => Some(&self.inductors),
+            ElementFamily::VoltageSources => Some(&self.voltage_sources),
+            ElementFamily::CurrentSources => Some(&self.current_sources),
+            ElementFamily::Diodes => Some(&self.diodes),
+            ElementFamily::Mosfets => Some(&self.mosfets),
+            ElementFamily::Bjts => Some(&self.bjts),
+            ElementFamily::Jfets => Some(&self.jfets),
+            ElementFamily::Behavioral => Some(&self.behavioral),
+        }
+    }
 }
 
 /// Compute small-signal AC branch currents from a solved AC system.

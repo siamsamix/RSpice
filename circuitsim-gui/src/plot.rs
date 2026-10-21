@@ -11,7 +11,7 @@
 
 use circuitsim::analysis::{AcResult, DcSweepResult, TranResult};
 use circuitsim::circuit::{Circuit, ElementFamily, CURRENT_FAMILIES};
-use egui_plot::{Line, PlotPoints, PlotUi};
+use egui_plot::{Legend, Line, Plot, PlotPoints, PlotUi};
 
 use crate::theme::PLOT_COLORS;
 
@@ -31,7 +31,6 @@ pub struct Bounds {
     pub y_min: Option<f64>,
     pub y_max: Option<f64>,
 }
-
 impl Bounds {
     /// Clear to auto-fit (the "Auto Fit" button).
     pub fn reset(&mut self) {
@@ -121,6 +120,113 @@ pub fn apply_bounds(plot_ui: &mut PlotUi, bounds: &Bounds) {
         [safe_x_min, safe_y_min],
         [safe_x_max, safe_y_max],
     ));
+}
+
+/// One standard result-tab plot: axis labels, legend, scroll/drag/zoom
+/// gestures, the one-time bounds application and the series draw were the
+/// same nine lines chained at every tab — the caller now passes only the
+/// plot's identity, height, labels, series and optional bounds.
+pub fn plot_frame(
+    name: &str,
+    height: f32,
+    x_label: &str,
+    y_label: &str,
+    series: &[PlotSeries],
+    apply: Option<Bounds>,
+    ui: &mut egui::Ui,
+) {
+    let plot = Plot::new(name)
+        .height(height)
+        .x_axis_label(x_label)
+        .y_axis_label(y_label)
+        .y_axis_min_width(50.0)
+        .legend(Legend::default().position(egui_plot::Corner::RightTop))
+        .show_background(true)
+        .allow_scroll(true)
+        .allow_drag(true)
+        .allow_boxed_zoom(true);
+    plot.show(ui, |plot_ui| {
+        if let Some(bounds) = apply {
+            apply_bounds(plot_ui, &bounds);
+        }
+        draw(plot_ui, series, 2.0);
+    });
+}
+
+/// X scale of the AC panels, decided by the dB/Linear toggle.
+///
+/// (Moved here from app.rs — it is plot-layer vocabulary, and the cursor
+/// plumbing below is the only place that needs to know what "dB" means.)
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum AcMagScale { #[default] Db, Linear }
+
+/// The hover-label text of one AC panel.
+pub enum AcCursor {
+    /// `{name}\nf = … Hz\n{quantity} = …` with the panel's quantity label.
+    Quantity(String),
+    /// `{name}\nf = … Hz\nphase = …°`.
+    Phase,
+}
+
+/// One AC panel: the standard [frame][`plot_frame`] plus the frequency
+/// cursor plumbing all four panels share — dB mode draws log-spaced grid
+/// lines (and, on quantity plots, engineering-notation Hz ticks), linear
+/// mode plain ticks, and the hover label resolves the axis value (a
+/// `log10` exponent in dB mode) back to Hz before printing.
+pub fn ac_plot_frame(
+    name: &str,
+    height: f32,
+    scale: AcMagScale,
+    cursor: AcCursor,
+    y_label: &str,
+    series: &[PlotSeries],
+    apply: Option<Bounds>,
+    ui: &mut egui::Ui,
+) {
+    let mut plot = Plot::new(name)
+        .height(height)
+        .x_axis_label("frequency (Hz)")
+        .y_axis_label(y_label)
+        .y_axis_min_width(50.0)
+        .legend(Legend::default().position(egui_plot::Corner::RightTop))
+        .show_background(true)
+        .allow_scroll(true)
+        .allow_drag(true)
+        .allow_boxed_zoom(true);
+
+    if scale == AcMagScale::Db {
+        plot = plot.x_grid_spacer(egui_plot::log_grid_spacer(10));
+    }
+    if let AcCursor::Quantity(_) = cursor {
+        let frequency_of = |x: f64| match scale {
+            AcMagScale::Db => 10.0_f64.powf(x),
+            AcMagScale::Linear => x,
+        };
+        plot = plot.x_axis_formatter(move |mark, _range| {
+            let f = frequency_of(mark.value);
+            if f >= 1e9 { format!("{:.1} G", f / 1e9) }
+            else if f >= 1e6 { format!("{:.1} M", f / 1e6) }
+            else if f >= 1e3 { format!("{:.1} k", f / 1e3) }
+            else { format!("{:.1}", f) }
+        });
+    }
+    let plot = plot.label_formatter(move |name, val| {
+        if name.is_empty() { return String::new(); }
+        let f = match scale {
+            AcMagScale::Db => 10.0_f64.powf(val.x),
+            AcMagScale::Linear => val.x,
+        };
+        match &cursor {
+            AcCursor::Quantity(q) => format!("{name}\nf = {f:.3e} Hz\n{q} = {:.3e}", val.y),
+            AcCursor::Phase => format!("{name}\nf = {f:.3e} Hz\nphase = {:.2}°", val.y),
+        }
+    });
+    plot.show(ui, |plot_ui| {
+        if let Some(bounds) = apply {
+            apply_bounds(plot_ui, &bounds);
+        }
+        draw(plot_ui, series, 2.0);
+    });
 }
 
 /// Draw a batch of series in legend order.

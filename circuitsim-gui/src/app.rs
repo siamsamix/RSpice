@@ -1,14 +1,21 @@
-use circuitsim::circuit::{CURRENT_FAMILIES, Capacitor as CsCapacitor, Circuit as CsCircuit, ElementFamily, Inductor as CsInductor, NodeId, Resistor as CsResistor, VoltageSource as CsVoltageSource};
-use circuitsim::netlist::{emit as netlist_emit, AcCommand, AcScale, AnalysisCommands, Netlist, ParseOptions};
+use circuitsim::circuit::{CURRENT_FAMILIES, Circuit as CsCircuit, ElementFamily, Pulse, Sine, Waveform};
+use circuitsim::netlist::{emit as netlist_emit, emit_source_value, parse_source_value, ParseOptions, SourceValue};
 use circuitsim::units::parse_value;
 use circuitsim::{parse, run, AcResult, DcResult, DcSweepResult, SimulationResult, TranResult};
 use egui;
-use egui_plot::{Legend, Plot};
+use egui_plot::Plot;
 use std::collections::HashMap;
 use egui::{Color32, Pos2, Rect, Stroke, Vec2};
 
-use crate::schematic::{CompKind, Component, GridPt, NodeAssignment, Wire, GRID_SIZE};
-use crate::plot::{ac_current_series, ac_voltage_series, apply_bounds, dc_sweep_series, draw, tran_current_series, tran_diff_series, tran_voltage_series, AcQuantity, PlotState};
+use crate::schematic::{
+    AnalysisType, CompKind, Direction, GridPt, NodeAssignment, SchematicState, Tool,
+    GRID_SIZE,
+};
+use crate::plot::{
+    ac_current_series, ac_plot_frame, ac_voltage_series, dc_sweep_series, draw, plot_frame,
+    tran_current_series, tran_diff_series, tran_voltage_series, AcCursor, AcMagScale,
+    AcQuantity, PlotState,
+};
 
 /// Deck-spelling label for a node (`in`, `out`), falling back to its id.
 /// A free function so UI closures can capture only the names slice.
@@ -19,81 +26,92 @@ fn node_label(names: &[String], i: usize) -> String {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum Direction { Right, Down, Left, Up }
+/// Grid labels per source family — shared by the read and rebuild paths so
+/// the two can never disagree about a field's meaning.
+const DC_LABELS: &[&str] = &["Voltage"];
+const AC_LABELS: &[&str] = &["Magnitude", "Phase"];
+const SIN_LABELS: &[&str] = &["V_offset", "V_amp", "Freq", "T_delay", "Theta"];
+const PULSE_LABELS: &[&str] = &[
+    "V_initial", "V_on", "T_delay", "T_rise", "T_fall", "T_on", "T_period",
+];
 
-impl Direction {
-    fn next(self) -> Self {
-        match self {
-            Direction::Right => Direction::Down,
-            Direction::Down => Direction::Left,
-            Direction::Left => Direction::Up,
-            Direction::Up => Direction::Right,
-        }
-    }
-
-    fn offset(self, length: i32) -> (i32, i32) {
-        match self {
-            Direction::Right => (length, 0),
-            Direction::Down => (0, length),
-            Direction::Left => (-length, 0),
-            Direction::Up => (0, -length),
-        }
+/// The dropdown family name for a parsed source value (`"DC"`, `"AC"`,
+/// `"SIN"`, `"PULSE"`, or `"Params"` for families without a grid editor).
+/// The classification reads the typed [`SourceValue`], not the raw text —
+/// `starts_with` guessing is what let a `SFFM(...)` card be rewritten into
+/// garbage here.
+fn source_value_family(value: &SourceValue) -> &'static str {
+    match value {
+        SourceValue::Dc { .. } => "DC",
+        SourceValue::Ac { .. } => "AC",
+        SourceValue::Waveform(Waveform::Sine(_)) => "SIN",
+        SourceValue::Waveform(Waveform::Pulse(_)) => "PULSE",
+        SourceValue::Waveform(_) => "Params",
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Tool { Select, Wire, R, C, L, V, Gnd }
-
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum AnalysisType { Tran, Ac }
-
-impl Default for AnalysisType {
-    fn default() -> Self { AnalysisType::Tran }
-}
-
-struct SchematicState {
-    tool: Tool,
-    components: Vec<Component>,
-    wires: Vec<Wire>,
-    active_wire_start: Option<GridPt>,
-    current_dir: Direction,
-    selected_component: Option<usize>,
-    selected_wire: Option<usize>,
-    drag_last_grid: Option<GridPt>,
-    pan: Vec2,
-    zoom: f32,
-    analysis_type: AnalysisType,
-    tran_step: String,
-    tran_stop: String,
-    ac_variation: String,
-    ac_points: String,
-    ac_fstart: String,
-    ac_fstop: String,
-}
-
-impl Default for SchematicState {
-    fn default() -> Self {
-        Self {
-            tool: Tool::Select,
-            components: vec![],
-            wires: vec![],
-            active_wire_start: None,
-            current_dir: Direction::Down,
-            selected_component: None,
-            selected_wire: None,
-            drag_last_grid: None,
-            pan: Vec2::ZERO,
-            zoom: 1.0,
-            analysis_type: AnalysisType::Tran,
-            tran_step: "1u".to_string(),
-            tran_stop: "5m".to_string(),
-            ac_variation: "dec".to_string(),
-            ac_points: "20".to_string(),
-            ac_fstart: "1".to_string(),
-            ac_fstop: "10k".to_string(),
+/// One editable row per parameter: the grid labels plus one field string.
+/// Values print through `f64` `Display` — plain decimal notation the value
+/// grammar always re-parses, so the round trip never loses a number.
+fn source_value_fields(value: &SourceValue) -> (&'static [&'static str], Vec<String>) {
+    match value {
+        SourceValue::Dc { value } => (DC_LABELS, vec![format!("{value}")]),
+        SourceValue::Ac { magnitude, phase } => {
+            (AC_LABELS, vec![format!("{magnitude}"), format!("{phase}")])
         }
+        SourceValue::Waveform(Waveform::Sine(s)) => (
+            SIN_LABELS,
+            vec![
+                format!("{}", s.vo), format!("{}", s.va), format!("{}", s.freq),
+                format!("{}", s.td), format!("{}", s.theta),
+            ],
+        ),
+        SourceValue::Waveform(Waveform::Pulse(p)) => (
+            PULSE_LABELS,
+            vec![
+                format!("{}", p.v1), format!("{}", p.v2), format!("{}", p.td),
+                format!("{}", p.tr), format!("{}", p.tf), format!("{}", p.pw),
+                format!("{}", p.per),
+            ],
+        ),
+        _ => (&["Params"], vec![]),
     }
+}
+
+/// Rebuild a typed [`SourceValue`] from the dropdown family and one string
+/// per grid field. Every field re-enters through the shared value grammar,
+/// so suffixes (`2u`) work exactly as they do on a deck card.
+fn source_value_from_fields(family: &str, fields: &[String]) -> Result<SourceValue, String> {
+    let field = |labels: &[&str], i: usize| -> Result<f64, String> {
+        let label = labels.get(i).copied().unwrap_or("param");
+        let text = fields.get(i).map(|s| s.as_str()).unwrap_or("0");
+        let text = if text.is_empty() { "0" } else { text };
+        parse_value(text).map_err(|e| format!("{label}: {e}"))
+    };
+    Ok(match family {
+        "DC" => SourceValue::Dc { value: field(DC_LABELS, 0)? },
+        "AC" => SourceValue::Ac {
+            magnitude: field(AC_LABELS, 0)?,
+            phase: field(AC_LABELS, 1)?,
+        },
+        "SIN" => SourceValue::Waveform(Waveform::Sine(Sine {
+            vo: field(SIN_LABELS, 0)?,
+            va: field(SIN_LABELS, 1)?,
+            freq: field(SIN_LABELS, 2)?,
+            td: field(SIN_LABELS, 3)?,
+            theta: field(SIN_LABELS, 4)?,
+        })),
+        "PULSE" => SourceValue::Waveform(Waveform::Pulse(Pulse {
+            v1: field(PULSE_LABELS, 0)?,
+            v2: field(PULSE_LABELS, 1)?,
+            td: field(PULSE_LABELS, 2)?,
+            tr: field(PULSE_LABELS, 3)?,
+            tf: field(PULSE_LABELS, 4)?,
+            pw: field(PULSE_LABELS, 5)?,
+            per: field(PULSE_LABELS, 6)?,
+        })),
+        _ => return Err("no grid editor for this family".into()),
+    })
 }
 
 #[derive(PartialEq, Eq)]
@@ -192,14 +210,6 @@ enum TranSubTab {
     Differential,
 }
 
-/// Which quantity to show on the frequency-response magnitude plot.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum AcMagScale { Db, Linear }
-
-impl Default for AcMagScale {
-    fn default() -> Self { AcMagScale::Db }
-}
-
 pub struct CircuitSimApp {
     netlist: String,
     file_label: String,
@@ -289,7 +299,7 @@ impl CircuitSimApp {
         Self::default()
     }
     fn generate_netlist_from_schematic(&mut self) {
-        match self.build_schematic_netlist() {
+        match self.schematic.build_netlist() {
             Ok(netlist) => {
                 self.netlist = netlist_emit(&netlist);
                 self.status = Some((true, "Generated netlist from schematic".into()));
@@ -300,383 +310,17 @@ impl CircuitSimApp {
         }
     }
 
-    /// Build the typed netlist IR from the schematic. The editor and the
-    /// simulator then speak one language, and the emitted text comes from the
-    /// canonical [`netlist_emit`] writer instead of hand-built format strings.
-    ///
-    /// Element values are user text with optional SPICE suffixes, so they parse
-    /// through the shared value grammar — a bad literal is reported here
-    /// instead of silently becoming 0.
-    fn build_schematic_netlist(&self) -> Result<Netlist, String> {
-        let assignment = NodeAssignment::of(&self.schematic.components, &self.schematic.wires);
-
-        let mut circuit = CsCircuit::new("schematic");
-        let mut r_idx = 1; let mut c_idx = 1; let mut l_idx = 1; let mut v_idx = 1;
-
-        for c in &self.schematic.components {
-            if c.kind == CompKind::Ground { continue; }
-
-            let n1 = NodeId(assignment.node_of(c.p1));
-            let n2 = NodeId(assignment.node_of(c.p2));
-            circuit.ensure_node(n1.0);
-            circuit.ensure_node(n2.0);
-
-            match c.kind {
-                CompKind::Resistor => {
-                    let resistance = parse_value(&c.val)
-                        .map_err(|e| format!("R{r_idx} value '{}': {e}", c.val))?;
-                    circuit.resistors.push(CsResistor {
-                        name: format!("R{r_idx}"), n1, n2, resistance,
-                        model: None,
-                    });
-                    r_idx += 1;
-                }
-                CompKind::Capacitor => {
-                    let capacitance = parse_value(&c.val)
-                        .map_err(|e| format!("C{c_idx} value '{}': {e}", c.val))?;
-                    circuit.capacitors.push(CsCapacitor {
-                        name: format!("C{c_idx}"), n1, n2, capacitance,
-                        model: None,
-                    });
-                    c_idx += 1;
-                }
-                CompKind::Inductor => {
-                    let inductance = parse_value(&c.val)
-                        .map_err(|e| format!("L{l_idx} value '{}': {e}", c.val))?;
-                    circuit.inductors.push(CsInductor {
-                        name: format!("L{l_idx}"), n1, n2, inductance,
-                        model: None,
-                    });
-                    l_idx += 1;
-                }
-                CompKind::Voltage => {
-                    let voltage = parse_value(&c.val)
-                        .map_err(|e| format!("V{v_idx} value '{}': {e}", c.val))?;
-                    circuit.voltage_sources.push(CsVoltageSource {
-                        name: format!("V{v_idx}"),
-                        n1, n2, voltage,
-                        waveform: None, ac: None,
-                    });
-                    v_idx += 1;
-                }
-                CompKind::Ground => unreachable!(),
-            }
-        }
-
-        let mut analysis = AnalysisCommands::default();
-        analysis.dc_op = true;
-        match self.schematic.analysis_type {
-            AnalysisType::Tran => {
-                let step = parse_value(&self.schematic.tran_step)
-                    .map_err(|e| format!(".tran step '{}': {e}", self.schematic.tran_step))?;
-                let stop = parse_value(&self.schematic.tran_stop)
-                    .map_err(|e| format!(".tran stop '{}': {e}", self.schematic.tran_stop))?;
-                analysis.tran_step = Some(step);
-                analysis.tran_stop = Some(stop);
-                analysis.tran_start = 0.0;
-            }
-            AnalysisType::Ac => {
-                let scale = match self.schematic.ac_variation.to_ascii_lowercase().as_str() {
-                    "dec" => AcScale::Dec,
-                    "oct" => AcScale::Oct,
-                    "lin" => AcScale::Lin,
-                    other => {
-                        return Err(format!(
-                            ".ac sweep type '{other}' must be dec, oct, or lin"
-                        ));
-                    }
-                };
-                let points = self.schematic.ac_points.trim().parse::<usize>()
-                    .map_err(|_| {
-                        format!(".ac points '{}' must be a whole number", self.schematic.ac_points)
-                    })?;
-                let f_start = parse_value(&self.schematic.ac_fstart)
-                    .map_err(|e| format!(".ac start '{}': {e}", self.schematic.ac_fstart))?;
-                let f_stop = parse_value(&self.schematic.ac_fstop)
-                    .map_err(|e| format!(".ac stop '{}': {e}", self.schematic.ac_fstop))?;
-                analysis.ac = Some(AcCommand { scale, points, f_start, f_stop, stimulus_source: None });
-            }
-        }
-
-        Ok(Netlist {
-            circuit,
-            analysis,
-            // Schematic-built decks carry no source text and no parameters:
-            // the parameter language only exists in the text editor.
-            source: String::new(),
-            params: HashMap::new(),
-            funcs: HashMap::new(),
-            mc_seed: 0,
-            // Nothing was parsed here — no import diagnostics exist yet.
-            warnings: Vec::new(),
-            options: ParseOptions::default(),
-            overrides: HashMap::new(),
-        })
-    }
-
-    /// Parse the current netlist text and build a schematic layout from it.
-    ///
-    /// Layout strategy:
-    ///   • Each unique non-ground node gets a vertical column (x = col * COL_W).
-    ///   • Components are placed vertically between their two node columns at
-    ///     increasing y positions (one slot per column pair).
-    ///   • Horizontal wires connect component pins to the node column spine.
-    ///   • A vertical wire runs along each node spine connecting all the pins.
-    ///   • Node 0 (ground) gets a Ground symbol instead of a spine wire.
+    /// Parse the current netlist text and rebuild the schematic from it —
+    /// the column/interval layout lives with the IR in [`crate::schematic`];
+    /// this shell only reports the outcome.
     fn generate_schematic_from_netlist(&mut self) {
-        // ── 1. Parse the netlist through the one shared grammar ──────────────
-        // (The schematic previously re-tokenised the text by hand, silently
-        // dropping every diode/MOSFET card and whatever else it misread.)
-        #[derive(Clone)]
-        struct ParsedComp {
-            kind:   CompKind,
-            node_a: usize,
-            node_b: usize,
-            val:    String,
-        }
-
-        let netlist = match parse(&self.netlist) {
-            Ok(n) => n,
-            Err(e) => {
-                self.status = Some((false, format!("Netlist error: {e}")));
-                return;
+        match SchematicState::from_netlist(&self.netlist, &self.schematic) {
+            Ok((schematic, status)) => {
+                self.schematic = schematic;
+                self.status = Some((true, status));
             }
-        };
-        let circuit = &netlist.circuit;
-        // Tolerant import reports what it carried over but could not apply
-        // (unknown directives, unsupported device families).
-        let import_warnings = netlist.warnings.len();
-
-        // Display of an f64 prints plain decimal notation, which parse_value
-        // always re-parses — the round trip never loses the number.
-        let fmt_val = |v: f64| format!("{v}");
-
-        let mut parsed: Vec<ParsedComp> = vec![];
-        for r in &circuit.resistors {
-            parsed.push(ParsedComp {
-                kind:   CompKind::Resistor,
-                node_a: r.n1.0,
-                node_b: r.n2.0,
-                val:    fmt_val(r.resistance),
-            });
+            Err(e) => self.status = Some((false, e)),
         }
-        for c in &circuit.capacitors {
-            parsed.push(ParsedComp {
-                kind:   CompKind::Capacitor,
-                node_a: c.n1.0,
-                node_b: c.n2.0,
-                val:    fmt_val(c.capacitance),
-            });
-        }
-        for l in &circuit.inductors {
-            parsed.push(ParsedComp {
-                kind:   CompKind::Inductor,
-                node_a: l.n1.0,
-                node_b: l.n2.0,
-                val:    fmt_val(l.inductance),
-            });
-        }
-        for v in &circuit.voltage_sources {
-            // Only the DC level is drawn; PULSE/SIN parameters stay in the
-            // netlist (the schematic has no waveform editing yet).
-            parsed.push(ParsedComp {
-                kind:   CompKind::Voltage,
-                node_a: v.n1.0,
-                node_b: v.n2.0,
-                val:    fmt_val(v.voltage),
-            });
-        }
-        // Diodes, MOSFETs and current sources have no schematic symbol yet —
-        // count them instead of silently dropping them like the old
-        // hand-parser did.
-        let skipped =
-            circuit.diodes.len() + circuit.mosfets.len() + circuit.current_sources.len();
-
-        if parsed.is_empty() {
-            let msg = if skipped > 0 {
-                format!(
-                    "No supported components (R/C/L/V) found in netlist — {} diode/MOSFET/current-source element(s) have no schematic symbol",
-                    skipped
-                )
-            } else {
-                "No supported components (R/C/L/V) found in netlist".into()
-            };
-            self.status = Some((false, msg));
-            return;
-        }
-
-        // ── 2. Collect all non-ground node numbers and assign columns ─────────
-        let mut node_set: Vec<usize> = vec![];
-        for c in &parsed {
-            for &n in &[c.node_a, c.node_b] {
-                if n != 0 && !node_set.contains(&n) {
-                    node_set.push(n);
-                }
-            }
-        }
-        node_set.sort_unstable();
-
-        let node_to_col: HashMap<usize, i32> = node_set
-        .iter()
-        .enumerate()
-        .map(|(i, &n)| (n, i as i32))
-        .collect();
-
-        // ── 3. Lay out components ─────────────────────────────────────────────
-        const COL_W:    i32 = 6;
-        const COMP_LEN: i32 = 4;
-        const ROW_GAP:  i32 = 6;
-        const ORIGIN_X: i32 = 3;
-        const ORIGIN_Y: i32 = 3;
-
-        let mut new_components: Vec<Component> = vec![];
-        let mut new_wires:      Vec<Wire>      = vec![];
-        let mut spine_pins: HashMap<usize, Vec<i32>> = HashMap::new();
-
-        // Tracker for packing parallel components efficiently into rows
-        struct Interval { start: i32, end: i32 }
-        let mut row_intervals: Vec<Vec<Interval>> = vec![];
-
-        for comp in &parsed {
-            let col_a = node_to_col.get(&comp.node_a).copied().unwrap_or(-1);
-            let col_b = node_to_col.get(&comp.node_b).copied().unwrap_or(-1);
-
-            // Ignore malformed ground-to-ground components
-            if col_a < 0 && col_b < 0 { continue; }
-
-            let start_half: i32;
-            let end_half: i32;
-            let mut mid_half: i32;
-
-            // Calculate "half-column" intervals to map out the X-axis territory
-            if col_a >= 0 && col_b >= 0 {
-                start_half = col_a.min(col_b) * 2;
-                end_half = col_a.max(col_b) * 2;
-                mid_half = start_half + (end_half - start_half) / 2;
-
-                // If midpoint lands exactly on a spine (even), push it to the right channel
-                if mid_half % 2 == 0 { mid_half += 1; }
-            } else {
-                let c = col_a.max(col_b); // The non-ground column
-                start_half = c * 2;
-                end_half = c * 2 + 1;
-                mid_half = end_half; // Push ground components into the right-side channel
-            }
-
-            // Interval Packer: Find the lowest Y-row where this X-interval doesn't collide
-            let mut row = 0;
-            loop {
-                if row >= row_intervals.len() {
-                    row_intervals.push(vec![]);
-                }
-                // Overlap check (they collide if they share any X-territory)
-                let overlaps = row_intervals[row].iter().any(|i| {
-                    !(end_half < i.start || start_half > i.end)
-                });
-
-                if !overlaps {
-                    row_intervals[row].push(Interval { start: start_half, end: end_half });
-                    break;
-                }
-                row += 1;
-            }
-
-            let y_top = ORIGIN_Y + (row as i32) * (COMP_LEN + ROW_GAP);
-            let comp_x = ORIGIN_X + mid_half * (COL_W / 2);
-
-            let p1 = GridPt(comp_x, y_top);
-            let p2 = GridPt(comp_x, y_top + COMP_LEN);
-
-            new_components.push(Component {
-                kind: comp.kind,
-                p1,
-                p2,
-                val: comp.val.clone(),
-            });
-
-            // Horizontal wire: p1 -> spine of pin1_node
-            if comp.node_a != 0 {
-                let spine_x = ORIGIN_X + col_a * COL_W;
-                if spine_x != comp_x {
-                    new_wires.push(Wire { p1: GridPt(comp_x, y_top), p2: GridPt(spine_x, y_top) });
-                }
-                spine_pins.entry(comp.node_a).or_default().push(y_top);
-            } else {
-                // Ground pin for node A
-                new_components.push(Component {
-                    kind: CompKind::Ground,
-                    p1: GridPt(comp_x, y_top),
-                                    p2: GridPt(comp_x, y_top),
-                                    val: "".into(),
-                });
-            }
-
-            // Horizontal wire: p2 -> spine of pin2_node
-            if comp.node_b != 0 {
-                let spine_x = ORIGIN_X + col_b * COL_W;
-                if spine_x != comp_x {
-                    new_wires.push(Wire { p1: GridPt(comp_x, y_top + COMP_LEN), p2: GridPt(spine_x, y_top + COMP_LEN) });
-                }
-                spine_pins.entry(comp.node_b).or_default().push(y_top + COMP_LEN);
-            } else {
-                // Ground pin for node B
-                new_components.push(Component {
-                    kind: CompKind::Ground,
-                    p1: GridPt(comp_x, y_top + COMP_LEN),
-                                    p2: GridPt(comp_x, y_top + COMP_LEN),
-                                    val: "".into(),
-                });
-            }
-        }
-
-        // ── 4. Vertical spine wires for each non-ground node ─────────────────
-        for (&node, pins) in &spine_pins {
-            let y_min = *pins.iter().min().unwrap();
-            let y_max = *pins.iter().max().unwrap();
-            // Only draw the vertical spine if the node connects across multiple Y levels
-            if y_min != y_max {
-                let spine_x = ORIGIN_X + node_to_col[&node] * COL_W;
-                new_wires.push(Wire { p1: GridPt(spine_x, y_min), p2: GridPt(spine_x, y_max) });
-            }
-        }
-
-        // ── 5. Analysis directives from the typed parse ──────────────────────
-        // (The editor radio is single-choice; when a netlist carries both
-        // sweeps, AC wins the UI — the simulation itself still runs both.)
-        let a = &netlist.analysis;
-        if let Some(ac) = &a.ac {
-            self.schematic.analysis_type = AnalysisType::Ac;
-            self.schematic.ac_variation = match ac.scale {
-                AcScale::Dec => "dec",
-                AcScale::Oct => "oct",
-                AcScale::Lin => "lin",
-            }.to_string();
-            self.schematic.ac_points = ac.points.to_string();
-            self.schematic.ac_fstart = format!("{}", ac.f_start);
-            self.schematic.ac_fstop  = format!("{}", ac.f_stop);
-        } else if a.tran_step.is_some() {
-            self.schematic.analysis_type = AnalysisType::Tran;
-            self.schematic.tran_step = format!("{}", a.tran_step.unwrap());
-            self.schematic.tran_stop = format!("{}", a.tran_stop.unwrap_or(0.0));
-        }
-
-        // ── 6. Commit ─────────────────────────────────────────────────────────
-        self.schematic.components         = new_components;
-        self.schematic.wires              = new_wires;
-        self.schematic.selected_component = None;
-        self.schematic.selected_wire      = None;
-        self.schematic.pan                = Vec2::ZERO;
-        self.schematic.zoom               = 1.0;
-
-        let n = parsed.len();
-        let mut status = format!("Imported {} component(s) from netlist", n);
-        if skipped > 0 {
-            status.push_str(&format!(" ({} D/M/I element(s) not drawn)", skipped));
-        }
-        if import_warnings > 0 {
-            status.push_str(&format!(" · {} import warning(s)", import_warnings));
-        }
-        self.status = Some((true, status));
     }
 
     fn run_simulation(&mut self) {
@@ -983,32 +627,11 @@ impl CircuitSimApp {
     fn schematic_panel(&mut self, ui: &mut egui::Ui) {
         // Handle keyboard shortcut for rotation (Spacebar)
         if ui.input(|i| i.key_pressed(egui::Key::Space)) {
-            if let Some(idx) = self.schematic.selected_component {
-                // Rotate the selected component 90 degrees around p1
-                if let Some(c) = self.schematic.components.get_mut(idx) {
-                    let dx = c.p2.0 - c.p1.0;
-                    let dy = c.p2.1 - c.p1.1;
-
-                    // 90-degree rotation formula: (x, y) -> (-y, x)
-                    let new_dx = -dy;
-                    let new_dy = dx;
-
-                    let old_p2 = c.p2;
-                    c.p2 = GridPt(c.p1.0 + new_dx, c.p1.1 + new_dy);
-
-                    // Keep wires attached to the rotated pin
-                    for w in self.schematic.wires.iter_mut() {
-                        if w.p1 == old_p2 {
-                            w.p1 = c.p2;
-                        }
-                        if w.p2 == old_p2 {
-                            w.p2 = c.p2;
-                        }
-                    }
-                }
+            if self.schematic.selected_component.is_some() {
+                self.schematic.rotate_selected();
             } else {
                 // No component selected, update future placement direction
-                self.schematic.current_dir = self.schematic.current_dir.next();
+                self.schematic.advance_direction();
             }
         }
 
@@ -1049,7 +672,7 @@ impl CircuitSimApp {
                     .min_size(egui::vec2(0.0, 24.0));
 
                     if ui.add(btn).clicked() {
-                        self.schematic.tool = t;
+                        self.schematic.select_tool(t);
                     }
                 }
 
@@ -1082,7 +705,7 @@ impl CircuitSimApp {
                     .min_size(egui::vec2(0.0, 24.0));
 
                     if ui.add(btn).clicked() {
-                        self.schematic.tool = t;
+                        self.schematic.select_tool(t);
                     }
                 }
 
@@ -1542,30 +1165,7 @@ impl CircuitSimApp {
                     if current_grid != last_grid {
                         let dx = current_grid.0 - last_grid.0;
                         let dy = current_grid.1 - last_grid.1;
-
-                        if let Some(c) = self.schematic.components.get_mut(idx) {
-                            let old_p1 = c.p1;
-                            let old_p2 = c.p2;
-
-                            // Move component endpoints
-                            c.p1.0 += dx;
-                            c.p1.1 += dy;
-                            c.p2.0 += dx;
-                            c.p2.1 += dy;
-
-                            // Stretch wires attached to the component's pins
-                            for w in self.schematic.wires.iter_mut() {
-                                if w.p1 == old_p1 || w.p1 == old_p2 {
-                                    w.p1.0 += dx;
-                                    w.p1.1 += dy;
-                                }
-                                if w.p2 == old_p1 || w.p2 == old_p2 {
-                                    w.p2.0 += dx;
-                                    w.p2.1 += dy;
-                                }
-                            }
-                        }
-
+                        self.schematic.drag_component(idx, dx, dy);
                         self.schematic.drag_last_grid = Some(current_grid);
                     }
                 }
@@ -1583,41 +1183,9 @@ impl CircuitSimApp {
                 ));
 
                 match self.schematic.tool {
-                    Tool::Wire => {
-                        if let Some(start) = self.schematic.active_wire_start {
-                            if start != grid_pt {
-                                self.schematic.wires.push(Wire { p1: start, p2: grid_pt });
-                            }
-                            self.schematic.active_wire_start = None;
-                        } else {
-                            self.schematic.active_wire_start = Some(grid_pt);
-                        }
-                    }
-                    Tool::R | Tool::C | Tool::L | Tool::V => {
-                        let kind = match self.schematic.tool {
-                            Tool::R => CompKind::Resistor, Tool::C => CompKind::Capacitor,
-                            Tool::L => CompKind::Inductor, Tool::V => CompKind::Voltage,
-                            _ => unreachable!(),
-                        };
-                        let val = match kind {
-                            CompKind::Resistor => "1k", CompKind::Capacitor => "1u",
-                            CompKind::Inductor => "1m", CompKind::Voltage => "DC 5",
-                            _ => "",
-                        }.to_string();
-
-                        // Calculate P2 based on current rotation direction
-                        let (dx, dy) = self.schematic.current_dir.offset(3);
-                        self.schematic.components.push(Component {
-                            kind,
-                            p1: grid_pt,
-                            p2: GridPt(grid_pt.0 + dx, grid_pt.1 + dy),
-                                                       val
-                        });
-                    }
-                    Tool::Gnd => {
-                        self.schematic.components.push(Component {
-                            kind: CompKind::Ground, p1: grid_pt, p2: grid_pt, val: "".into()
-                        });
+                    Tool::Wire => self.schematic.wire_click(grid_pt),
+                    Tool::R | Tool::C | Tool::L | Tool::V | Tool::Gnd => {
+                        self.schematic.place_at(grid_pt);
                     }
                     Tool::Select => {
                         let mut selected = None;
@@ -1635,11 +1203,11 @@ impl CircuitSimApp {
                                 break;
                             }
                         }
-                        self.schematic.selected_component = selected;
-
-                        // If no component hit, check wires
+                        // If no component hit, check wires; the hit-test
+                        // result goes through the model so the selection
+                        // fields can never disagree.
+                        let mut hit_wire = None;
                         if selected.is_none() {
-                            let mut hit_wire = None;
                             for (wi, w) in self.schematic.wires.iter().enumerate() {
                                 let a = to_screen(w.p1);
                                 let b = to_screen(w.p2);
@@ -1660,10 +1228,8 @@ impl CircuitSimApp {
                                     break;
                                 }
                             }
-                            self.schematic.selected_wire = hit_wire;
-                        } else {
-                            self.schematic.selected_wire = None;
                         }
+                        self.schematic.select(selected, hit_wire);
                     }
                 }
 
@@ -1676,9 +1242,7 @@ impl CircuitSimApp {
 
         // Cancel wire dragging on Right Click
         if response.secondary_clicked() {
-            self.schematic.active_wire_start = None;
-            self.schematic.selected_component = None; // Deselect on right click
-            self.schematic.selected_wire = None;
+            self.schematic.cancel_gesture();
         }
 
         // Delete key removes selected wire or component
@@ -1739,8 +1303,7 @@ impl CircuitSimApp {
             }
         }
         if let Some(wi) = delete_wire_idx {
-            self.schematic.wires.remove(wi);
-            self.schematic.selected_wire = None;
+            self.schematic.delete_wire(wi);
         }
 
         // --- ADD THIS AT THE END OF schematic_panel ---
@@ -1794,11 +1357,13 @@ impl CircuitSimApp {
                     ui.separator();
                     ui.add_space(6.0);
                     if c.kind == CompKind::Voltage {
-                        // Determine current type based on string prefix
-                        let current_type = if c.val.starts_with("SIN") { "SIN" }
-                        else if c.val.starts_with("PULSE") { "PULSE" }
-                        else if c.val.starts_with("AC") { "AC" }
-                        else { "DC" };
+                        // The deck grammar owns source values: parse once to
+                        // classify for the dropdown, edit the typed fields,
+                        // re-emit. Hand string surgery is gone from here.
+                        let parse_opts = ParseOptions::default();
+                        let current_type = parse_source_value(&c.val, &parse_opts)
+                            .map(|v| source_value_family(&v))
+                            .unwrap_or("DC"); // unparseable text: dropdown only
 
                         let mut new_type = current_type;
                         let mem_id = ui.id().with("v_params").with(idx);
@@ -1817,108 +1382,94 @@ impl CircuitSimApp {
                                 ui.selectable_value(&mut new_type, "PULSE", "Pulse");
                             });
 
-                            // Auto-fill a template if the user changes the dropdown type
+                            // Auto-fill a template if the user changes the
+                            // dropdown type; the grammar's writer emits it, so
+                            // every card value in the deck is round-trippable.
                             if new_type != current_type {
-                                c.val = match new_type {
-                                    "DC" => "DC 5".to_string(),
-                                      "AC" => "AC 1 0".to_string(),
-                                      "SIN" => "SIN(0 5 1k 0 0)".to_string(),
-                                      "PULSE" => "PULSE(0 5 1m 1u 1u 5m 10m)".to_string(),
-                                      _ => c.val.clone(),
+                                let value = match new_type {
+                                    "DC" => SourceValue::Dc { value: 5.0 },
+                                    "AC" => SourceValue::Ac { magnitude: 1.0, phase: 0.0 },
+                                    "SIN" => SourceValue::Waveform(Waveform::Sine(Sine {
+                                        vo: 0.0, va: 5.0, freq: 1e3, td: 0.0, theta: 0.0,
+                                    })),
+                                    "PULSE" => SourceValue::Waveform(Waveform::Pulse(Pulse {
+                                        v1: 0.0, v2: 5.0, td: 1e-3, tr: 1e-6, tf: 1e-6,
+                                        pw: 5e-3, per: 1e-2,
+                                    })),
+                                    _ => return,
                                 };
+                                c.val = emit_source_value(&value);
                             }
                         });
 
                         ui.add_space(6.0);
 
-                        // Cache strings in UI memory so text cursors survive immediate mode updates
+                        // The grid only exists for families the editor knows
+                        // (DC / AC / SIN / PULSE). Other families keep their
+                        // canonical text until a template rewrite applies.
+                        let editable: Option<(&'static [&'static str], Vec<String>)> =
+                            match parse_source_value(&c.val, &parse_opts) {
+                                Ok(value) if source_value_family(&value) != "Params" => {
+                                    Some(source_value_fields(&value))
+                                }
+                                _ => None,
+                            };
+
+                        // Cache strings in UI memory so text cursors survive
+                        // immediate mode updates; fields re-derive from the
+                        // typed parse whenever the card text changed outside
+                        // this grid.
                         let mut cache: (String, Vec<String>) = ui.data_mut(|d| {
-                            let mut cache = d.get_temp::<(String, Vec<String>)>(mem_id).unwrap_or_else(|| {
-                                ("".to_string(), vec![])
-                            });
+                            let mut cache = d
+                                .get_temp::<(String, Vec<String>)>(mem_id)
+                                .unwrap_or_else(|| (String::new(), vec![]));
 
-                            // Re-parse from c.val if the external string was altered (e.g., loaded/changed type)
                             if cache.0 != c.val {
-                                let expected_len = match new_type {
-                                    "DC" => 1, "AC" => 2, "SIN" => 5, "PULSE" => 7, _ => 1,
-                                };
-                                let mut extracted = vec![];
-                                let s = &c.val;
-
-                                if new_type == "SIN" || new_type == "PULSE" {
-                                    if let Some(start) = s.find('(') {
-                                        let end = s.rfind(')').unwrap_or(s.len());
-                                        let inner = &s[start+1..end];
-                                        extracted = inner.split_whitespace().map(|x| x.to_string()).collect();
-                                    }
-                                } else {
-                                    let inner = if s.starts_with(new_type) {
-                                        s[new_type.len()..].trim()
-                                    } else {
-                                        s.trim()
-                                    };
-                                    extracted = inner.split_whitespace().map(|x| x.to_string()).collect();
+                                if let Some((_, fields)) = &editable {
+                                    cache.1 = fields.clone();
                                 }
-
-                                // Pad or truncate to ensure perfect UI grid mapping
-                                while extracted.len() < expected_len {
-                                    extracted.push("".to_string());
-                                }
-                                extracted.truncate(expected_len);
-
-                                cache.1 = extracted;
                                 cache.0 = c.val.clone();
                             }
                             cache
                         });
 
-                        let labels = match new_type {
-                            "DC" => vec!["Voltage"],
-                            "AC" => vec!["Magnitude", "Phase"],
-                            "SIN" => vec!["V_offset", "V_amp", "Freq", "T_delay", "Theta"],
-                            "PULSE" => vec!["V_initial", "V_on", "T_delay", "T_rise", "T_fall", "T_on", "T_period"],
-                            _ => vec!["Params"],
-                        };
+                        if let Some((labels, _)) = &editable {
+                            let mut changed = false;
 
-                        let mut changed = false;
-
-                        // Display parameters in an organized vertical grid
-                        egui::Grid::new("v_params_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
-                            for (i, label) in labels.iter().enumerate() {
-                                ui.label(egui::RichText::new(*label).size(11.0).color(TEXT_SECONDARY));
-                                if ui.add(egui::TextEdit::singleline(&mut cache.1[i]).desired_width(70.0)).changed() {
-                                    changed = true;
+                            // Display parameters in an organized vertical grid
+                            egui::Grid::new("v_params_grid").num_columns(2).spacing([8.0, 6.0]).show(ui, |ui| {
+                                for (i, label) in labels.iter().enumerate() {
+                                    ui.label(egui::RichText::new(*label).size(11.0).color(TEXT_SECONDARY));
+                                    if ui.add(egui::TextEdit::singleline(&mut cache.1[i]).desired_width(70.0)).changed() {
+                                        changed = true;
+                                    }
+                                    ui.end_row();
                                 }
-                                ui.end_row();
-                            }
-                        });
+                            });
 
-                        // Reconstruct SPICE param string seamlessly on edit
-                        if changed {
-                            c.val = match new_type {
-                                "DC" => {
-                                    let v = if cache.1[0].is_empty() { "0" } else { &cache.1[0] };
-                                    format!("DC {}", v)
-                                },
-                                "AC" => {
-                                    let mag = if cache.1[0].is_empty() { "0" } else { &cache.1[0] };
-                                    let phase = if cache.1[1].is_empty() { "0" } else { &cache.1[1] };
-                                    format!("AC {} {}", mag, phase)
-                                },
-                                "SIN" => {
-                                    format!("SIN({})", cache.1.join(" "))
-                                },
-                                "PULSE" => {
-                                    format!("PULSE({})", cache.1.join(" "))
-                                },
-                                _ => cache.1.join(" "),
-                            };
-                            cache.0 = c.val.clone(); // Inform cache that we drove this update safely
+                            // Reconstruct the card text seamlessly on edit —
+                            // each field re-enters through the value grammar
+                            // and the writer owns the family spelling. A field
+                            // that does not parse keeps the card's previous
+                            // value instead of smuggling raw text into the
+                            // netlist.
+                            if changed {
+                                if let Ok(value) = source_value_from_fields(new_type, &cache.1) {
+                                    c.val = emit_source_value(&value);
+                                }
+                                cache.0 = c.val.clone();
+                            }
+                        } else {
+                            ui.horizontal(|ui| {
+                                ui.label(egui::RichText::new("Value").size(11.0).color(TEXT_SECONDARY));
+                                ui.add_space(4.0);
+                                ui.label(egui::RichText::new(&c.val).size(11.0).color(TEXT_SECONDARY));
+                            });
                         }
 
                         ui.data_mut(|d| d.insert_temp(mem_id, cache));
 
-                    } else if c.kind != CompKind::Ground {
+                                        } else if c.kind != CompKind::Ground {
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new("Value").size(11.0).color(TEXT_SECONDARY));
                             ui.add_space(4.0);
@@ -1953,8 +1504,7 @@ impl CircuitSimApp {
 
         // Apply deletion if requested
         if let Some(idx) = delete_idx {
-            self.schematic.components.remove(idx);
-            self.schematic.selected_component = None;
+            self.schematic.delete_component(idx);
         }
 
     }
@@ -2184,28 +1734,14 @@ impl CircuitSimApp {
                 });
                 ui.add_space(6.0);
 
-                let apply_b = self.plot.dc_apply;
-                let bounds = self.plot.dc_bounds;
+                let apply = self.plot.dc_apply.then(|| self.plot.dc_bounds);
+                self.plot.dc_apply = false;
                 let x_label = sweep.targets.first().cloned().unwrap_or_else(|| "sweep".into());
                 let series = dc_sweep_series(sweep, &self.dc_plot_nodes, &self.node_names, 1.0, 1.0);
-                self.plot.dc_apply = false;
-
-                Plot::new("dc_sweep_plot")
-                .height(260.0)
-                .x_axis_label(x_label)
-                .y_axis_label("Voltage (V)")
-                .y_axis_min_width(50.0)
-                .legend(Legend::default().position(egui_plot::Corner::RightTop))
-                .show_background(true)
-                .allow_scroll(true)
-                .allow_drag(true)
-                .allow_boxed_zoom(true)
-                .show(ui, |plot_ui| {
-                    if apply_b {
-                        apply_bounds(plot_ui, &bounds);
-                    }
-                    draw(plot_ui, &series, 2.0);
-                });
+                plot_frame(
+                    "dc_sweep_plot", 260.0, &x_label, "Voltage (V)",
+                    &series, apply, ui,
+                );
             } else {
                 // Nested sweep: a table — `${outer} • ${inner}` pairs don't line
                 // up into a single curve, so the numbers are shown directly.
@@ -2285,30 +1821,13 @@ impl CircuitSimApp {
 
                 code_frame().show(ui, |ui| {
                     let adjusted_height = ui.available_height();
-                    let plot = Plot::new("waveforms")
-                    .height(adjusted_height)
-                    .x_axis_label("time (s)")
-                    .y_axis_label("Voltage (V)")
-                    .y_axis_min_width(50.0)
-                    .legend(Legend::default().position(egui_plot::Corner::RightTop))
-                    .show_background(true)
-                    .allow_scroll(true)
-                    .allow_drag(true)
-                    .allow_boxed_zoom(true);
-
                     let series = tran_voltage_series(tran, &self.plot_nodes, &self.node_names, x_mult, y_mult);
-                    let apply_b = self.plot.tran_apply;
-                    let bounds = self.plot.tran_bounds;
-                    if apply_b {
-                        self.plot.tran_apply = false;
-                    }
-
-                    plot.show(ui, |plot_ui| {
-                        if apply_b {
-                            apply_bounds(plot_ui, &bounds);
-                        }
-                        draw(plot_ui, &series, 2.0);
-                    });
+                    let apply = self.plot.tran_apply.then(|| self.plot.tran_bounds);
+                    self.plot.tran_apply = false;
+                    plot_frame(
+                        "waveforms", adjusted_height, "time (s)", "Voltage (V)",
+                        &series, apply, ui,
+                    );
                 });
             }
 
@@ -2322,35 +1841,18 @@ impl CircuitSimApp {
                 ui.add_space(8.0);
                 code_frame().show(ui, |ui| {
                     let adjusted_height = ui.available_height();
-                    let plot = Plot::new("waveforms_current")
-                    .height(adjusted_height)
-                    .x_axis_label("time (s)")
-                    .y_axis_label("Current (A)")
-                    .y_axis_min_width(50.0)
-                    .legend(Legend::default().position(egui_plot::Corner::RightTop))
-                    .show_background(true)
-                    .allow_scroll(true)
-                    .allow_drag(true)
-                    .allow_boxed_zoom(true);
-
                     let series = tran_current_series(
                         tran,
                         self.circuit.as_ref().unwrap_or(&CsCircuit::default()),
                         x_mult,
                         y_mult,
                     );
-                    let apply_b = self.plot.tran_apply;
-                    let bounds = self.plot.tran_bounds;
-                    if apply_b {
-                        self.plot.tran_apply = false;
-                    }
-
-                    plot.show(ui, |plot_ui| {
-                        if apply_b {
-                            apply_bounds(plot_ui, &bounds);
-                        }
-                        draw(plot_ui, &series, 2.0);
-                    });
+                    let apply = self.plot.tran_apply.then(|| self.plot.tran_bounds);
+                    self.plot.tran_apply = false;
+                    plot_frame(
+                        "waveforms_current", adjusted_height, "time (s)", "Current (A)",
+                        &series, apply, ui,
+                    );
                 });
             }
 
@@ -2404,30 +1906,14 @@ impl CircuitSimApp {
 
                 code_frame().show(ui, |ui| {
                     let adjusted_height = ui.available_height();
-                    let plot = Plot::new("waveforms_diff")
-                        .height(adjusted_height)
-                        .x_axis_label("time (s)")
-                        .y_axis_label(format!("V({}) − V({})  (V)", node_label(&self.node_names, node_a), node_label(&self.node_names, node_b)))
-                        .y_axis_min_width(50.0)
-                        .legend(Legend::default().position(egui_plot::Corner::RightTop))
-                        .show_background(true)
-                        .allow_scroll(true)
-                        .allow_drag(true)
-                        .allow_boxed_zoom(true);
-
                     let series = tran_diff_series(tran, node_a, node_b, &self.node_names, x_mult, y_mult);
-                    let apply_b = self.plot.tran_apply;
-                    let bounds = self.plot.tran_bounds;
-                    if apply_b {
-                        self.plot.tran_apply = false;
-                    }
-
-                    plot.show(ui, |plot_ui| {
-                        if apply_b {
-                            apply_bounds(plot_ui, &bounds);
-                        }
-                        draw(plot_ui, &series, 2.0);
-                    });
+                    let apply = self.plot.tran_apply.then(|| self.plot.tran_bounds);
+                    self.plot.tran_apply = false;
+                    plot_frame(
+                        "waveforms_diff", adjusted_height, "time (s)",
+                        &format!("V({}) − V({})  (V)", node_label(&self.node_names, node_a), node_label(&self.node_names, node_b)),
+                        &series, apply, ui,
+                    );
                 });
             }
         }
@@ -2512,103 +1998,22 @@ impl CircuitSimApp {
         };
 
         code_frame().show(ui, |ui| {
-            let mut plot = Plot::new("ac_magnitude")
-            .height(half_h.max(120.0))
-            .x_axis_label("frequency (Hz)")
-            .y_axis_label(mag_label)
-            .y_axis_min_width(50.0)
-            .legend(Legend::default().position(egui_plot::Corner::RightTop))
-            .show_background(true)
-            .allow_scroll(true)
-            .allow_drag(true)
-            .allow_boxed_zoom(true);
-
-            plot = match mag_scale {
-                AcMagScale::Db => plot
-                    .x_grid_spacer(egui_plot::log_grid_spacer(10))
-                    // NEW: Format the X-axis ticks so they display actual frequencies, not log10 exponents
-                    .x_axis_formatter(|mark, _range| {
-                        // Note: If you are using an older egui version where `mark` is an f64, remove `.value`
-                        let f = 10.0_f64.powf(mark.value);
-
-                        if f >= 1e9 { format!("{:.1} G", f / 1e9) }
-                        else if f >= 1e6 { format!("{:.1} M", f / 1e6) }
-                        else if f >= 1e3 { format!("{:.1} k", f / 1e3) }
-                        else { format!("{:.1}", f) }
-                    })
-                    .label_formatter(move |name, val| {
-                        if name.is_empty() { return String::new(); }
-                        let f = 10.0_f64.powf(val.x);
-                        // FIXED: Using `f` instead of `val.x`
-                        format!("{}\nf = {:.3e} Hz\n{} = {:.3e}", name, f, mag_label, val.y)
-                    }),
-
-                AcMagScale::Linear => plot
-                    // NEW: Added formatter here too for visual consistency if they use Linear mode
-                    .x_axis_formatter(|mark, _range| {
-                        let f = mark.value; // No 10^x transform needed in linear mode
-
-                        if f >= 1e9 { format!("{:.1} G", f / 1e9) }
-                        else if f >= 1e6 { format!("{:.1} M", f / 1e6) }
-                        else if f >= 1e3 { format!("{:.1} k", f / 1e3) }
-                        else { format!("{:.1}", f) }
-                    })
-                    .label_formatter(move |name, val| {
-                        if name.is_empty() { return String::new(); }
-                        format!("{}\nf = {:.3e} Hz\n{} = {:.3e}", name, val.x, mag_label, val.y)
-                    }),
-            };
-
-            plot.show(ui, |plot_ui| {
-
-                // NEW: Apply bounds to Magnitude Plot
-                if apply_b {
-                    apply_bounds(plot_ui, &mag_bounds);
-                }
-
-                draw(plot_ui, &node_mag_series, 2.0);
-            });
+            let apply = apply_b.then(|| mag_bounds);
+            ac_plot_frame(
+                "ac_magnitude", half_h.max(120.0), mag_scale, AcCursor::Quantity(mag_label.to_string()),
+                &mag_label, &node_mag_series, apply, ui,
+            );
         });
 
         ui.add_space(8.0);
 
         // ── Phase plot ───────────────────────────────────────────────────────
         code_frame().show(ui, |ui| {
-            let mut plot = Plot::new("ac_phase")
-            .height(half_h.max(120.0))
-            .x_axis_label("frequency (Hz)")
-            .y_axis_label("phase (°)")
-            .y_axis_min_width(50.0)
-            .legend(Legend::default().position(egui_plot::Corner::RightTop))
-            .show_background(true)
-            .allow_scroll(true)
-            .allow_drag(true)
-            .allow_boxed_zoom(true);
-
-            plot = match mag_scale {
-                AcMagScale::Db => plot
-                .x_grid_spacer(egui_plot::log_grid_spacer(10))
-                .label_formatter(|name, val| {
-                    if name.is_empty() { return String::new(); }
-                    let f = 10.0_f64.powf(val.x);
-                    format!("{}\nf = {:.3e} Hz\nphase = {:.2}°", name, f, val.y)
-                }),
-                AcMagScale::Linear => plot
-                .label_formatter(|name, val| {
-                    if name.is_empty() { return String::new(); }
-                    format!("{}\nf = {:.3e} Hz\nphase = {:.2}°", name, val.x, val.y)
-                }),
-            };
-
-            plot.show(ui, |plot_ui| {
-
-                // Apply bounds to Phase Plot
-                if apply_b {
-                    apply_bounds(plot_ui, &phase_bounds);
-                }
-
-                draw(plot_ui, &node_phase_series, 2.0);
-            });
+            let apply = apply_b.then(|| phase_bounds);
+            ac_plot_frame(
+                "ac_phase", half_h.max(120.0), mag_scale, AcCursor::Phase,
+                "phase (°)", &node_phase_series, apply, ui,
+            );
         });
 
         ui.add_space(8.0);
@@ -2619,74 +2024,24 @@ impl CircuitSimApp {
                 AcMagScale::Db     => "current magnitude (dB·A)",
                 AcMagScale::Linear => "current magnitude (A)",
             };
-            let mut plot = Plot::new("ac_branch_current_mag")
-            .height(half_h.max(120.0))
-            .x_axis_label("frequency (Hz)")
-            .y_axis_label(cur_mag_label)
-            .legend(Legend::default().position(egui_plot::Corner::RightTop))
-            .show_background(true)
-            .allow_scroll(true)
-            .allow_drag(true)
-            .allow_boxed_zoom(true);
-
-            plot = match mag_scale {
-                AcMagScale::Db => plot
-                    .x_grid_spacer(egui_plot::log_grid_spacer(10))
-                    .label_formatter(move |name, val| {
-                        if name.is_empty() { return String::new(); }
-                        let f = 10.0_f64.powf(val.x);
-                        format!("{}\nf = {:.3e} Hz\n{} = {:.3e}", name, f, cur_mag_label, val.y)
-                    }),
-                AcMagScale::Linear => plot
-                    .label_formatter(move |name, val| {
-                        if name.is_empty() { return String::new(); }
-                        format!("{}\nf = {:.3e} Hz\n{} = {:.3e}", name, val.x, cur_mag_label, val.y)
-                    }),
-            };
-
-            plot.show(ui, |plot_ui| {
-                if apply_b {
-                    apply_bounds(plot_ui, &mag_bounds);
-                }
-                draw(plot_ui, &cur_mag_series, 2.0);
-            });
+            let apply = apply_b.then(|| mag_bounds);
+            ac_plot_frame(
+                "ac_branch_current_mag", half_h.max(120.0), mag_scale,
+                AcCursor::Quantity(cur_mag_label.to_string()), cur_mag_label,
+                &cur_mag_series, apply, ui,
+            );
         });
 
         ui.add_space(8.0);
 
         // ── Branch current phase plot ─────────────────────────────────────────
         code_frame().show(ui, |ui| {
-            let mut plot = Plot::new("ac_branch_current_phase")
-            .height(half_h.max(120.0))
-            .x_axis_label("frequency (Hz)")
-            .y_axis_label("current phase (°)")
-            .legend(Legend::default().position(egui_plot::Corner::RightTop))
-            .show_background(true)
-            .allow_scroll(true)
-            .allow_drag(true)
-            .allow_boxed_zoom(true);
-
-            plot = match mag_scale {
-                AcMagScale::Db => plot
-                    .x_grid_spacer(egui_plot::log_grid_spacer(10))
-                    .label_formatter(|name, val| {
-                        if name.is_empty() { return String::new(); }
-                        let f = 10.0_f64.powf(val.x);
-                        format!("{}\nf = {:.3e} Hz\nphase = {:.2}°", name, f, val.y)
-                    }),
-                AcMagScale::Linear => plot
-                    .label_formatter(|name, val| {
-                        if name.is_empty() { return String::new(); }
-                        format!("{}\nf = {:.3e} Hz\nphase = {:.2}°", name, val.x, val.y)
-                    }),
-            };
-
-            plot.show(ui, |plot_ui| {
-                if apply_b {
-                    apply_bounds(plot_ui, &phase_bounds);
-                }
-                draw(plot_ui, &cur_phase_series, 2.0);
-            });
+            let apply = apply_b.then(|| phase_bounds);
+            ac_plot_frame(
+                "ac_branch_current_phase", half_h.max(120.0), mag_scale,
+                AcCursor::Phase, "current phase (°)",
+                &cur_phase_series, apply, ui,
+            );
         });
 
         // Toggle off the bounds application after all plots have processed it

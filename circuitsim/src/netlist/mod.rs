@@ -654,3 +654,52 @@ pub fn emit(netlist: &Netlist) -> String {
     out.push_str(".end\n");
     out
 }
+
+// ─── Source-value bridge (frontends edit through the core grammar) ──────────
+
+/// The value of an independent `V`/`I` source, in the deck's own vocabulary:
+/// `DC <value>`, `AC <magnitude> <phase>`, or one of the waveform families
+/// (`PULSE`, `SIN`, `EXP`, `PWL`, `SFFM`, `AM`). Kept public so frontends
+/// route source-value editing and display through it instead of hand-splitting
+/// the card text.
+#[derive(Debug, Clone)]
+pub enum SourceValue {
+    /// `DC <value>` (a bare number parses as this too).
+    Dc { value: f64 },
+    /// `AC <magnitude> <phase>`.
+    Ac { magnitude: f64, phase: f64 },
+    /// A stored waveform family (`Sine`, `Pulse`, …).
+    Waveform(Waveform),
+}
+
+/// Parse one source-value specification as written on a `V`/`I` card —
+/// the same grammar the deck parser applies to source values, so a
+/// frontend's edited text never drifts from what `parse` would read.
+pub fn parse_source_value(text: &str, options: &ParseOptions) -> Result<SourceValue> {
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    if tokens.is_empty() {
+        return Err(SimError::Parse("source value is empty".into()));
+    }
+    let spec = self::waveforms::parse_source_value_specs(&tokens, options)?;
+    if let Some(w) = spec.waveform {
+        return Ok(SourceValue::Waveform(w));
+    }
+    if let Some(ac) = spec.ac {
+        return Ok(SourceValue::Ac { magnitude: ac.mag, phase: ac.phase });
+    }
+    if let Some(value) = spec.dc {
+        return Ok(SourceValue::Dc { value });
+    }
+    Err(SimError::Parse("source value is empty".into()))
+}
+
+/// Emit one source value back to its canonical card text — the inverse of
+/// [`parse_source_value`]. `AC` always prints its phase (eliding a zero is
+/// what kept `1e-3` phases from surviving a round trip).
+pub fn emit_source_value(value: &SourceValue) -> String {
+    match value {
+        SourceValue::Dc { value } => format!("DC {value}"),
+        SourceValue::Ac { magnitude, phase } => format!("AC {magnitude} {phase}"),
+        SourceValue::Waveform(w) => self::waveforms::waveform_text(w),
+    }
+}

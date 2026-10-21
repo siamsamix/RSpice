@@ -111,6 +111,91 @@ fn bdf2_coefficients(h_prev: f64, h: f64) -> (f64, f64, f64) {
     (a0, a1, a2)
 }
 
+// ─── The integrator's companion law (one owner) ─────────────────────────────
+
+/// The step coefficients of the selected integration method: what multiplies
+/// the newest state (`alpha`), the previous two states (`beta1`, `beta2`),
+/// and the previous derivative (`gamma` — the trapezoidal memory the Gear
+/// methods don't carry).
+///
+/// Every device companion is this one law applied to its own capacity term:
+/// linear capacitors, inductors, mutual coupling, and every junction
+/// capacitance — the stamp model *and* the accepted-step report. The
+/// per-family `match` towers this replaces each re-derived the arithmetic,
+/// which is how the families were free to drift apart.
+struct Companion {
+    alpha: f64,
+    beta1: f64,
+    beta2: f64,
+    gamma: f64,
+}
+
+impl Companion {
+    /// Coefficients for one step of `method` (BDF2 adapts to the step
+    /// change; the others look only at `dt`).
+    fn for_step(method: IntegrationMethod, dt: f64, last_dt: f64) -> Self {
+        match method {
+            IntegrationMethod::Trapezoidal => Self {
+                alpha: 2.0 / dt,
+                beta1: -2.0 / dt,
+                beta2: 0.0,
+                gamma: 1.0,
+            },
+            IntegrationMethod::Gear1 => Self {
+                alpha: 1.0 / dt,
+                beta1: -1.0 / dt,
+                beta2: 0.0,
+                gamma: 0.0,
+            },
+            IntegrationMethod::Gear2 => {
+                let (a0, a1, a2) = bdf2_coefficients(last_dt, dt);
+                Self { alpha: a0, beta1: a1, beta2: a2, gamma: 0.0 }
+            }
+        }
+    }
+
+    /// The history law: `k·d(state)/dt` per the method, `history` the
+    /// trapezoid's previous derivative. One evaluation of this is both the
+    /// accepted-step report and the anchor the companion models linearize
+    /// ("iterate against the stored history").
+    fn derivative(&self, k: f64, new: f64, prev: f64, older: f64, history: f64) -> f64 {
+        k * (self.alpha * new + self.beta1 * prev + self.beta2 * older) - self.gamma * history
+    }
+
+    /// Voltage-state capacitor companion for capacity `k`: admittance `g`
+    /// plus the injected current `i_eq` (`n2 → n1`), anchored at the
+    /// previous state, so the solved branch sees `g·v − i_eq` == this law.
+    /// All the junction caps (BJT/MOSFET/JFET) are the same evaluation.
+    fn capacitor(&self, k: f64, prev: f64, older: f64, history: f64) -> (f64, f64) {
+        let g = self.alpha * k;
+        (g, g * prev - self.derivative(k, prev, prev, older, history))
+    }
+
+    /// Charge-state capacitor companion (the diode's junction + transit
+    /// charge): the law runs on the stored charge `q(v)`, linearized at the
+    /// guess `v` (`dqdv = dq/dv` there).
+    fn charge_capacitor(
+        &self,
+        dqdv: f64,
+        v: f64,
+        q: f64,
+        q_prev: f64,
+        q_older: f64,
+        i_prev: f64,
+    ) -> (f64, f64) {
+        let g = self.alpha * dqdv;
+        (g, g * v - self.derivative(1.0, q, q_prev, q_older, i_prev))
+    }
+
+    /// The dual (inductor-side) companion: companion resistance `r_eq` and
+    /// history voltage `v_eq` for the branch row. Mutual coupling reuses it
+    /// with the partner's current history in the state slots and its own
+    /// `v_mutual` as the history derivative.
+    fn dual(&self, m: f64, prev: f64, older: f64, history: f64) -> (f64, f64) {
+        (self.alpha * m, self.derivative(m, 0.0, prev, older, history))
+    }
+}
+
 // ─── TODO §3: DC junction limiting ──────────────────────────────────────────
 
 /// The classic SPICE2 pn-junction excursion limiter.
@@ -1066,6 +1151,7 @@ fn stamp_diode_capacitances<T: Field>(
     dt: f64,
     method: IntegrationMethod,
 ) -> Result<()> {
+    let companion = Companion::for_step(method, dt, state.last_dt);
     for (i, d) in circuit.diodes.iter().enumerate() {
         let model = circuit.diode_models.get(&d.model).ok_or_else(|| {
             SimError::Circuit(format!(
@@ -1082,23 +1168,8 @@ fn stamp_diode_capacitances<T: Field>(
         let q_prev = state.diode_charges.get(i).copied().unwrap_or(q);
         let q_older = state.diode_charges_older.get(i).copied().unwrap_or(q_prev);
         let i_prev = state.diode_cap_currents.get(i).copied().unwrap_or(0.0);
-        let (g_eq, i_eq) = match method {
-            IntegrationMethod::Trapezoidal => {
-                let g = 2.0 * dqdv / dt;
-                // i = g·v + i_eq is the companion; at v = vd it must equal
-                // the charge-history current 2(Q−Qprev)/dt − iprev.
-                (g, g * vd - (2.0 * (q - q_prev) / dt - i_prev))
-            }
-            IntegrationMethod::Gear1 => {
-                let g = dqdv / dt;
-                (g, g * vd - (q - q_prev) / dt)
-            }
-            IntegrationMethod::Gear2 => {
-                let (a0, a1, a2) = bdf2_coefficients(state.last_dt, dt);
-                let g = dqdv * a0;
-                (g, g * vd - (a0 * q + a1 * q_prev + a2 * q_older))
-            }
-        };
+        let (g_eq, i_eq) =
+            companion.charge_capacitor(dqdv, vd, q, q_prev, q_older, i_prev);
         if g_eq.is_finite() && i_eq.is_finite() {
             stamp_admittance(sys, d.anode, d.cathode, T::lift(g_eq));
             // Companion sources inject n2 → n1, matching the linear
@@ -1224,6 +1295,7 @@ fn stamp_bjt_capacitances<T: Field>(
     dt: f64,
     method: IntegrationMethod,
 ) -> Result<()> {
+    let companion = Companion::for_step(method, dt, state.last_dt);
     for (i, q) in circuit.bjts.iter().enumerate() {
         let Some(model) = circuit.bjt_models.get(&q.model) else {
             continue;
@@ -1247,20 +1319,7 @@ fn stamp_bjt_capacitances<T: Field>(
                 .map(|v| v[k])
                 .unwrap_or(v_prev);
             let i_prev = state.bjt_cap_currents.get(i).map(|v| v[k]).unwrap_or(0.0);
-            let (g_eq, i_eq) = match method {
-                IntegrationMethod::Trapezoidal => {
-                    let g = 2.0 * cap / dt;
-                    (g, g * v_prev + i_prev)
-                }
-                IntegrationMethod::Gear1 => {
-                    let g = cap / dt;
-                    (g, g * v_prev)
-                }
-                IntegrationMethod::Gear2 => {
-                    let (a0, a1, a2) = bdf2_coefficients(state.last_dt, dt);
-                    (cap * a0, -cap * (a1 * v_prev + a2 * v_older))
-                }
-            };
+            let (g_eq, i_eq) = companion.capacitor(cap, v_prev, v_older, i_prev);
             stamp_admittance(sys, nodes[k].0, nodes[k].1, T::lift(g_eq));
             stamp_current_source(sys, nodes[k].1, nodes[k].0, T::lift(i_eq));
         }
@@ -1389,6 +1448,7 @@ fn stamp_jfet_capacitances<T: Field>(
     dt: f64,
     method: IntegrationMethod,
 ) -> Result<()> {
+    let companion = Companion::for_step(method, dt, state.last_dt);
     for (i, j) in circuit.jfets.iter().enumerate() {
         let Some(model) = circuit.jfet_models.get(&j.model) else {
             continue;
@@ -1409,20 +1469,7 @@ fn stamp_jfet_capacitances<T: Field>(
                 .map(|v| v[k])
                 .unwrap_or(v_prev);
             let i_prev = state.jfet_cap_currents.get(i).map(|v| v[k]).unwrap_or(0.0);
-            let (g_eq, i_eq) = match method {
-                IntegrationMethod::Trapezoidal => {
-                    let g = 2.0 * cap / dt;
-                    (g, g * v_prev + i_prev)
-                }
-                IntegrationMethod::Gear1 => {
-                    let g = cap / dt;
-                    (g, g * v_prev)
-                }
-                IntegrationMethod::Gear2 => {
-                    let (a0, a1, a2) = bdf2_coefficients(state.last_dt, dt);
-                    (cap * a0, -cap * (a1 * v_prev + a2 * v_older))
-                }
-            };
+            let (g_eq, i_eq) = companion.capacitor(cap, v_prev, v_older, i_prev);
             stamp_admittance(sys, nodes[k].0, nodes[k].1, T::lift(g_eq));
             stamp_current_source(sys, nodes[k].1, nodes[k].0, T::lift(i_eq));
         }
@@ -1610,6 +1657,7 @@ fn stamp_mosfet_capacitances<T: Field>(
     dt: f64,
     method: IntegrationMethod,
 ) -> Result<()> {
+    let companion = Companion::for_step(method, dt, state.last_dt);
     for (i, m) in circuit.mosfets.iter().enumerate() {
         let caps = mosfet_cap_values(circuit, m);
         let nodes = mosfet_cap_nodes(m);
@@ -1633,20 +1681,7 @@ fn stamp_mosfet_capacitances<T: Field>(
                 .get(i)
                 .map(|v| v[k])
                 .unwrap_or(0.0);
-            let (g_eq, i_eq) = match method {
-                IntegrationMethod::Trapezoidal => {
-                    let g = 2.0 * cap / dt;
-                    (g, g * v_prev + i_prev)
-                }
-                IntegrationMethod::Gear1 => {
-                    let g = cap / dt;
-                    (g, g * v_prev)
-                }
-                IntegrationMethod::Gear2 => {
-                    let (a0, a1, a2) = bdf2_coefficients(state.last_dt, dt);
-                    (cap * a0, -cap * (a1 * v_prev + a2 * v_older))
-                }
-            };
+            let (g_eq, i_eq) = companion.capacitor(cap, v_prev, v_older, i_prev);
             stamp_admittance(sys, nodes[k].0, nodes[k].1, T::lift(g_eq));
             stamp_current_source(sys, nodes[k].1, nodes[k].0, T::lift(i_eq));
         }
@@ -1690,25 +1725,13 @@ fn stamp_capacitors<T: Field>(
     state: &TransientState,
     method: IntegrationMethod,
 ) {
+    let companion = Companion::for_step(method, dt, state.last_dt);
     for (i, c) in circuit.capacitors.iter().enumerate() {
         let cap = circuit.capacitance_at(c);
         let v_prev = state.capacitor_voltages.get(i).copied().unwrap_or(0.0);
         let i_prev = state.capacitor_currents.get(i).copied().unwrap_or(0.0);
         let v_older = state.capacitor_voltages_older.get(i).copied().unwrap_or(v_prev);
-        let (g_eq, i_eq) = match method {
-            IntegrationMethod::Trapezoidal => {
-                let g = 2.0 * cap / dt;
-                (g, g * v_prev + i_prev)
-            }
-            IntegrationMethod::Gear1 => {
-                let g = cap / dt;
-                (g, g * v_prev)
-            }
-            IntegrationMethod::Gear2 => {
-                let (a0, a1, a2) = bdf2_coefficients(state.last_dt, dt);
-                (cap * a0, -cap * (a1 * v_prev + a2 * v_older))
-            }
-        };
+        let (g_eq, i_eq) = companion.capacitor(cap, v_prev, v_older, i_prev);
         stamp_admittance(sys, c.n1, c.n2, T::lift(g_eq));
         stamp_current_source(sys, c.n2, c.n1, T::lift(i_eq));
     }
@@ -1723,25 +1746,13 @@ fn stamp_inductors<T: Field>(
     state: &TransientState,
     method: IntegrationMethod,
 ) {
+    let companion = Companion::for_step(method, dt, state.last_dt);
     for (i, l) in circuit.inductors.iter().enumerate() {
         let ind = circuit.inductance_at(l);
         let i_prev = state.inductor_currents.get(i).copied().unwrap_or(0.0);
         let i_older = state.inductor_currents_older.get(i).copied().unwrap_or(i_prev);
         let v_prev = state.inductor_voltages.get(i).copied().unwrap_or(0.0);
-        let (r_eq, v_eq) = match method {
-            IntegrationMethod::Trapezoidal => {
-                let r = 2.0 * ind / dt;
-                (r, -r * i_prev - v_prev)
-            }
-            IntegrationMethod::Gear1 => {
-                let r = ind / dt;
-                (r, -r * i_prev)
-            }
-            IntegrationMethod::Gear2 => {
-                let (a0, a1, a2) = bdf2_coefficients(state.last_dt, dt);
-                (ind * a0, ind * (a1 * i_prev + a2 * i_older))
-            }
-        };
+        let (r_eq, v_eq) = companion.dual(ind, i_prev, i_older, v_prev);
         let branch = sys.branch.ind_branch(i);
 
         if let Some(i1) = node_index(l.n1) {
@@ -1775,6 +1786,7 @@ fn stamp_mutual_inductances<T: Field>(
     state: &TransientState,
     method: IntegrationMethod,
 ) {
+    let companion = Companion::for_step(method, dt, state.last_dt);
     for (kidx, k) in circuit.mutual_inductances.iter().enumerate() {
         let (Some(i), Some(j)) = (
             inductor_index(circuit, &k.inductor1),
@@ -1791,24 +1803,8 @@ fn stamp_mutual_inductances<T: Field>(
         let older_i = state.inductor_currents_older.get(i).copied().unwrap_or(prev_i);
         let older_j = state.inductor_currents_older.get(j).copied().unwrap_or(prev_j);
         let v_mutual = state.mutual_voltages.get(kidx).copied().unwrap_or(0.0);
-        let (coef, eq_i, eq_j) = match method {
-            IntegrationMethod::Trapezoidal => {
-                let c = 2.0 * m / dt;
-                (c, -c * prev_j - v_mutual, -c * prev_i - v_mutual)
-            }
-            IntegrationMethod::Gear1 => {
-                let c = m / dt;
-                (c, -c * prev_j, -c * prev_i)
-            }
-            IntegrationMethod::Gear2 => {
-                let (a0, a1, a2) = bdf2_coefficients(state.last_dt, dt);
-                (
-                    m * a0,
-                    m * (a1 * prev_j + a2 * older_j),
-                    m * (a1 * prev_i + a2 * older_i),
-                )
-            }
-        };
+        let (coef, eq_i) = companion.dual(m, prev_j, older_j, v_mutual);
+        let eq_j = companion.dual(m, prev_i, older_i, v_mutual).1;
         let bi = sys.branch.ind_branch(i);
         let bj = sys.branch.ind_branch(j);
         sys.a[(bi, bj)] -= T::lift(coef);
@@ -2267,6 +2263,7 @@ pub fn advance_transient_state(
     method: IntegrationMethod,
     t_end: f64,
 ) -> TransientState {
+    let companion = Companion::for_step(method, dt, previous.last_dt);
     let branch = BranchLayout::for_circuit(circuit);
     let capacitor_voltages: Vec<f64> = circuit
         .capacitors
@@ -2299,16 +2296,9 @@ pub fn advance_transient_state(
                 .get(i)
                 .copied()
                 .unwrap_or(v_prev);
-            match method {
-                IntegrationMethod::Trapezoidal => {
-                    (2.0 * cap / dt) * (v_new - v_prev) - i_prev
-                }
-                IntegrationMethod::Gear1 => cap / dt * (v_new - v_prev),
-                IntegrationMethod::Gear2 => {
-                    let (a0, a1, a2) = bdf2_coefficients(previous.last_dt, dt);
-                    cap * (a0 * v_new + a1 * v_prev + a2 * v_older)
-                }
-            }
+            // One history law: the accepted voltage steps and the previous
+            // capacitor current.
+            companion.derivative(cap, v_new, v_prev, v_older, i_prev)
         })
         .collect();
 
@@ -2334,14 +2324,7 @@ pub fn advance_transient_state(
             let q_prev = previous.diode_charges.get(i).copied().unwrap_or(q);
             let q_older = previous.diode_charges_older.get(i).copied().unwrap_or(q_prev);
             let i_prev = previous.diode_cap_currents.get(i).copied().unwrap_or(0.0);
-            match method {
-                IntegrationMethod::Trapezoidal => 2.0 * (q - q_prev) / dt - i_prev,
-                IntegrationMethod::Gear1 => (q - q_prev) / dt,
-                IntegrationMethod::Gear2 => {
-                    let (a0, a1, a2) = bdf2_coefficients(previous.last_dt, dt);
-                    a0 * q + a1 * q_prev + a2 * q_older
-                }
-            }
+            companion.derivative(1.0, q, q_prev, q_older, i_prev)
         })
         .collect();
 
@@ -2382,16 +2365,8 @@ pub fn advance_transient_state(
                 if cap <= 0.0 {
                     continue;
                 }
-                currents[k] = match method {
-                    IntegrationMethod::Trapezoidal => {
-                        (2.0 * cap / dt) * (new_v[k] - prev_v[k]) - prev_i[k]
-                    }
-                    IntegrationMethod::Gear1 => cap / dt * (new_v[k] - prev_v[k]),
-                    IntegrationMethod::Gear2 => {
-                        let (a0, a1, a2) = bdf2_coefficients(previous.last_dt, dt);
-                        cap * (a0 * new_v[k] + a1 * prev_v[k] + a2 * older_v[k])
-                    }
-                };
+                currents[k] =
+                    companion.derivative(cap, new_v[k], prev_v[k], older_v[k], prev_i[k]);
             }
             currents
         })
@@ -2441,16 +2416,8 @@ pub fn advance_transient_state(
                 if caps[k] <= 0.0 {
                     continue;
                 }
-                currents[k] = match method {
-                    IntegrationMethod::Trapezoidal => {
-                        (2.0 * caps[k] / dt) * (new_v[k] - prev_v[k]) - prev_i[k]
-                    }
-                    IntegrationMethod::Gear1 => caps[k] / dt * (new_v[k] - prev_v[k]),
-                    IntegrationMethod::Gear2 => {
-                        let (a0, a1, a2) = bdf2_coefficients(previous.last_dt, dt);
-                        caps[k] * (a0 * new_v[k] + a1 * prev_v[k] + a2 * older_v[k])
-                    }
-                };
+                currents[k] =
+                    companion.derivative(caps[k], new_v[k], prev_v[k], older_v[k], prev_i[k]);
             }
             currents
         })
@@ -2498,16 +2465,8 @@ pub fn advance_transient_state(
                 if caps[k] <= 0.0 {
                     continue;
                 }
-                currents[k] = match method {
-                    IntegrationMethod::Trapezoidal => {
-                        (2.0 * caps[k] / dt) * (new_v[k] - prev_v[k]) - prev_i[k]
-                    }
-                    IntegrationMethod::Gear1 => caps[k] / dt * (new_v[k] - prev_v[k]),
-                    IntegrationMethod::Gear2 => {
-                        let (a0, a1, a2) = bdf2_coefficients(previous.last_dt, dt);
-                        caps[k] * (a0 * new_v[k] + a1 * prev_v[k] + a2 * older_v[k])
-                    }
-                };
+                currents[k] =
+                    companion.derivative(caps[k], new_v[k], prev_v[k], older_v[k], prev_i[k]);
             }
             currents
         })
@@ -2537,16 +2496,7 @@ pub fn advance_transient_state(
             // The history slot is indexed by the K card; recover it below.
             previous.mutual_voltages.get(mutual_voltages.len()).copied().unwrap_or(0.0)
         };
-        let v = match method {
-            IntegrationMethod::Trapezoidal => {
-                (2.0 * m / dt) * (new_j - prev_j) - previous_mutual
-            }
-            IntegrationMethod::Gear1 => (m / dt) * (new_j - prev_j),
-            IntegrationMethod::Gear2 => {
-                let (a0, a1, a2) = bdf2_coefficients(previous.last_dt, dt);
-                m * (a0 * new_j + a1 * prev_j + a2 * older_j)
-            }
-        };
+        let v = companion.derivative(m, new_j, prev_j, older_j, previous_mutual);
         mutual_voltages.push(v);
     }
 

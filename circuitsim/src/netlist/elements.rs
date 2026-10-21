@@ -1360,10 +1360,15 @@ pub(super) fn parse_voltage_source(
     circuit: &mut Circuit,
     plan: &HashMap<String, usize>,
     options: &ParseOptions,
+    warnings: &mut Vec<String>,
+    line_no: usize,
 ) -> Result<()> {
     let n1 = parse_node(tokens[1], circuit, plan)?;
     let n2 = parse_node(tokens[2], circuit, plan)?;
-    let spec = parse_source_value_specs(&tokens[3..], options)?;
+    let (spec, leftovers) = parse_source_value_specs(&tokens[3..], options)?;
+    if !leftovers.is_empty() {
+        warnings.push(ignored_tokens(line_no, "source", &leftovers));
+    }
 
     let final_voltage = match (spec.dc, &spec.waveform) {
         (Some(v), _) => v,
@@ -1386,10 +1391,15 @@ pub(super) fn parse_current_source(
     circuit: &mut Circuit,
     plan: &HashMap<String, usize>,
     options: &ParseOptions,
+    warnings: &mut Vec<String>,
+    line_no: usize,
 ) -> Result<()> {
     let n1 = parse_node(tokens[1], circuit, plan)?;
     let n2 = parse_node(tokens[2], circuit, plan)?;
-    let spec = parse_source_value_specs(&tokens[3..], options)?;
+    let (spec, leftovers) = parse_source_value_specs(&tokens[3..], options)?;
+    if !leftovers.is_empty() {
+        warnings.push(ignored_tokens(line_no, "source", &leftovers));
+    }
 
     let final_current = match (spec.dc, &spec.waveform) {
         (Some(v), _) => v,

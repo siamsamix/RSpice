@@ -504,8 +504,22 @@ fn parse_featured(
             'C' => parse_capacitor(&tokens, &mut circuit, &plan, &mut warnings, line_no)?,
             'L' => parse_inductor(&tokens, &mut circuit, &plan, &mut warnings, line_no)?,
             'D' => parse_diode(&tokens, &mut circuit, &plan, &mut warnings, line_no)?,
-            'V' => parse_voltage_source(&tokens, &mut circuit, &plan, options)?,
-            'I' => parse_current_source(&tokens, &mut circuit, &plan, options)?,
+            'V' => parse_voltage_source(
+                &tokens,
+                &mut circuit,
+                &plan,
+                options,
+                &mut warnings,
+                line_no,
+            )?,
+            'I' => parse_current_source(
+                &tokens,
+                &mut circuit,
+                &plan,
+                options,
+                &mut warnings,
+                line_no,
+            )?,
             'M' => parse_mosfet(&tokens, &mut circuit, &plan, &mut warnings, line_no)?,
             'E' | 'G' | 'F' | 'H' => {
                 parse_controlled_source(
@@ -650,17 +664,20 @@ fn logical_lines(source: &str) -> Result<Vec<(usize, String)>> {
     Ok(out)
 }
 
-/// Lift the literal `seed=` value of every `.options` card, before anything
-/// expands: element lines draw through the parameter environment (and the
-/// options card only *executes* during the final deck walk). Case-
-/// insensitive on the directive and the key, last card wins — the same read
-/// order the walk itself uses. Values that do not parse as a plain number
-/// (a `seed={n}` expansion) are ignored here and warned by the walk.
+/// Lift the literal `seed=` value of every `.options`/`.option` card, before
+/// anything expands: element lines draw through the parameter environment (and
+/// the options card only *executes* during the final deck walk). Case-
+/// insensitive on the directive (both spellings) and the key, last card wins —
+/// the same read order the walk itself uses. Values that do not parse as a
+/// plain number (a `seed={n}` expansion) are ignored here and warned by the
+/// walk.
 fn scan_options_seed(logical: &[(usize, String)]) -> u64 {
     let mut seed = 0u64;
     for (_, line) in logical {
         let mut tokens = line.split_whitespace();
-        if !tokens.next().is_some_and(|t| t.eq_ignore_ascii_case(".options")) {
+        if !tokens.next().is_some_and(|t| {
+            t.eq_ignore_ascii_case(".options") || t.eq_ignore_ascii_case(".option")
+        }) {
             continue;
         }
         for token in tokens {
@@ -758,7 +775,15 @@ pub fn parse_source_value(text: &str, options: &ParseOptions) -> Result<SourceVa
     if tokens.is_empty() {
         return Err(SimError::Parse("source value is empty".into()));
     }
-    let spec = self::waveforms::parse_source_value_specs(&tokens, options)?;
+    let (spec, leftovers) = self::waveforms::parse_source_value_specs(&tokens, options)?;
+    if !leftovers.is_empty() {
+        // A frontend's edited value must survive the round trip completely:
+        // tokens the grammar cannot place would otherwise vanish silently.
+        return Err(SimError::Parse(format!(
+            "source value ignores unsupported tokens: {}",
+            leftovers.join(" ")
+        )));
+    }
     if let Some(w) = spec.waveform {
         return Ok(SourceValue::Waveform(w));
     }

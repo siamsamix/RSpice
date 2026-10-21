@@ -224,8 +224,16 @@ pub(super) fn parse_dot_command(
 }
 
 /// The standard shape of a "these cards were carried, not applied" warning.
-pub(super) fn ignored_tokens(line_no: usize, directive: &str, tokens: &[&str]) -> String {
-    format!("line {line_no}: {directive} ignores unsupported tokens: {}", tokens.join(" "))
+pub(super) fn ignored_tokens<S: AsRef<str>>(
+    line_no: usize,
+    directive: &str,
+    tokens: &[S],
+) -> String {
+    let tokens: Vec<&str> = tokens.iter().map(|t| t.as_ref()).collect();
+    format!(
+        "line {line_no}: {directive} ignores unsupported tokens: {}",
+        tokens.join(" ")
+    )
 }
 
 /// The same warning for owned tokens (`.tran` numeric extras).
@@ -1120,6 +1128,10 @@ pub(super) fn emit_commands(analysis: &AnalysisCommands, out: &mut String) {
     if let Some(four) = &analysis.four {
         out.push_str(&format!(".four {} {}\n", four.frequency, four.outputs.join(" ")));
     }
+    for m in &analysis.measurements {
+        out.push_str(&emit_measurement(m));
+        out.push('\n');
+    }
     for step in &analysis.steps {
         match &step.values {
             StepValues::Linear { start, stop, step: inc } => {
@@ -1144,5 +1156,111 @@ pub(super) fn emit_commands(analysis: &AnalysisCommands, out: &mut String) {
     }
     for e in &analysis.ic {
         out.push_str(&format!(".ic V({})={}\n", e.node, e.value));
+    }
+}
+
+// ─── `.meas` emission ────────────────────────────────────────────────────────
+
+/// Canonical text for one `.meas` card — the inverse of `parse_measurement`
+/// and its FIND/CROSS/TRIG variants. Options re-print in the card's own
+/// vocabulary (`VAL=`, `FROM=`, `TO=`, `RISE|FALL|CROSS[=n]`), so a deck that
+/// carries measurements survives `parse(emit(parse))` field for field.
+pub(super) fn emit_measurement(m: &Measurement) -> String {
+    let mut line = format!(".meas {} {}", meas_analysis_text(m.analysis), m.name);
+    match &m.kind {
+        MeasKind::Scalar {
+            func,
+            expr,
+            from,
+            to,
+        } => {
+            line.push_str(&format!(" {} {}", meas_func_text(*func), expr));
+            push_meas_range(&mut line, *from, *to);
+        }
+        MeasKind::FindWhen {
+            expr,
+            when,
+            when_value,
+            edge,
+            from,
+            to,
+        } => {
+            line.push_str(&format!(" FIND {} WHEN {}={}", expr, when, when_value));
+            push_meas_edge(&mut line, *edge);
+            push_meas_range(&mut line, *from, *to);
+        }
+        MeasKind::Cross {
+            expr,
+            value,
+            edge,
+            from,
+            to,
+        } => {
+            line.push_str(&format!(" CROSS {} VAL={}", expr, value));
+            push_meas_edge(&mut line, *edge);
+            push_meas_range(&mut line, *from, *to);
+        }
+        MeasKind::TrigTarg {
+            trig_expr,
+            trig_value,
+            trig_edge,
+            targ_expr,
+            targ_value,
+            targ_edge,
+            from,
+            to,
+        } => {
+            line.push_str(&format!(" TRIG {} VAL={}", trig_expr, trig_value));
+            push_meas_edge(&mut line, *trig_edge);
+            line.push_str(&format!(" TARG {} VAL={}", targ_expr, targ_value));
+            push_meas_edge(&mut line, *targ_edge);
+            push_meas_range(&mut line, *from, *to);
+        }
+    }
+    line
+}
+
+fn meas_analysis_text(analysis: MeasAnalysis) -> &'static str {
+    match analysis {
+        MeasAnalysis::Tran => "tran",
+        MeasAnalysis::Ac => "ac",
+        MeasAnalysis::Dc => "dc",
+        MeasAnalysis::Op => "op",
+    }
+}
+
+fn meas_func_text(func: MeasFunc) -> &'static str {
+    match func {
+        MeasFunc::Avg => "avg",
+        MeasFunc::Rms => "rms",
+        MeasFunc::Max => "max",
+        MeasFunc::Min => "min",
+        MeasFunc::Pp => "pp",
+        MeasFunc::MaxAt => "max_at",
+        MeasFunc::MinAt => "min_at",
+    }
+}
+
+fn push_meas_edge(line: &mut String, edge: Option<(MeasEdge, usize)>) {
+    let Some((word, count)) = edge else { return };
+    let text = match word {
+        MeasEdge::Rise => "RISE",
+        MeasEdge::Fall => "FALL",
+        MeasEdge::Cross => "CROSS",
+    };
+    if count == 1 {
+        line.push(' ');
+        line.push_str(text);
+    } else {
+        line.push_str(&format!(" {text}={count}"));
+    }
+}
+
+fn push_meas_range(line: &mut String, from: Option<f64>, to: Option<f64>) {
+    if let Some(value) = from {
+        line.push_str(&format!(" FROM={value}"));
+    }
+    if let Some(value) = to {
+        line.push_str(&format!(" TO={value}"));
     }
 }

@@ -1,4 +1,5 @@
 use approx::assert_relative_eq;
+use circuitsim::model::{BOLTZMANN, ZERO_CELSIUS_K};
 use circuitsim::{ParseOptions, parse, parse_with_options, run, simulate};
 
 use std::path::PathBuf;
@@ -854,6 +855,31 @@ R2 out 0 1k
         2.878895e-9 * (9000.0f64).sqrt(),
         max_relative = 1e-3
     );
+}
+
+#[test]
+fn noise_thermal_density_follows_temp() {
+    let netlist = r#"
+V1 in 0 DC 1
+R1 in out 1k
+R2 out 0 1k
+.temp 127
+.noise V(out) V1 DEC 3 1k 10k
+.end
+"#;
+    let n = parse(netlist).unwrap();
+    let r = run(&n).unwrap();
+    let noise = r.noise.expect(".noise produced a result");
+    // R1 ∥ R2 = 500 Ω at T = 127 °C = 400.15 K: the thermal floor must read
+    // the deck temperature (it used to be pinned at 27 °C even on `.temp`
+    // decks, silently understating the noise floor). BOLTZMANN and
+    // ZERO_CELSIUS_K come from `model`, the same constants `noise_psd_at`
+    // uses — one decision point, not two magic numbers.
+    let expected: f64 = (4.0f64 * BOLTZMANN * (127.0 + ZERO_CELSIUS_K) * 500.0).sqrt();
+    for p in &noise.points {
+        assert_relative_eq!(p.output_density, expected, epsilon = 1e-13);
+        assert_relative_eq!(p.input_density, 2.0 * expected, epsilon = 1e-12);
+    }
 }
 
 #[test]

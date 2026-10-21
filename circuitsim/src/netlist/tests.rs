@@ -208,6 +208,63 @@
             "warnings: {:?}", parameterized.warnings);
     }
 
+    /// The `.option` spelling (the reference tools accept both) must reach
+    /// the same pre-scan. It used to fall through, firing a false
+    /// "parameterized" warning and leaving the draw seed at zero.
+    #[test]
+    fn option_singular_spelling_seeds_the_draws_too() {
+        let plural = parse(
+            "* deck\n.op\nV1 1 0 {rand(1)}\nR1 1 0 1k\n.options seed=42\n.end\n",
+        )
+        .unwrap();
+        let singular = parse(
+            "* deck\n.op\nV1 1 0 {rand(1)}\nR1 1 0 1k\n.option seed=42\n.end\n",
+        )
+        .unwrap();
+        assert_eq!(singular.analysis.mc_seed, 42, "the walk records the value");
+        assert_eq!(singular.mc_seed, plural.mc_seed, "same env seed as the plural form");
+        assert_eq!(
+            singular.circuit.voltage_sources[0].voltage.to_bits(),
+            plural.circuit.voltage_sources[0].voltage.to_bits(),
+            "the draws match the plural spelling"
+        );
+        assert!(
+            singular.warnings.is_empty(),
+            "no false parameterized warning: {:?}",
+            singular.warnings
+        );
+    }
+
+    /// `.meas` cards round-trip: the emitter used to skip them entirely, so
+    /// `parse(emit(parse))` silently dropped every measurement. Values are
+    /// plain decimals so no parse path can drift an ulp between passes.
+    #[test]
+    fn meas_cards_round_trip() {
+        let src = "*. meas deck\n\
+                   V1 in 0 DC 0\n\
+                   R1 in out 1k\n\
+                   .tran 1u 1m\n\
+                   .meas tran vavg AVG V(out) FROM=0.001 TO=0.009\n\
+                   .meas tran tset FIND V(out) WHEN V(out)=0.99 RISE=1 FROM=0 TO=0.001\n\
+                   .meas tran tcross CROSS V(out) VAL=1.5 FALL\n\
+                   .meas tran tdelay TRIG V(in) VAL=0.5 RISE=2 TARG V(out) VAL=0.5 FALL=3 TO=0.001\n\
+                   .end\n";
+        let first = parse(src).expect("first parse");
+        assert_eq!(first.analysis.measurements.len(), 4);
+        let text = emit(&first);
+        assert!(text.contains(".meas"), "emit dropped the measurements: {text}");
+        let second = parse(&text).expect("re-parse of emitted text");
+        assert_eq!(second.analysis.measurements.len(), 4);
+        for (a, b) in first.analysis.measurements.iter().zip(&second.analysis.measurements) {
+            assert_eq!(a.analysis, b.analysis, "analysis drift on {}", a.name);
+            assert_eq!(a.name, b.name);
+            assert_eq!(format!("{:?}", a.kind), format!("{:?}", b.kind), "kind drift on {}", a.name);
+        }
+        // Emitting the re-parsed deck again is a fixed point: the canonical
+        // text is stable.
+        assert_eq!(emit(&second), text);
+    }
+
     /// TODO §4: `.op pon` / `.op all` record the operating-point report
     /// style. The variant survives `parse(emit(parse))`, and a bare `.op`
     /// stays bare in the emitted deck.
@@ -612,6 +669,38 @@
             panic!("expected a SIN waveform");
         };
         assert_eq!(sine.freq, 1e3);
+    }
+
+    /// Tokens after a waveform are carried as warnings, not dropped — every
+    /// waveform arm used to return early and swallow the card's tail.
+    #[test]
+    fn source_trailing_tokens_warn() {
+        let n = parse(
+            "V1 in 0 PULSE(0 5 0 1n 1n 1u 2u) extra\n\
+             R1 in 0 1k\n\
+             .op\n\
+             .end\n",
+        )
+        .unwrap();
+        assert!(
+            n.warnings.iter().any(|w| w.contains("source") && w.contains("extra")),
+            "warnings: {:?}",
+            n.warnings
+        );
+        // The pulse itself still parsed, and the extra token did not shift it.
+        let Some(Waveform::Pulse(pulse)) = n.circuit.voltage_sources[0].waveform.as_ref() else {
+            panic!("expected a PULSE waveform");
+        };
+        assert_eq!(pulse.v2, 5.0);
+        assert_eq!(pulse.per, crate::units::parse_value("2u").unwrap());
+    }
+
+    /// A non-ASCII tail must surface as a parse error, not panic on a
+    /// mid-character byte slice (`&text[..4]` used to do exactly that).
+    #[test]
+    fn pwl_non_ascii_tail_is_an_error_not_a_panic() {
+        let result = parse("V1 in 0 pwlfilÿx\nR1 in 0 1k\n.op\n.end\n");
+        assert!(result.is_err(), "a broken PWL card must be a loud error");
     }
 
     // ─── Subcircuit hierarchy ─────────────────────────────────────────────────

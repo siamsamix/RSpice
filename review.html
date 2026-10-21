@@ -1,0 +1,433 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Architecture review for RSpice</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script type="module">
+      import mermaid from "https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.esm.min.mjs";
+      mermaid.initialize({ startOnLoad: true, theme: "neutral", securityLevel: "loose" });
+    </script>
+    <style>
+      .deep { background: linear-gradient(135deg, #0f172a, #1e293b); }
+      .seam { border-style: dashed; }
+      .band { border-left-width: 4px; }
+    </style>
+  </head>
+  <body class="bg-stone-50 font-sans text-slate-900">
+    <main class="mx-auto max-w-5xl space-y-12 px-6 py-12">
+
+      <header class="space-y-3">
+        <h1 class="font-serif text-3xl font-semibold tracking-tight">Architecture review for <span class="text-indigo-700">RSpice</span></h1>
+        <p class="text-sm text-slate-600">Tue Oct 20 2026 · scope: the hot spot is commit <span class="font-mono">6382bc3</span> (BJT/JFET, behavioral B sources, .tran completeness — +10,224 lines) landing on top of the cut&nbsp;#0–#6 deepening. This review asks whether the seams those cuts drew still hold.</p>
+        <div class="flex flex-wrap items-center gap-x-5 gap-y-1 text-xs text-slate-500">
+          <span class="inline-block h-3 w-3 rounded border border-slate-400 bg-white"></span> module
+          <span class="inline-block h-3 w-3 rounded border border-dashed border-slate-400"></span> seam
+          <span class="inline-block h-3 w-3 rounded bg-red-100 ring-1 ring-red-400"></span> leakage
+          <span class="inline-block h-3 w-6 rounded deep"></span> deep module
+        </div>
+      </header>
+
+      <section id="candidates" class="space-y-12">
+
+        <!-- ─────────────────────────── C1 ─────────────────────────── -->
+        <article id="c1" class="scroll-mt-8 space-y-4 rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+          <div class="flex flex-wrap items-baseline justify-between gap-2">
+            <h2 class="font-serif text-2xl font-semibold">1 &nbsp;Name every branch and node — once</h2>
+            <div class="space-x-2 text-xs">
+              <span class="rounded-full bg-emerald-100 px-3 py-1 font-semibold text-emerald-800">Strong</span>
+              <span class="rounded-full bg-slate-100 px-3 py-1 text-slate-600">ports &amp; adapters</span>
+            </div>
+          </div>
+          <div class="font-mono text-sm text-slate-600">
+            circuitsim/src/mna.rs <span class="text-slate-400">BranchCurrents :1927 · AcBranchCurrents :2637</span><br />
+            circuitsim/src/analysis.rs <span class="text-slate-400">MeasCurrents :1378–1428 · probe_value :1487–1577 · Circuit::tran_matrix_size :1305 (circuit.rs)</span><br />
+            circuitsim-gui/src/plot.rs <span class="text-slate-400">TranFamily :198–255 · AcFamily :345–403</span><br />
+            circuitsim-gui/src/app.rs <span class="text-slate-400">dc_tab family walk :2131–2155 · node-count dig ×4</span><br />
+            circuitsim-cli/src/main.rs <span class="text-slate-400">print_dc :264–287 · waveform_csv :572–637</span>
+          </div>
+
+          <div class="grid gap-4 md:grid-cols-2">
+            <div class="rounded-lg border border-slate-200 bg-stone-50 p-4">
+              <p class="mb-2 text-xs uppercase tracking-wider text-slate-500">before — same fact, four spellings</p>
+              <pre class="mermaid">
+flowchart LR
+  A["plot.rs<br/>TranFamily · AcFamily<br/>synthesizes 'R{i+1}'"]
+  B["cli/main.rs<br/>zip-by-position walk<br/>against net.mosfets[i]"]
+  C["analysis.rs<br/>MeasCurrents – hand copy,<br/>bjts field missing"]
+  BC["BranchCurrents<br/>10 parallel Vecs,<br/>no element names"]
+  A --> BC
+  B --> BC
+  C -->|"I(Q1) dead end"| BC
+  BC -. rows actually .-> BL["BranchLayout<br/>the real row owner"]
+  CT["circuit.rs<br/>tran_matrix_size —<br/>unowned twin of BranchLayout"]
+  CT -. drift risk .-> BL
+  classDef leak stroke:#dc2626,stroke-width:2px,fill:#fef2f2,color:#991b1b;
+  classDef deep fill:#0f172a,color:#f8fafc,stroke:#0f172a;
+  class C leak
+  class BL deep
+              </pre>
+            </div>
+            <div class="rounded-lg border border-slate-200 bg-stone-50 p-4">
+              <p class="mb-2 text-xs uppercase tracking-wider text-slate-500">after — one named-report interface</p>
+              <pre class="mermaid">
+flowchart LR
+  G["gui adapter"] --> R["MutationResult reports<br/>branch_currents.of(name)<br/>node_voltages.of(node)<br/>node count exposed"]
+  C["cli adapter"] --> R
+  M[".meas · .four<br/>'I(Q1)' resolved by name"] --> R
+  R --> BL["BranchLayout —<br/>sole owner of row layout"]
+  classDef deep fill:#0f172a,color:#f8fafc,stroke:#0f172a;
+  class R deep
+              </pre>
+            </div>
+          </div>
+
+          <p class="text-sm">**Problem:** `SimulationResult` carries parallel `Vec`s with no identity, so the same branch-row/column fact is spelled out four times — and the `analysis.rs` copy already rotted: it lost `bjts` the moment BJT/JFET shipped, so `I(Q1)` can never resolve in `.meas`/`.four`, and the GUI's positional `R{i+1}` labels lie on any deck that says `RLOAD`.</p>
+          <p class="text-sm">**Solution:** results speak the domain language — named branch records and node names travel with the data, `BranchLayout` is the one row-count owner, and every consumer (`gui`, `cli`, `.meas`) resolves by name.</p>
+          <ul class="list-disc space-y-1 pl-5 text-sm">
+            <li>locality: the I(Q1) class of bug becomes one module's bug</li>
+            <li>leverage: one interface, three readers already exist</li>
+            <li>deletes MeasCurrents + TranFamily/AcFamily</li>
+            <li>labels survive `RLOAD` renames</li>
+            <li>interface shrinks: node-count dig ×7 collapses</li>
+          </ul>
+        </article>
+
+        <!-- ─────────────────────────── C2 ─────────────────────────── -->
+        <article id="c2" class="scroll-mt-8 space-y-4 rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+          <div class="flex flex-wrap items-baseline justify-between gap-2">
+            <h2 class="font-serif text-2xl font-semibold">2 &nbsp;One companion module owns the Integration method</h2>
+            <div class="space-x-2 text-xs">
+              <span class="rounded-full bg-emerald-100 px-3 py-1 font-semibold text-emerald-800">Strong</span>
+              <span class="rounded-full bg-slate-100 px-3 py-1 text-slate-600">in-process</span>
+            </div>
+          </div>
+          <div class="font-mono text-sm text-slate-600">
+            circuitsim/src/mna.rs <span class="text-slate-400">match method ×13 — stamp D :1085 · Q :1250 · J :1412 · M :1636 · C :1697 · L :1730 · K :1793 · advance C :2282 · D :2317 · M :2365 · Q :2424 · J :2481 · K :2519 · advance_transient_state :2241–2599</span>
+          </div>
+
+          <div class="grid gap-4 md:grid-cols-2">
+            <div class="rounded-lg border border-slate-200 bg-stone-50 p-4">
+              <p class="mb-2 text-xs uppercase tracking-wider text-slate-500">before — 13 thin bands, each a paste</p>
+              <div class="flex min-h-[300px] flex-col justify-center gap-[3px]">
+                <div class="band flex items-center justify-between bg-amber-50 px-2 py-[3px] font-mono text-[11px] text-amber-900" style="border-left-color:#f59e0b"><span>stamp_capacitors</span><span class="text-red-700">match method {…}</span></div>
+                <div class="band flex items-center justify-between bg-amber-50 px-2 py-[3px] font-mono text-[11px] text-amber-900" style="border-left-color:#f59e0b"><span>stamp_inductors</span><span class="text-red-700">match method {…}</span></div>
+                <div class="band flex items-center justify-between bg-amber-50 px-2 py-[3px] font-mono text-[11px] text-amber-900" style="border-left-color:#f59e0b"><span>stamp_mutual_inductances</span><span class="text-red-700">match method {…}</span></div>
+                <div class="band flex items-center justify-between bg-amber-50 px-2 py-[3px] font-mono text-[11px] text-amber-900" style="border-left-color:#f59e0b"><span>stamp_diode_capacitances</span><span class="text-red-700">match method {…}</span></div>
+                <div class="band flex items-center justify-between bg-amber-50 px-2 py-[3px] font-mono text-[11px] text-amber-900" style="border-left-color:#f59e0b"><span>stamp_bjt_capacitances</span><span class="text-red-700">match method {…}</span></div>
+                <div class="band flex items-center justify-between bg-amber-50 px-2 py-[3px] font-mono text-[11px] text-amber-900" style="border-left-color:#f59e0b"><span>stamp_jfet_capacitances</span><span class="text-red-700">match method {…}</span></div>
+                <div class="band flex items-center justify-between bg-amber-50 px-2 py-[3px] font-mono text-[11px] text-amber-900" style="border-left-color:#f59e0b"><span>stamp_mosfet_capacitances</span><span class="text-red-700">match method {…}</span></div>
+                <div class="band flex items-center justify-between bg-red-50 px-2 py-[3px] font-mono text-[11px] text-red-900" style="border-left-color:#dc2626"><span>advance: C · D · M · Q · J · K</span><span class="text-red-700">match method ×6 more</span></div>
+                <p class="pt-2 text-[11px] text-slate-500">the only extract: <span class="font-mono">bdf2_coefficients</span> — the per-family integration law stayed pasted</p>
+              </div>
+            </div>
+            <div class="rounded-lg border border-slate-200 bg-stone-50 p-4">
+              <p class="mb-2 text-xs uppercase tracking-wider text-slate-500">after — one deep companion</p>
+              <div class="flex min-h-[300px] flex-col justify-center gap-2">
+                <div class="deep rounded-lg border-2 border-slate-900 p-4 text-emerald-50">
+                  <p class="text-xs uppercase tracking-widest text-emerald-300">companion module</p>
+                  <p class="mt-1 font-mono text-sm">companion(method, dt, last_dt) → weights</p>
+                  <p class="mt-1 text-xs text-slate-300">Trap · Gear1 · Gear2 · BDF2 rule · LTE residuals — all here</p>
+                </div>
+                <div class="flex flex-wrap gap-1 font-mono text-[11px] text-slate-600">
+                  <span class="rounded border border-slate-300 bg-white px-1">D charge law</span>
+                  <span class="rounded border border-slate-300 bg-white px-1">Q charge law</span>
+                  <span class="rounded border border-slate-300 bg-white px-1">J charge law</span>
+                  <span class="rounded border border-slate-300 bg-white px-1">M charge law</span>
+                  <span class="rounded border border-slate-300 bg-white px-1">C law</span>
+                  <span class="rounded border border-slate-300 bg-white px-1">L flux law</span>
+                  <span class="rounded border border-slate-300 bg-white px-1">K cross law</span>
+                </div>
+                <p class="text-[11px] text-slate-500">each thin law calls the companion — method knowledge appears exactly once</p>
+              </div>
+            </div>
+          </div>
+
+          <p class="text-sm">**Problem:** the integration method book (glossary: *Integration method*, *Adaptive step / LTE*) is a template pasted into 13 stamp and advance sites, so any new method, multistep order, or companion fix means 13 coordinated edits — and only the coefficient fn was ever extracted.</p>
+          <p class="text-sm">**Solution:** one companion interface — `(method, dt, last_dt) → coefficients` — with per-family charge/flux laws reduced to their device terms; `advance_transient_state` feeds it instead of re-deriving it.</p>
+          <ul class="list-disc space-y-1 pl-5 text-sm">
+            <li>locality: one place per integrator decision</li>
+            <li>method enum stops leaking into 13 stamps</li>
+            <li>a new method becomes one edit</li>
+            <li>leverage: the companion drives direct tests</li>
+          </ul>
+        </article>
+
+        <!-- ─────────────────────────── C3 ─────────────────────────── -->
+        <article id="c3" class="scroll-mt-8 space-y-4 rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+          <div class="flex flex-wrap items-baseline justify-between gap-2">
+            <h2 class="font-serif text-2xl font-semibold">3 &nbsp;One card grammar: parse beside emit</h2>
+            <div class="space-x-2 text-xs">
+              <span class="rounded-full bg-amber-100 px-3 py-1 font-semibold text-amber-800">Worth exploring</span>
+              <span class="rounded-full bg-slate-100 px-3 py-1 text-slate-600">in-process</span>
+            </div>
+          </div>
+          <div class="font-mono text-sm text-slate-600">
+            circuitsim/src/netlist.rs <span class="text-slate-400">5,679 lines — pipeline :404–500 · .include/.lib :508–815 · subckts :817–1476 · node plan :1538–1626 · dot grammar :1637–2975 (model cards :2016–2390 · .meas :2692–2975) · element cards :3089–3625 · waveform specs :3627–4037 · emit :4038–4650 · in-file tests :4651–5679</span>
+          </div>
+
+          <div class="grid gap-4 md:grid-cols-2">
+            <div class="rounded-lg border border-slate-200 bg-stone-50 p-4">
+              <p class="mb-2 text-xs uppercase tracking-wider text-slate-500">before — one file, five modules, matched halves 1,000 lines apart</p>
+              <div class="min-h-[300px] space-y-2">
+                <div class="flex h-8 overflow-hidden rounded border border-slate-300 text-[9px] leading-8">
+                  <div class="bg-slate-200 text-right pr-1" style="width:8%">IR</div>
+                  <div class="bg-slate-200" style="width:3%"></div>
+                  <div class="bg-slate-200 text-center" style="width:2%">|</div>
+                  <div class="bg-slate-200" style="width:6%"></div>
+                  <div class="bg-slate-200" style="width:12%"></div>
+                  <div class="bg-slate-200" style="width:2%"></div>
+                  <div class="bg-emerald-100" style="width:24%"></div>
+                  <div class="bg-emerald-200" style="width:10%"></div>
+                  <div class="bg-emerald-100" style="width:7%"></div>
+                  <div class="bg-blue-100" style="width:11%"></div>
+                  <div class="bg-stone-300" style="width:15%"></div>
+                </div>
+                <div class="flex justify-between font-mono text-[10px] text-slate-500">
+                  <span>← pipeline · subckts · node plan</span><span>tests (1,030 lines) →</span>
+                </div>
+                <div class="flex justify-between font-mono text-[10px]">
+                  <span class="rounded bg-emerald-100 px-1 text-emerald-900">green = parse copies of the grammar</span>
+                  <span class="rounded bg-blue-100 px-1 text-blue-900">blue = emit — the third copy</span>
+                </div>
+                <div class="relative mx-1 mt-4 h-16 rounded border border-dashed border-slate-300 p-2 text-[11px] text-slate-600">
+                  `emit` must re-know parse transformations to round-trip — <span class="text-red-700">"RS deliberately not reprinted: `expand_diode_series_resistance` materialized arms"</span> (netlist.rs:4107)
+                </div>
+                <div class="rounded border border-l-4 border-red-300 bg-red-50 p-2 text-[11px] text-red-900">
+                  `node_slot_indices` claims "so they can never drift apart" (:962) — Q is special-cased in `node_slots_for_tokens` one fn below (:983). The pure table was extracted; its guarantee is already hollow.
+                </div>
+              </div>
+            </div>
+            <div class="rounded-lg border border-slate-200 bg-stone-50 p-4">
+              <p class="mb-2 text-xs uppercase tracking-wider text-slate-500">after — per-family columns, parse · emit adjacent</p>
+              <div class="flex min-h-[300px] flex-col justify-center gap-2">
+                <div class="flex gap-2">
+                  <div class="w-24 space-y-2">
+                    <div class="rounded border border-slate-300 bg-white p-2 text-center font-mono text-[10px]">pipeline</div>
+                    <div class="rounded border border-slate-300 bg-white p-2 text-center font-mono text-[10px]">subckts</div>
+                    <div class="rounded border border-slate-300 bg-white p-2 text-center font-mono text-[10px]">node plan</div>
+                  </div>
+                  <div class="flex flex-1 gap-2">
+                    <div class="flex-1 rounded border-2 border-slate-800 deep p-2 text-center">
+                      <p class="text-[10px] uppercase tracking-widest text-emerald-300">dot-grammar module</p>
+                      <p class="mt-1 font-mono text-[10px] text-emerald-50">parse + emit + tests<br/>in one column</p>
+                    </div>
+                    <div class="flex-1 rounded border-2 border-slate-800 deep p-2 text-center">
+                      <p class="text-[10px] uppercase tracking-widest text-emerald-300">element cards</p>
+                      <p class="mt-1 font-mono text-[10px] text-emerald-50">parse + emit<br/>beside each other</p>
+                    </div>
+                    <div class="flex-1 rounded border-2 border-slate-800 deep p-2 text-center">
+                      <p class="text-[10px] uppercase tracking-widest text-emerald-300">waveform specs</p>
+                      <p class="mt-1 font-mono text-[10px] text-emerald-50">one grammar,<br/>both directions</p>
+                    </div>
+                  </div>
+                </div>
+                <p class="text-[11px] text-slate-500">model-card keys parsed and printed from one field table; the emit "RS is materialized" lore lives next to `expand_diode_series_resistance`</p>
+              </div>
+            </div>
+          </div>
+
+          <p class="text-sm">**Problem:** `netlist.rs` is one file holding ~5 distinct modules; the parse and emit halves of each element's life sit ~1,000 lines apart, so the writer became a third copy of the card grammar that has to re-know the reader's transformations.</p>
+          <p class="text-sm">**Solution:** split into the modules the file already contains, and drive model-card + waveform serialization from the same field tables the parsers use — per family, parse/emit/tests co-located.</p>
+          <ul class="list-disc space-y-1 pl-5 text-sm">
+            <li>locality: one family, one edit, one place</li>
+            <li>emit stops re-knowing parse transformations</li>
+            <li>node-slot drift claim becomes real</li>
+            <li>navigable: five modules, not 5,679 lines</li>
+          </ul>
+        </article>
+
+        <!-- ─────────────────────────── C4 ─────────────────────────── -->
+        <article id="c4" class="scroll-mt-8 space-y-4 rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+          <div class="flex flex-wrap items-baseline justify-between gap-2">
+            <h2 class="font-serif text-2xl font-semibold">4 &nbsp;Probes compile once, at parse</h2>
+            <div class="space-x-2 text-xs">
+              <span class="rounded-full bg-amber-100 px-3 py-1 font-semibold text-amber-800">Worth exploring</span>
+              <span class="rounded-full bg-slate-100 px-3 py-1 text-slate-600">in-process</span>
+            </div>
+          </div>
+          <div class="font-mono text-sm text-slate-600">
+            circuitsim/src/analysis.rs <span class="text-slate-400">eval_meas_expr :1582–1626 · probe_value :1487–1577 · evaluate_measurement :1765–1825 · ParamEnv struct-literal :1759/:1884</span><br />
+            circuitsim/src/behavior.rs <span class="text-slate-400">the proven pattern — ProbeSpec → ProbeBinding :200–211</span>
+          </div>
+
+          <div class="grid gap-4 md:grid-cols-2">
+            <div class="rounded-lg border border-slate-200 bg-stone-50 p-4">
+              <p class="mb-2 text-xs uppercase tracking-wider text-slate-500">before — re-lex per sample</p>
+              <pre class="mermaid">
+sequenceDiagram
+  participant D as Measurement (parsed)
+  participant S as sample loop
+  rect rgba(220,38,38,0.08)
+    loop every sample point
+      D->>S: probe string "V(out)+2*I(RL)"
+      S->>S: char-scan for V( / I(
+      S->>S: build substituted string
+      S->>S: env.eval_num() re-lexes whole expr
+      note right of S: ParamEnv rebuilt by<br/>struct literal — funcs table<br/>silently dropped
+    end
+  end
+              </pre>
+            </div>
+            <div class="rounded-lg border border-slate-200 bg-stone-50 p-4">
+              <p class="mb-2 text-xs uppercase tracking-wider text-slate-500">after — compile once (the Behavior seam pattern)</p>
+              <pre class="mermaid">
+sequenceDiagram
+  participant P as parse time
+  participant M as Measurement
+  participant S as sample loop
+  P->>M: compile probes → typed bindings<br/>(ProbeSpec → ProbeBinding)
+  M->>M: resolve V(out)·I(Q1) against Circuit
+  loop every sample point
+    M->>S: plug probe values, evaluate compiled form
+  end
+              </pre>
+            </div>
+          </div>
+
+          <p class="text-sm">**Problem:** every `.meas`/`.four` operand is re-parsed char-by-char and re-lexed through `eval_num` inside the sample loop, chained through a family copy that also misses Q — because no return path like them was ever drawn.</p>
+          <p class="text-sm">**Solution:** compile probe operands once at parse into typed bindings — the exact pattern `behavior::ProbeSpec` already proves — and resolve them against the `Circuit` before any sample runs (subsets of candidate 1's named reports provide the values).</p>
+          <ul class="list-disc space-y-1 pl-5 text-sm">
+            <li>.func stops vanishing in .meas</li>
+            <li>per-sample re-lex deleted; hot loop cheaper</li>
+            <li>one probe grammar, shared with behavior</li>
+            <li>leverage: compile once, probe everywhere</li>
+          </ul>
+        </article>
+
+        <!-- ─────────────────────────── C5 ─────────────────────────── -->
+        <article id="c5" class="scroll-mt-8 space-y-4 rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+          <div class="flex flex-wrap items-baseline justify-between gap-2">
+            <h2 class="font-serif text-2xl font-semibold">5 &nbsp;Behavior advances its own history</h2>
+            <div class="space-x-2 text-xs">
+              <span class="rounded-full bg-amber-100 px-3 py-1 font-semibold text-amber-800">Worth exploring</span>
+              <span class="rounded-full bg-slate-100 px-3 py-1 text-slate-600">in-process</span>
+            </div>
+          </div>
+          <div class="font-mono text-sm text-slate-600">
+            circuitsim/src/mna.rs <span class="text-slate-400">seed :2215–2237 · advance :2538–2572 · report recompute :2117–2138 · MAX_DELAY_SAMPLES read :2566</span><br />
+            circuitsim/src/behavior.rs <span class="text-slate-400">eval_expr::Idt :700–705 — the same trapezoid law, as evaluation</span><br />
+            <span class="text-slate-400">also: the one two-way import edge — circuit.rs:2 ↔ behavior.rs:23</span>
+          </div>
+
+          <div class="grid gap-4 md:grid-cols-2">
+            <div class="rounded-lg border border-slate-200 bg-stone-50 p-4">
+              <p class="mb-2 text-xs uppercase tracking-wider text-slate-500">before — the law spelled twice, both sides of a seam</p>
+              <div class="grid min-h-[300px] grid-cols-2 items-center gap-3">
+                <div class="rounded-lg border border-slate-300 bg-white p-3">
+                  <p class="font-mono text-[10px] uppercase tracking-wider text-slate-500">behavior.rs</p>
+                  <p class="mt-2 font-mono text-[11px]">eval_expr::Idt:</p>
+                  <p class="mt-1 rounded bg-stone-100 p-1 font-mono text-[11px]">acc + ½·dt·(now + prev)</p>
+                  <p class="mt-2 font-mono text-[11px]">eval_expr::Delay: queue</p>
+                </div>
+                <div class="rounded-lg border-2 border-red-400 bg-red-50 p-3">
+                  <p class="font-mono text-[10px] uppercase tracking-wider text-red-700">mna.rs — advance_transient_state</p>
+                  <p class="mt-2 font-mono text-[11px]">advance:</p>
+                  <p class="mt-1 rounded bg-white p-1 font-mono text-[11px] ring-1 ring-red-300">acc + ½·dt·(now + prev) ← same law</p>
+                  <p class="mt-2 font-mono text-[11px]">queue + cap at&nbsp;</p>
+                  <p class="rounded bg-white p-1 font-mono text-[11px] ring-1 ring-red-300">crate::behavior::MAX_DELAY_SAMPLES</p>
+                  <p class="mt-2 font-mono text-[11px]">seed: another roll of the same update</p>
+                </div>
+              </div>
+            </div>
+            <div class="rounded-lg border border-slate-200 bg-stone-50 p-4">
+              <p class="mb-2 text-xs uppercase tracking-wider text-slate-500">after — one interface at the seam</p>
+              <div class="flex min-h-[300px] flex-col items-center justify-center gap-3">
+                <div class="deep w-full rounded-lg border-2 border-slate-900 p-4 text-center">
+                  <p class="text-[10px] uppercase tracking-widest text-emerald-300">behavior module</p>
+                  <p class="mt-1 font-mono text-sm text-emerald-50">Behavior::advance(t_end, dt, runtime)</p>
+                  <p class="mt-1 text-[11px] text-slate-300">trapezoid roll · delay queue · seed — all behind the interface</p>
+                </div>
+                <svg width="24" height="28" class="text-slate-400"><line x1="12" y1="0" x2="12" y2="20" stroke="currentColor" stroke-width="2" stroke-dasharray="4 3"/><path d="M6 20 L12 28 L18 20 Z" fill="currentColor"/></svg>
+                <div class="w-full rounded border border-slate-300 bg-white p-3 text-center">
+                  <p class="font-mono text-[11px] text-slate-700">mna: read runtime · stamp linearized rows</p>
+                  <p class="text-[10px] text-slate-500">the thin adapter it already wants to be</p>
+                </div>
+              </div>
+            </div>
+          </div>
+
+          <p class="text-sm">**Problem:** the Behavioral B source's history-advance law lives in `mna.rs` while `behavior.rs` owns the same law's evaluation form — so integrator or B-expression changes must cross a seam, and the two would drift if either changes its formula.</p>
+          <p class="text-sm">**Solution:** `Behavior::advance(t_end, dt, runtime)` — the history bookkeeping moves behind the seam; `mna` keeps only "read runtime, stamp linearized rows", and the dribbles (seed arm, report recompute, delay cap import) fold into it.</p>
+          <ul class="list-disc space-y-1 pl-5 text-sm">
+            <li>locality: idt/delay bugs concentrate in behavior.rs</li>
+            <li>mna interface shrinks; adapter stays thin</li>
+            <li>gives the circuit↔behavior cycle a direction</li>
+            <li>transient seed rolls leave stamping land</li>
+          </ul>
+        </article>
+
+        <!-- ─────────────────────────── C6 ─────────────────────────── -->
+        <article id="c6" class="scroll-mt-8 space-y-4 rounded-xl border border-slate-200 bg-white p-6 shadow-sm">
+          <div class="flex flex-wrap items-baseline justify-between gap-2">
+            <h2 class="font-serif text-2xl font-semibold">6 &nbsp;The Schematic editor mutates through modules</h2>
+            <div class="space-x-2 text-xs">
+              <span class="rounded-full bg-amber-100 px-3 py-1 font-semibold text-amber-800">Worth exploring</span>
+              <span class="rounded-full bg-slate-100 px-3 py-1 text-slate-600">in-process</span>
+            </div>
+          </div>
+          <div class="font-mono text-sm text-slate-600">
+            circuitsim-gui/src/app.rs <span class="text-slate-400">2,703 lines — schematic_panel :991–1968 · component popup string surgery :1754–1966 · drag/wire-stretch :1564–1574 · rotate :1008–1015 · conversions :287–409 and :411–674 · result tabs :2075–2701</span><br />
+            circuitsim-gui/src/schematic.rs <span class="text-slate-400">NodeAssignment::of :54–132 — the deep half that already exists</span>
+          </div>
+
+          <div class="grid gap-4 md:grid-cols-2">
+            <div class="rounded-lg border border-slate-200 bg-stone-50 p-4">
+              <p class="mb-2 text-xs uppercase tracking-wider text-slate-500">before — app.rs regions, ~2703 lines</p>
+              <div class="min-h-[300px] space-y-[2px] font-mono text-[10px]">
+                <div class="band bg-slate-200 px-2 py-[3px]" style="border-left-color:#0284c7">state · decks · enum defs <span class="text-slate-500">~108–286</span></div>
+                <div class="band bg-emerald-100 px-2 py-[3px]" style="border-left-color:#059669">schematic→netlist conversion + ordering <span class="text-slate-500">~287–409</span></div>
+                <div class="band bg-emerald-100 px-2 py-[3px]" style="border-left-color:#059669">netlist→schematic + layout packer <span class="text-slate-500">~411–674</span></div>
+                <div class="band bg-slate-200 px-2 py-[3px]" style="border-left-color:#0284c7">run orchestration · dialogs <span class="text-slate-500">~676–816</span></div>
+                <div class="band bg-slate-200 px-2 py-[3px]" style="border-left-color:#0284c7">panels · toolbar · editor wiring <span class="text-slate-500">~821–989</span></div>
+                <div class="band bg-amber-100 px-2 py-[3px]" style="border-left-color:#f59e0b">schematic_panel (977 lines): tools · pan/zoom · symbols</div>
+                <div class="band bg-red-100 px-2 py-[3px] text-red-900 ring-1 ring-red-300" style="border-left-color:#dc2626">component popup — second copy of SIN/PULSE grammar<br/>expected_len = {"SIN"=&gt;5, "PULSE"=&gt;7} · string surgery :1754–1966</div>
+                <div class="band bg-slate-200 px-2 py-[3px]" style="border-left-color:#0284c7">drag · wire-stretch — re-derives connectivity NodeAssignment already owns</div>
+                <div class="band bg-slate-200 px-2 py-[3px]" style="border-left-color:#0284c7">result tabs: 8 Plot::new stacks + 6 duplicated formatters <span class="text-slate-500">~2075–2701</span></div>
+              </div>
+            </div>
+            <div class="rounded-lg border border-slate-200 bg-stone-50 p-4">
+              <p class="mb-2 text-xs uppercase tracking-wider text-slate-500">after — a Schematic module with one interface</p>
+              <div class="flex min-h-[300px] flex-col justify-center gap-3">
+                <div class="deep rounded-lg border-2 border-slate-900 p-4">
+                  <p class="text-[10px] uppercase tracking-widest text-emerald-300">schematic module</p>
+                  <p class="mt-1 font-mono text-sm text-emerald-50">Schematic::to_netlist() · from_netlist() · move() · rotate()</p>
+                  <p class="mt-1 text-[11px] text-slate-300">connectivity (NodeAssignment stays) · conversion both ways · wire-attach on mutation</p>
+                </div>
+                <div class="flex items-center gap-2">
+                  <div class="flex-1 rounded border border-slate-300 bg-white p-2 text-center font-mono text-[10px]">waveform edits → core's parse/emit (netlist's own grammar)</div>
+                  <svg width="20" height="20" class="text-slate-400 shrink-0"><line x1="2" y1="10" x2="14" y2="10" stroke="currentColor" stroke-width="2" stroke-dasharray="3 2"/><path d="M12 5 L19 10 L12 15 Z" fill="currentColor"/></svg>
+                  <div class="rounded border border-slate-300 bg-white p-2 font-mono text-[10px] text-slate-600">core keeps owning deck speech</div>
+                </div>
+                <p class="text-[11px] text-slate-500">app.rs keeps screens and wiring only; ~600 lines go, and the result-tab plot pile folds into one `plot_frame` on the existing plot.rs interface</p>
+              </div>
+            </div>
+          </div>
+
+          <p class="text-sm">**Problem:** the schematic panel re-implements the deck grammar by string surgery (`SIN`/`PULSE` re-parsed against `expected_len`), re-stretches wires by hand, and hides a layout algorithm inside a conversion fn — knowledge that core and `NodeAssignment` already own, just typed by cursor position.</p>
+          <p class="text-sm">**Solution:** a GUI-side Schematic module owning conversion in both directions plus move/rotate mutation ("keep wires attached" is its invariant), with waveform edits passed through core's parse/emit instead of raw string surgery.</p>
+          <ul class="list-disc space-y-1 pl-5 text-sm">
+            <li>deck-grammar edits stay in core</li>
+            <li>drag stops re-deriving connectivity</li>
+            <li>app.rs loses ~600 lines of copy</li>
+            <li>locality: editor bugs meet one module</li>
+          </ul>
+          <div class="rounded-lg bg-amber-50 p-3 text-xs text-amber-900">Related, smaller: result tabs duplicate `Plot::new` + formatter closures ~6× (app.rs :2267–2701). Pure GUI-local copy — weakest claim, easiest deletion.</div>
+        </article>
+
+      </section>
+
+      <!-- ─────────────────── top recommendation ─────────────────── -->
+      <section id="top-recommendation" class="scroll-mt-8 space-y-3 rounded-xl deep p-8 text-emerald-50 shadow-md">
+        <p class="text-xs uppercase tracking-widest text-emerald-300">top recommendation</p>
+        <h2 class="font-serif text-3xl font-semibold"><a href="#c1" class="hover:underline">1 · Name every branch and node — once</a></h2>
+        <p class="max-w-3xl text-sm text-slate-200">The seam to the frontends is real — `gui` and `cli` are two independent adapters — but it is shallow: reports are parallel `Vec`s with no identity, so the family/column fact leaks into four files, and one of the four copies is <span class="text-red-300">already rotted</span> (`MeasCurrents` lost `bjts`; `I(Q1)` in `.meas`/`.four` fails silently today). Deepen the result interface and the bug class is deleted with the copy — and candidate 4 (compile probes once) builds on the same named values.</p>
+        <p class="max-w-3xl text-xs text-slate-400">And beneath the cards: adding one element letter touches ~15 named sites across 5 files (the BJT count in `6382bc3` proves it). Cards 1–4 each remove one of those sites; that is the column becoming a table, one row at a time.</p>
+      </section>
+
+      <footer class="pb-6 text-center text-xs text-slate-400">
+        generated by improve-codebase-architecture · nothing landed in the repo · no ADRs existed, so no callouts apply
+      </footer>
+    </main>
+  </body>
+</html>

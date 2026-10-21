@@ -17,7 +17,16 @@ pub(super) struct SourceSpec {
     pub(super) ac: Option<Ac>,
 }
 
-pub(super) fn parse_source_value_specs(rest: &[&str], options: &ParseOptions) -> Result<SourceSpec> {
+/// Parse the value tail of a `V`/`I` card into a [`SourceSpec`].
+///
+/// The `Vec<String>` carries the trailing tokens the grammar could not place
+/// (anything after a `PULSE(…)` tail, or after a `PWL FILE=…` name). Callers
+/// decide the presentation: a deck import warns and carries on, the frontend
+/// value bridge turns them into an error — nothing is dropped silently.
+pub(super) fn parse_source_value_specs(
+    rest: &[&str],
+    options: &ParseOptions,
+) -> Result<(SourceSpec, Vec<String>)> {
     let mut spec = SourceSpec::default();
     let mut i = 0usize;
     while i < rest.len() {
@@ -59,7 +68,7 @@ pub(super) fn parse_source_value_specs(rest: &[&str], options: &ParseOptions) ->
             let pw  = parse_value(&p[5]).map_err(SimError::Parse)?;
             let per = parse_value(&p[6]).map_err(SimError::Parse)?;
             set_waveform(&mut spec, Waveform::Pulse(Pulse { v1, v2, td, tr, tf, pw, per }))?;
-            return Ok(spec);
+            return Ok((spec, p[7..].to_vec()));
         } else if token.starts_with("sin") && !token.starts_with("sffm") {
             let s = parenthesised_params(&rest[i..], "sin")?;
             if s.len() < 3 {
@@ -73,7 +82,7 @@ pub(super) fn parse_source_value_specs(rest: &[&str], options: &ParseOptions) ->
             let td    = if s.len() > 3 { parse_value(&s[3]).map_err(SimError::Parse)? } else { 0.0 };
             let theta = if s.len() > 4 { parse_value(&s[4]).map_err(SimError::Parse)? } else { 0.0 };
             set_waveform(&mut spec, Waveform::Sine(Sine { vo, va, freq, td, theta }))?;
-            return Ok(spec);
+            return Ok((spec, s[s.len().min(5)..].to_vec()));
         } else if token.starts_with("exp") {
             let e = parenthesised_params(&rest[i..], "exp")?;
             if e.len() < 6 {
@@ -88,7 +97,7 @@ pub(super) fn parse_source_value_specs(rest: &[&str], options: &ParseOptions) ->
             let td2 = parse_value(&e[4]).map_err(SimError::Parse)?;
             let tau2 = parse_value(&e[5]).map_err(SimError::Parse)?;
             set_waveform(&mut spec, Waveform::Exp(Exp { v1, v2, td1, tau1, td2, tau2 }))?;
-            return Ok(spec);
+            return Ok((spec, e[6..].to_vec()));
         } else if token.starts_with("sffm") {
             let s = parenthesised_params(&rest[i..], "sffm")?;
             if s.len() < 5 {
@@ -103,7 +112,7 @@ pub(super) fn parse_source_value_specs(rest: &[&str], options: &ParseOptions) ->
             let fs = parse_value(&s[4]).map_err(SimError::Parse)?;
             let td = if s.len() > 5 { parse_value(&s[5]).map_err(SimError::Parse)? } else { 0.0 };
             set_waveform(&mut spec, Waveform::Sffm(Sffm { vo, va, fc, mdi, fs, td }))?;
-            return Ok(spec);
+            return Ok((spec, s[s.len().min(6)..].to_vec()));
         } else if token.starts_with("am") {
             let a = parenthesised_params(&rest[i..], "am")?;
             if a.len() < 4 {
@@ -117,11 +126,11 @@ pub(super) fn parse_source_value_specs(rest: &[&str], options: &ParseOptions) ->
             let fc = parse_value(&a[3]).map_err(SimError::Parse)?;
             let td = if a.len() > 4 { parse_value(&a[4]).map_err(SimError::Parse)? } else { 0.0 };
             set_waveform(&mut spec, Waveform::Am(Am { va, vo, fm, fc, td }))?;
-            return Ok(spec);
+            return Ok((spec, a[a.len().min(5)..].to_vec()));
         } else if token.starts_with("pwl") {
-            let pwl = parse_pwl(&rest[i..], options)?;
+            let (pwl, leftovers) = parse_pwl(&rest[i..], options)?;
             set_waveform(&mut spec, Waveform::Pwl(pwl))?;
-            return Ok(spec);
+            return Ok((spec, leftovers));
         } else if spec.dc.is_none() {
             // Bare value — SPICE allows the DC keyword to be omitted.
             spec.dc = Some(parse_value(rest[i]).map_err(SimError::Parse)?);
@@ -132,7 +141,7 @@ pub(super) fn parse_source_value_specs(rest: &[&str], options: &ParseOptions) ->
             )));
         }
     }
-    Ok(spec)
+    Ok((spec, Vec::new()))
 }
 
 pub(super) fn set_waveform(spec: &mut SourceSpec, waveform: Waveform) -> Result<()> {
@@ -147,10 +156,19 @@ pub(super) fn set_waveform(spec: &mut SourceSpec, waveform: Waveform) -> Result<
 
 /// Parse a `PWL(…)` card, including `PWL FILE=<file>` and LTspice's
 /// `REPEAT FOR <n> (…) ENDREPEAT` / `REPEAT FOREVER (…) ENDREPEAT` blocks.
-pub(super) fn parse_pwl(rest: &[&str], options: &ParseOptions) -> Result<Pwl> {
+///
+/// Returns the card plus the tokens after a `FILE=` name that could not be
+/// applied (the inline form errors on stray tokens itself, so it always
+/// returns an empty vector).
+pub(super) fn parse_pwl(rest: &[&str], options: &ParseOptions) -> Result<(Pwl, Vec<String>)> {
     let text = rest.join(" ");
     let trimmed = text.trim();
-    let after = if trimmed.len() >= 3 && trimmed[..3].eq_ignore_ascii_case("pwl") {
+    // `get(..3)` instead of `[..3]`: a non-ASCII deck tail must surface as a
+    // parse error, not panic on a mid-character byte slice.
+    let after = if trimmed
+        .get(..3)
+        .is_some_and(|p| p.eq_ignore_ascii_case("pwl"))
+    {
         &trimmed[3..]
     } else {
         return Err(SimError::Parse("broken PWL card".into()));
@@ -158,13 +176,22 @@ pub(super) fn parse_pwl(rest: &[&str], options: &ParseOptions) -> Result<Pwl> {
     let after = after.trim();
     let after = after.strip_prefix('=').unwrap_or(after).trim();
 
-    if after.len() >= 4 && after[..4].eq_ignore_ascii_case("file") {
+    if after
+        .get(..4)
+        .is_some_and(|p| p.eq_ignore_ascii_case("file"))
+    {
         let file_part = after[4..].trim_start_matches(['=', ' ', '\t']);
-        let name = file_part
-            .split(|c: char| c.is_whitespace() || c == ')' || c == ',')
+        let mut parts = file_part.split(|c: char| c.is_whitespace() || c == ')' || c == ',');
+        let name = parts
             .next()
             .unwrap_or("")
             .trim_matches(|c| c == '"' || c == '\'');
+        // Tokens after the file name were carried, not applied — the inline
+        // form errors on stray tokens, so this branch reports them instead.
+        let leftovers: Vec<String> = parts
+            .map(|p| p.to_string())
+            .filter(|p| !p.is_empty())
+            .collect();
         if name.is_empty() {
             return Err(SimError::Parse("PWL FILE requires a file name".into()));
         }
@@ -201,7 +228,7 @@ pub(super) fn parse_pwl(rest: &[&str], options: &ParseOptions) -> Result<Pwl> {
         }
         let pwl = Pwl { points, repeat_from: None, repeat_count: None };
         pwl.validate().map_err(SimError::Parse)?;
-        return Ok(pwl);
+        return Ok((pwl, leftovers));
     }
 
     // Tokenize the inline form: commas/parentheses are separators, and the
@@ -265,7 +292,7 @@ pub(super) fn parse_pwl(rest: &[&str], options: &ParseOptions) -> Result<Pwl> {
     };
     let pwl = Pwl { points, repeat_from, repeat_count };
     pwl.validate().map_err(SimError::Parse)?;
-    Ok(pwl)
+    Ok((pwl, Vec::new()))
 }
 
 /// Join the tail of a source card from `start`, strip the function name,

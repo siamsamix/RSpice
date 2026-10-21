@@ -14,6 +14,7 @@ use crate::netlist::{
     StepValues, TfCommand, TfOutput,
 };
 use crate::circuit::MosfetType;
+use crate::model::{BOLTZMANN, ELECTRON_CHARGE, ZERO_CELSIUS_K};
 use num_complex::Complex64;
 
 #[derive(Debug, Clone)]
@@ -2182,14 +2183,6 @@ fn evaluate_fourier(
 
 // ─── .noise — small-signal noise sweep ───────────────────────────────────────
 
-/// Boltzmann constant (J/K).
-const BOLTZMANN: f64 = 1.380649e-23;
-/// Elementary charge (C).
-const ELECTRON_CHARGE: f64 = 1.602176634e-19;
-/// Reference temperature for thermal noise (K) — 27 °C until the `.temp`
-/// system lands.
-const NOISE_TEMPERATURE: f64 = 300.15;
-
 /// Resolve the two nodes of a voltage output operand.
 fn tf_output_nodes(circuit: &Circuit, output: &TfOutput) -> Result<(usize, usize)> {
     match output {
@@ -2236,7 +2229,10 @@ fn noise_psd_at(
         node_voltage(&adjoint, a) - node_voltage(&adjoint, b)
     };
 
-    let kt = BOLTZMANN * NOISE_TEMPERATURE;
+    // `circuit.temperature` is in °C; the 4kT thermal terms and the device
+    // noise currents below must read the *same* temperature, so both go
+    // through the deck's `.temp` value (0 °C = 273.15 K).
+    let kt = BOLTZMANN * (circuit.temperature + ZERO_CELSIUS_K);
     let mut psd = 0.0f64;
 
     for r in &circuit.resistors {

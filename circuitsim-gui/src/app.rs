@@ -405,6 +405,8 @@ impl CircuitSimApp {
             // the parameter language only exists in the text editor.
             source: String::new(),
             params: HashMap::new(),
+            funcs: HashMap::new(),
+            mc_seed: 0,
             // Nothing was parsed here — no import diagnostics exist yet.
             warnings: Vec::new(),
             options: ParseOptions::default(),

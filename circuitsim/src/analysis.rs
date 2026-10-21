@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use crate::circuit::Circuit;
+use crate::circuit::{Circuit, ElementFamily};
 use crate::error::{Result, SimError};
 use crate::mna::{
     advance_transient_state, build_system, compute_ac_branch_currents, compute_branch_currents,
@@ -1374,46 +1374,23 @@ pub fn run_tf_analysis(
 use crate::netlist::{MeasAnalysis, MeasEdge, MeasFunc, MeasKind, Measurement};
 use crate::params::{ParamEnv, ParamValue};
 
-/// Probe values from one measurement sample, in each element family's order.
-#[derive(Debug, Clone, Default)]
-struct MeasCurrents {
-    resistors: Vec<f64>,
-    capacitors: Vec<f64>,
-    inductors: Vec<f64>,
-    voltage_sources: Vec<f64>,
-    current_sources: Vec<f64>,
-    diodes: Vec<f64>,
-    mosfets: Vec<f64>,
-    jfets: Vec<f64>,
-    behavioral: Vec<f64>,
-}
-
 /// One point of the measured waveform: the abscissa plus every probed
 /// quantity, collapsed to real values (AC currents/voltages use magnitude).
+/// Branch reports are the simulator's own [`BranchCurrents`] — no
+/// per-consumer family copy to fall out of step with (the old `MeasCurrents`
+/// clone dropped `bjts` when the BJT landed, so `I(Q1)` never resolved).
 #[derive(Debug, Clone)]
 struct MeasSample {
     x: f64,
     nodes: Vec<f64>,
-    currents: MeasCurrents,
+    currents: BranchCurrents,
 }
 
-fn currents_from_real(b: &BranchCurrents) -> MeasCurrents {
-    MeasCurrents {
-        resistors: b.resistors.clone(),
-        capacitors: b.capacitors.clone(),
-        inductors: b.inductors.clone(),
-        voltage_sources: b.voltage_sources.clone(),
-        current_sources: b.current_sources.clone(),
-        diodes: b.diodes.clone(),
-        mosfets: b.mosfets.clone(),
-        jfets: b.jfets.clone(),
-        behavioral: b.behavioral.clone(),
-    }
-}
-
-fn currents_from_ac(b: &AcBranchCurrents) -> MeasCurrents {
-    let mag = |v: &Vec<Complex64>| v.iter().map(|c| c.norm()).collect();
-    MeasCurrents {
+/// AC branch currents collapse to magnitudes for measurement arithmetic: a
+/// `.meas` on an AC analysis reads the magnitudes the AC report prints.
+fn collapse_ac(b: &AcBranchCurrents) -> BranchCurrents {
+    let mag = |v: &[Complex64]| v.iter().map(|c| c.norm()).collect();
+    BranchCurrents {
         resistors: mag(&b.resistors),
         capacitors: mag(&b.capacitors),
         inductors: mag(&b.inductors),
@@ -1421,6 +1398,7 @@ fn currents_from_ac(b: &AcBranchCurrents) -> MeasCurrents {
         current_sources: mag(&b.current_sources),
         diodes: mag(&b.diodes),
         mosfets: mag(&b.mosfets),
+        bjts: mag(&b.bjts),
         jfets: mag(&b.jfets),
         behavioral: mag(&b.behavioral),
     }
@@ -1443,7 +1421,7 @@ fn measurement_samples(
                 .map(|p| MeasSample {
                     x: p.time,
                     nodes: p.node_voltages.clone(),
-                    currents: currents_from_real(&p.branch_currents),
+                    currents: p.branch_currents.clone(),
                 })
                 .collect())
         }
@@ -1456,7 +1434,7 @@ fn measurement_samples(
                 .map(|p| MeasSample {
                     x: p.values.first().copied().unwrap_or(0.0),
                     nodes: p.node_voltages.clone(),
-                    currents: currents_from_real(&p.branch_currents),
+                    currents: p.branch_currents.clone(),
                 })
                 .collect())
         }
@@ -1468,7 +1446,7 @@ fn measurement_samples(
                 .map(|p| MeasSample {
                     x: p.freq,
                     nodes: p.node_voltages.iter().map(|v| v.norm()).collect(),
-                    currents: currents_from_ac(&p.branch_currents),
+                    currents: collapse_ac(&p.branch_currents),
                 })
                 .collect())
         }
@@ -1477,152 +1455,160 @@ fn measurement_samples(
             Ok(vec![MeasSample {
                 x: 0.0,
                 nodes: dc.node_voltages.clone(),
-                currents: currents_from_real(&dc.branch_currents),
+                currents: dc.branch_currents.clone(),
             }])
         }
     }
 }
 
-/// Evaluate a probe operand (`V(out)`, `V(a,b)`, `I(V1)`) at one sample.
-fn probe_value(
-    circuit: &Circuit,
-    sample: &MeasSample,
-    letter: char,
-    inner: &str,
-) -> std::result::Result<f64, String> {
-    if letter.eq_ignore_ascii_case(&'v') {
-        let mut parts = inner.split(',').map(str::trim);
-        let first = parts.next().unwrap_or("");
-        let value = |name: &str| -> std::result::Result<f64, String> {
-            let lower = name.to_ascii_lowercase();
-            if lower == "0" || lower == "gnd" {
-                return Ok(0.0);
+/// One operand of a measurement expression, resolved once against the
+/// circuit: the parameter arithmetic stays text, while every `V()`/`I()`
+/// probe becomes a typed position its value is read from — the
+/// `behavior::ProbeSpec` pattern applied to `.meas`.
+enum MeasPart {
+    /// Literal arithmetic text between probes.
+    Text(String),
+    /// `V(net)` — the node id its sample value is read at (0 is ground).
+    Node(usize),
+    /// `V(a,b)` — the differential read between two node ids.
+    NodeDiff(usize, usize),
+    /// `I(el)` — family plus index into the family's report `Vec`.
+    Current(ElementFamily, usize),
+}
+
+/// A measurement expression compiled once per run: probes resolved and
+/// validated when the analysis starts, so per-sample work is value lookup
+/// plus the parameter engine — not a fresh syntax scan per point.
+struct MeasProgram {
+    parts: Vec<MeasPart>,
+}
+
+impl MeasProgram {
+    /// Compile `expr`: split out the `V(…)`/`I(…)` operands (balanced-paren
+    /// aware, so nested calls like `f(V(a))` stay intact) and bind them to
+    /// the circuit. Unknown nets or elements fail loudly here, once.
+    fn compile(expr: &str, circuit: &Circuit) -> std::result::Result<Self, String> {
+        let chars: Vec<char> = expr.chars().collect();
+        let mut parts: Vec<MeasPart> = Vec::new();
+        let mut text = String::with_capacity(expr.len());
+        let mut i = 0usize;
+        while i < chars.len() {
+            let c = chars[i];
+            if matches!(c, 'v' | 'V' | 'i' | 'I') && chars.get(i + 1) == Some(&'(') {
+                let mut depth = 1usize;
+                let mut j = i + 2;
+                while j < chars.len() {
+                    match chars[j] {
+                        '(' => depth += 1,
+                        ')' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                break;
+                            }
+                        }
+                        _ => {}
+                    }
+                    j += 1;
+                }
+                if j >= chars.len() {
+                    return Err(format!("expression '{expr}' has an unbalanced probe"));
+                }
+                let inner: String = chars[i + 2..j].iter().collect();
+                let probe = match c.to_ascii_lowercase() {
+                    'v' => Self::compile_voltage(circuit, &inner)?,
+                    _ => {
+                        let name = inner.trim();
+                        let (family, index) = circuit
+                            .resolve_current_probe(name)
+                            .ok_or_else(|| {
+                                format!("measurement names no element '{name}' for I(…)")
+                            })?;
+                        MeasPart::Current(family, index)
+                    }
+                };
+                if !text.is_empty() {
+                    parts.push(MeasPart::Text(std::mem::take(&mut text)));
+                }
+                parts.push(probe);
+                i = j + 1;
+                continue;
             }
-            if let Some(id) = circuit
-                .node_names
-                .iter()
-                .position(|n| n.eq_ignore_ascii_case(name))
-            {
-                return sample
-                    .nodes
-                    .get(id)
-                    .copied()
-                    .ok_or_else(|| format!("node '{name}' has no sample value"));
+            text.push(c);
+            i += 1;
+        }
+        if !text.is_empty() {
+            parts.push(MeasPart::Text(text));
+        }
+        Ok(MeasProgram { parts })
+    }
+
+    /// Bind `V(net)` / `V(a,b)`: names resolve through `Circuit::node_id`
+    /// (the ground/case alias lore in one place), with the numeric-id
+    /// fallback the reference tools accept.
+    fn compile_voltage(circuit: &Circuit, inner: &str) -> std::result::Result<MeasPart, String> {
+        let mut nets = inner.split(',').map(str::trim);
+        let resolve = |name: &str| -> std::result::Result<usize, String> {
+            if let Some(crate::circuit::NodeId(id)) = circuit.node_id(name) {
+                return Ok(id);
             }
-            if let Ok(id) = lower.parse::<usize>() {
-                return sample
-                    .nodes
-                    .get(id)
-                    .copied()
-                    .ok_or_else(|| format!("node '{name}' is out of range"));
+            if let Ok(id) = name.to_ascii_lowercase().parse::<usize>() {
+                if id < circuit.nodes {
+                    return Ok(id);
+                }
+                return Err(format!("node '{name}' is out of range"));
             }
             Err(format!("measurement names unknown node '{name}'"))
         };
-        let a = value(first)?;
-        match parts.next() {
-            Some(reference) => Ok(a - value(reference)?),
-            None => Ok(a),
+        let a = resolve(nets.next().unwrap_or(""))?;
+        match nets.next() {
+            Some(b) => Ok(MeasPart::NodeDiff(a, resolve(b)?)),
+            None => Ok(MeasPart::Node(a)),
         }
-    } else if letter.eq_ignore_ascii_case(&'i') {
-        let name = inner.trim();
-        let pick = |names: &[String], values: &[f64], family: &str| {
-            names
-                .iter()
-                .position(|n| n.eq_ignore_ascii_case(name))
-                .map(|i| values.get(i).copied().unwrap_or(0.0))
-                .ok_or_else(|| {
-                    format!("measurement names no {family} '{name}' (I(…) probes an element)")
-                })
+    }
+
+    /// Evaluate at one sample: substitute the bound probe values, inject
+    /// `time`, and run the parameter engine. `env` comes from
+    /// `Netlist::param_env()` — complete, so user `.func` calls work.
+    fn eval(
+        &self,
+        expr: &str,
+        env: &ParamEnv,
+        sample: &MeasSample,
+    ) -> std::result::Result<f64, String> {
+        let read_node = |id: usize| -> std::result::Result<f64, String> {
+            sample
+                .nodes
+                .get(id)
+                .copied()
+                .ok_or_else(|| format!("node '{id}' has no sample value"))
         };
-        let r_names: Vec<String> = circuit.resistors.iter().map(|r| r.name.clone()).collect();
-        if let Ok(v) = pick(&r_names, &sample.currents.resistors, "resistor") {
-            return Ok(v);
-        }
-        let c_names: Vec<String> = circuit.capacitors.iter().map(|c| c.name.clone()).collect();
-        if let Ok(v) = pick(&c_names, &sample.currents.capacitors, "capacitor") {
-            return Ok(v);
-        }
-        let l_names: Vec<String> = circuit.inductors.iter().map(|l| l.name.clone()).collect();
-        if let Ok(v) = pick(&l_names, &sample.currents.inductors, "inductor") {
-            return Ok(v);
-        }
-        let v_names: Vec<String> = circuit.voltage_sources.iter().map(|v| v.name.clone()).collect();
-        if let Ok(v) = pick(&v_names, &sample.currents.voltage_sources, "voltage source") {
-            return Ok(v);
-        }
-        let i_names: Vec<String> = circuit.current_sources.iter().map(|i| i.name.clone()).collect();
-        if let Ok(v) = pick(&i_names, &sample.currents.current_sources, "current source") {
-            return Ok(v);
-        }
-        let d_names: Vec<String> = circuit.diodes.iter().map(|d| d.name.clone()).collect();
-        if let Ok(v) = pick(&d_names, &sample.currents.diodes, "diode") {
-            return Ok(v);
-        }
-        let m_names: Vec<String> = circuit.mosfets.iter().map(|m| m.name.clone()).collect();
-        if let Ok(v) = pick(&m_names, &sample.currents.mosfets, "MOSFET") {
-            return Ok(v);
-        }
-        let j_names: Vec<String> = circuit.jfets.iter().map(|j| j.name.clone()).collect();
-        if let Ok(v) = pick(&j_names, &sample.currents.jfets, "JFET") {
-            return Ok(v);
-        }
-        let b_names: Vec<String> = circuit.behavioral.iter().map(|b| b.name.clone()).collect();
-        if let Ok(v) = pick(&b_names, &sample.currents.behavioral, "behavioral source") {
-            return Ok(v);
-        }
-        Err(format!("measurement names no element '{name}' for I(…)"))
-    } else {
-        Err(format!("unsupported probe '{letter}({inner})'"))
-    }
-}
-
-/// Replace every `V(…)`/`I(…)` probe in `expr` with its numeric value at this
-/// sample, then evaluate the remaining arithmetic through the parameter
-/// expression engine.
-fn eval_meas_expr(
-    expr: &str,
-    circuit: &Circuit,
-    sample: &MeasSample,
-    params: &ParamEnv,
-) -> std::result::Result<f64, String> {
-    let chars: Vec<char> = expr.chars().collect();
-    let mut out = String::with_capacity(expr.len());
-    let mut i = 0usize;
-    while i < chars.len() {
-        let c = chars[i];
-        if matches!(c, 'v' | 'V' | 'i' | 'I') && chars.get(i + 1) == Some(&'(') {
-            let mut depth = 1usize;
-            let mut j = i + 2;
-            while j < chars.len() {
-                match chars[j] {
-                    '(' => depth += 1,
-                    ')' => {
-                        depth -= 1;
-                        if depth == 0 {
-                            break;
-                        }
-                    }
-                    _ => {}
+        let mut out = String::with_capacity(128);
+        for part in &self.parts {
+            match part {
+                MeasPart::Text(t) => out.push_str(t),
+                MeasPart::Node(a) => {
+                    out.push_str(&format!("({})", read_node(*a)?));
                 }
-                j += 1;
+                MeasPart::NodeDiff(a, b) => {
+                    out.push_str(&format!("({})", read_node(*a)? - read_node(*b)?));
+                }
+                MeasPart::Current(family, index) => {
+                    let value = sample
+                        .currents
+                        .slice(*family)
+                        .and_then(|s| s.get(*index).copied())
+                        .ok_or_else(|| {
+                            format!("measurement names no {} for I(…)", family.label())
+                        })?;
+                    out.push_str(&format!("({value})"));
+                }
             }
-            if j >= chars.len() {
-                return Err(format!("expression '{expr}' has an unbalanced probe"));
-            }
-            let inner: String = chars[i + 2..j].iter().collect();
-            let value = probe_value(circuit, sample, c, &inner)?;
-            out.push_str(&format!("({value})"));
-            i = j + 1;
-            continue;
         }
-        out.push(c);
-        i += 1;
+        let mut env = env.clone();
+        env.params
+            .insert("time".to_string(), ParamValue::Num(sample.x));
+        env.eval_num(&out).map_err(|e| format!("expression '{expr}': {e}"))
     }
-
-    let mut env = params.clone();
-    env.params
-        .insert("time".to_string(), ParamValue::Num(sample.x));
-    env.eval_num(&out).map_err(|e| format!("expression '{expr}': {e}"))
 }
 
 fn indices_in_window(samples: &[MeasSample], from: Option<f64>, to: Option<f64>) -> Vec<usize> {
@@ -1756,42 +1742,44 @@ fn evaluate_measurement(
 ) -> std::result::Result<f64, String> {
     let samples = measurement_samples(measurement.analysis, dc, dc_sweep, tran, ac)?;
     let circuit = &netlist.circuit;
-    let params = ParamEnv {
-        params: netlist.params.clone(),
-        funcs: Default::default(),
-        ..Default::default()
-    };
+    // The deck's complete parameter environment: values, `.func` tables and
+    // the Monte-Carlo seed, compiled once per measurement.
+    let params = netlist.param_env();
     match &measurement.kind {
         MeasKind::Scalar { func, expr, from, to } => {
+            let program = MeasProgram::compile(expr, circuit)?;
             let idx = indices_in_window(&samples, *from, *to);
             let xs: Vec<f64> = idx.iter().map(|&i| samples[i].x).collect();
             let ys: Vec<f64> = idx
                 .iter()
-                .map(|&i| eval_meas_expr(expr, circuit, &samples[i], &params))
+                .map(|&i| program.eval(expr, &params, &samples[i]))
                 .collect::<std::result::Result<_, _>>()?;
             scalar_stat(*func, &xs, &ys)
         }
         MeasKind::FindWhen { expr, when, when_value, edge, from, to } => {
+            let program = MeasProgram::compile(expr, circuit)?;
+            let when_program = MeasProgram::compile(when, circuit)?;
             let idx = indices_in_window(&samples, *from, *to);
             let xs: Vec<f64> = idx.iter().map(|&i| samples[i].x).collect();
             let when_ys: Vec<f64> = idx
                 .iter()
-                .map(|&i| eval_meas_expr(when, circuit, &samples[i], &params))
+                .map(|&i| when_program.eval(when, &params, &samples[i]))
                 .collect::<std::result::Result<_, _>>()?;
             let expr_ys: Vec<f64> = idx
                 .iter()
-                .map(|&i| eval_meas_expr(expr, circuit, &samples[i], &params))
+                .map(|&i| program.eval(expr, &params, &samples[i]))
                 .collect::<std::result::Result<_, _>>()?;
             let crossings = crossing_points(&xs, &when_ys, *when_value, *edge);
             let x = pick_occurrence(crossings, *edge, "WHEN")?;
             interpolate_at(&xs, &expr_ys, x)
         }
         MeasKind::Cross { expr, value, edge, from, to } => {
+            let program = MeasProgram::compile(expr, circuit)?;
             let idx = indices_in_window(&samples, *from, *to);
             let xs: Vec<f64> = idx.iter().map(|&i| samples[i].x).collect();
             let ys: Vec<f64> = idx
                 .iter()
-                .map(|&i| eval_meas_expr(expr, circuit, &samples[i], &params))
+                .map(|&i| program.eval(expr, &params, &samples[i]))
                 .collect::<std::result::Result<_, _>>()?;
             let crossings = crossing_points(&xs, &ys, *value, *edge);
             pick_occurrence(crossings, *edge, "CROSS")
@@ -1806,15 +1794,17 @@ fn evaluate_measurement(
             from,
             to,
         } => {
+            let trig_program = MeasProgram::compile(trig_expr, circuit)?;
+            let targ_program = MeasProgram::compile(targ_expr, circuit)?;
             let idx = indices_in_window(&samples, *from, *to);
             let xs: Vec<f64> = idx.iter().map(|&i| samples[i].x).collect();
             let trig_ys: Vec<f64> = idx
                 .iter()
-                .map(|&i| eval_meas_expr(trig_expr, circuit, &samples[i], &params))
+                .map(|&i| trig_program.eval(trig_expr, &params, &samples[i]))
                 .collect::<std::result::Result<_, _>>()?;
             let targ_ys: Vec<f64> = idx
                 .iter()
-                .map(|&i| eval_meas_expr(targ_expr, circuit, &samples[i], &params))
+                .map(|&i| targ_program.eval(targ_expr, &params, &samples[i]))
                 .collect::<std::result::Result<_, _>>()?;
             let trig_crossings = crossing_points(&xs, &trig_ys, *trig_value, *trig_edge);
             let targ_crossings = crossing_points(&xs, &targ_ys, *targ_value, *targ_edge);
@@ -1881,19 +1871,18 @@ fn evaluate_fourier(
     let period = t_end - t_start;
     let omega = 2.0 * std::f64::consts::PI * cmd.frequency;
 
-    let params = ParamEnv {
-        params: netlist.params.clone(),
-        funcs: Default::default(),
-        ..Default::default()
-    };
+    let params = netlist.param_env();
     let mut outputs = Vec::with_capacity(cmd.outputs.len());
     for spec in &cmd.outputs {
+        let program =
+            MeasProgram::compile(spec, &netlist.circuit).map_err(SimError::Analysis)?;
         let mut xs = Vec::with_capacity(window.len());
         let mut ys = Vec::with_capacity(window.len());
         for sample in &window {
             xs.push(sample.x);
             ys.push(
-                eval_meas_expr(spec, &netlist.circuit, sample, &params)
+                program
+                    .eval(spec, &params, sample)
                     .map_err(SimError::Analysis)?,
             );
         }

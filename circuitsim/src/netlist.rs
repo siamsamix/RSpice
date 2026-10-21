@@ -10,7 +10,8 @@ use crate::circuit::{
 use crate::error::{Result, SimError};
 use crate::model::ModelTolerance;
 use crate::params::{
-    expand_line, parse_func_body, parse_param_body, seed_from_overrides, ParamEnv, ParamValue,
+    expand_line, parse_func_body, parse_param_body, seed_from_overrides, FuncDef, ParamEnv,
+    ParamValue,
 };
 use crate::units::parse_value;
 
@@ -330,6 +331,14 @@ pub struct Netlist {
     pub source: String,
     /// Final parameter table, for sweep-target resolution.
     pub params: HashMap<String, ParamValue>,
+    /// The final `.func` table. `.meas`/`.four` expressions evaluate through
+    /// it — it travels with the deck instead of being rebuilt (and dropped)
+    /// by each consumer.
+    pub funcs: HashMap<String, FuncDef>,
+    /// The Monte-Carlo seed this parse rolled (the step/sweep overrides are
+    /// mixed in), so runtime expression evaluation draws exactly the way the
+    /// parse-time expansion did.
+    pub mc_seed: u64,
     /// Best-effort import diagnostics: unknown directives and unsupported
     /// device kinds are recorded here and skipped, never fatal (TODO §2).
     pub warnings: Vec<String>,
@@ -493,10 +502,26 @@ fn parse_featured(
         analysis,
         source: source.to_string(),
         params: env.params,
+        funcs: env.funcs,
+        mc_seed: env.mc_seed,
         warnings,
         options: options.clone(),
         overrides: overrides.clone(),
     })
+}
+
+impl Netlist {
+    /// The complete parameter environment this deck parsed to: values, user
+    /// `.func` tables, and the Monte-Carlo seed. Measurement expressions
+    /// evaluate through exactly this — the hand-built copies that dropped
+    /// `funcs` are what made `.meas` lose user functions.
+    pub fn param_env(&self) -> ParamEnv {
+        ParamEnv {
+            params: self.params.clone(),
+            funcs: self.funcs.clone(),
+            mc_seed: self.mc_seed,
+        }
+    }
 }
 
 // ─── Library files (.include / .lib) ────────────────────────────────────────

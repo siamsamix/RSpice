@@ -34,6 +34,52 @@ R2 2 0 1k
     assert_relative_eq!(dc.node_voltages[2], 5.0, epsilon = 1e-6);
 }
 
+/// TODO §4: `.op all` derives annotated device operating points (resistor
+/// v/i/p, capacitor-held voltage, source conventions) from the same solution
+/// the plain bias point prints.
+#[test]
+fn op_all_annotates_device_operating_points() {
+    let netlist = r#"
+* annotated op points
+.op all
+V1 1 0 DC 10
+R1 1 2 1k
+R2 2 0 1k
+C1 2 0 1u
+.end
+"#;
+    let netlist = parse(netlist).unwrap();
+    let result = run(&netlist).unwrap();
+    let dc = result.dc.as_ref().unwrap();
+    let points = circuitsim::analysis::device_op_points(
+        &netlist.circuit,
+        &dc.node_voltages,
+        &dc.branch_currents,
+        &dc.source_currents,
+    );
+    let by_name = |name: &str| {
+        points
+            .iter()
+            .find(|p| p.name.eq_ignore_ascii_case(name))
+            .unwrap_or_else(|| panic!("no op point for {name}"))
+    };
+    let r1 = by_name("R1");
+    assert!(r1.entries.iter().any(|(k, v)| k == "v" && (*v - 5.0).abs() < 1e-6));
+    assert!(r1.entries.iter().any(|(k, v)| k == "i" && (*v - 5e-3).abs() < 1e-9));
+    assert!(r1.entries.iter().any(|(k, v)| k == "p" && (*v - 2.5e-2).abs() < 1e-9));
+    // The capacitor is an open circuit at DC: only the held voltage.
+    let c1 = by_name("C1");
+    assert!(c1.entries.iter().any(|(k, v)| k == "v" && (*v - 5.0).abs() < 1e-6));
+    assert!(c1.entries.iter().all(|(k, _)| *k != "i"));
+    // The delivering source reads the element-convention (negative) current.
+    let v1 = by_name("V1");
+    assert!(v1.entries.iter().any(|(k, v)| k == "i" && (*v + 5e-3).abs() < 1e-9));
+    assert!(v1.entries.iter().any(|(k, v)| k == "p" && (*v + 5e-2).abs() < 1e-9));
+    // Card order head-to-tail: R, C before the sources.
+    assert!(points.iter().position(|p| p.name == "R1")
+        < points.iter().position(|p| p.name == "V1"));
+}
+
 #[test]
 fn rc_charging_transient() {
     let netlist = r#"
@@ -2087,4 +2133,350 @@ R1 out 0 1k
         2.0,
         epsilon = 1e-9
     );
+}
+
+// ── ABM (TODO §5): E/F/G/H VALUE/TABLE/LAPLACE/FREQ/CHEBYSHEV ─────────────────
+
+/// `E1 … VALUE={expr}` is an instant transfer in every analysis; the deck
+/// `.param` folds into the expression.
+#[test]
+fn abm_value_scales_dc_voltage() {
+    let netlist = r#"
+.param gain=4
+V1 in 0 DC 2
+E1 out 0 VALUE={V(in)*gain}
+.op
+.end
+"#;
+    let n = parse(netlist).unwrap();
+    assert!(n.warnings.is_empty(), "{:?}", n.warnings);
+    let r = run(&n).unwrap();
+    let out = node_index(&n.circuit.node_names, "out");
+    assert_relative_eq!(r.dc.unwrap().node_voltages[out], 8.0, epsilon = 1e-9);
+}
+
+/// `G1 … VALUE={expr}` writes the current flavour: the parsed transconductance
+/// injects `f` from out+ (ground here) into out−, same as the classic `G`.
+#[test]
+fn abm_current_flavour_transconductance() {
+    let netlist = r#"
+V1 in 0 DC 1
+G1 0 out VALUE={V(in)*1m}
+R1 out 0 1k
+.op
+.end
+"#;
+    let n = parse(netlist).unwrap();
+    assert!(n.warnings.is_empty(), "{:?}", n.warnings);
+    let r = run(&n).unwrap();
+    let out = node_index(&n.circuit.node_names, "out");
+    assert_relative_eq!(r.dc.unwrap().node_voltages[out], 1.0, epsilon = 1e-9);
+}
+
+/// `TABLE {V(in)} = …` follows the swept input piecewise-linearly and sits
+/// silently at 0 the moment the input leaves the bracketing range (PSpice
+/// ABM semantics; the deck lists the pairs out of order).
+#[test]
+fn abm_table_sweep_interpolates_and_zeroes_outside() {
+    let netlist = r#"
+V1 in 0 DC 0
+E1 out 0 TABLE {V(in)} = (2, 2.5) (0, 0) (1, 1)
+.dc V1 -1 4 0.5
+.end
+"#;
+    let n = parse(netlist).unwrap();
+    assert!(n.warnings.is_empty(), "{:?}", n.warnings);
+    let sweep = run(&n).unwrap().dc_sweep.expect("sweep result");
+    // Parsed points: (0,0) (1,1) (2,2.5) — linear between, 0 outside.
+    let expect = |v: f64| -> f64 {
+        match v {
+            _ if v <= 0.0 => 0.0,
+            _ if v <= 1.0 => v,
+            _ if v <= 2.0 => 1.0 + 1.5 * (v - 1.0),
+            _ => 0.0,
+        }
+    };
+    let out = node_index(&n.circuit.node_names, "out");
+    for pt in &sweep.points {
+        let v = pt.node_voltages[out];
+        assert_relative_eq!(v, expect(pt.values[0]), epsilon = 1e-12, max_relative = 1e-9);
+    }
+}
+
+/// `LAPLACE {V(in)} = {num} {den}` stamps its DC gain H(0) = n0/d0 in the
+/// operating point (1/(s+0.5) → ×2) and the full complex response in AC:
+/// |H| = 1/√2·2 at the ω = 0.5 rad/s corner, −45°.
+#[test]
+fn abm_laplace_dc_gain_and_ac_at_pole() {
+    let netlist = r#"
+V1 in 0 DC 1 AC 1
+R1 out 0 1k
+E1 out 0 LAPLACE {V(in)} = {1} {1, 0.5}
+.op
+.ac LIN 2 0.039788735772 0.079577471545
+.end
+"#;
+    let n = parse(netlist).unwrap();
+    let r = run(&n).unwrap();
+    let out = node_index(&n.circuit.node_names, "out");
+
+    // DC: the stamped gain is n0/d0 = 1/0.5 = 2 (den (0) = 0.5 ≠ 0).
+    assert_relative_eq!(r.dc.unwrap().node_voltages[out], 2.0, epsilon = 1e-9);
+
+    // AC: the card carries the one dynamic-form scope note.
+    assert_eq!(n.warnings.len(), 1, "warnings: {:?}", n.warnings);
+    assert!(
+        n.warnings[0].contains("respond in AC"),
+        "warning: {:?}",
+        n.warnings[0]
+    );
+    let ac = r.ac.unwrap();
+    let first = ac.points.first().unwrap().node_voltages[out];
+    assert_relative_eq!(first.norm(), 1.788854382, epsilon = 1e-5); // 1/√(0.5²+0.25²)
+    assert_relative_eq!(first.arg().to_degrees(), -26.5650512, epsilon = 1e-3);
+    let last = ac.points.last().unwrap().node_voltages[out];
+    // |H(ω)| = 2/√2 at the ω = 0.5 rad/s corner (2× −3 dB), −45°.
+    assert_relative_eq!(last.norm(), 2.0 * std::f64::consts::FRAC_1_SQRT_2, epsilon = 1e-6);
+    assert_relative_eq!(last.arg().to_degrees(), -45.0, epsilon = 1e-3);
+}
+
+/// `FREQ {expr} = <f, g> …` interpolates its gain/phase rows (in log f) onto
+/// the AC test frequencies; each sweep point shows exactly the table value.
+#[test]
+fn abm_freq_rows_drive_ac() {
+    let netlist = r#"
+V1 in 0 DC 0 AC 2
+R1 out 0 1k
+G1 0 out FREQ {V(in)*1m} = <100, 5> <1, 0.5>
+.op
+.ac LIN 2 1 2
+.end
+"#;
+    let n = parse(netlist).unwrap();
+    let ac = run(&n).unwrap().ac.unwrap();
+    let out = node_index(&n.circuit.node_names, "out");
+    // The card carries the one dynamic-form scope note.
+    assert_eq!(n.warnings.len(), 1, "warnings: {:?}", n.warnings);
+    assert!(
+        n.warnings[0].contains("respond in AC"),
+        "warning: {:?}",
+        n.warnings[0]
+    );
+
+    // The sweep recomputes the operating point per frequency, so the AC
+    // drive (2) rides the dynamic coupling (rows at 1 and 100 Hz).
+    let first = ac.points.first().unwrap().node_voltages[out];
+    assert_relative_eq!(first.norm(), 1.0, epsilon = 1e-9); // gain 0.5 × 2 mA × 1 k
+    let last = ac.points.last().unwrap().node_voltages[out];
+    // At 2 Hz the log-f interpolation between 0.5 (1 Hz) and 5 (100 Hz)
+    // gives 0.5 + log10(2)/log10(100)·4.5 → ×2 mA × 1 kΩ.
+    assert_relative_eq!(last.norm(), 2.0 * 1.1773174907399583, epsilon = 1e-5);
+    // Zero-phase rows keep the phasor on the real axis.
+    assert!(first.arg().abs() < 1e-9);
+    assert!(last.arg().abs() < 1e-9);
+}
+
+/// `CHEBYSHEV {expr} 1 0 0` attenuates by 1/(1 + |T₂(f)|): half at f = 1 (T₂
+/// (1) = 1) and at DC (T₂(0) = −1), 1/1.5 at f = 0.5. Zero phase throughout.
+#[test]
+fn abm_chebyshev_attenuates_dc_and_ac() {
+    let netlist = r#"
+V1 in 0 DC 2.5 AC 2
+R1 out 0 1k
+F1 0 out CHEBYSHEV {V(in)*1m} 1 0 0
+.op
+.ac LIN 2 0.5 1
+.end
+"#;
+    let n = parse(netlist).unwrap();
+    let r = run(&n).unwrap();
+    let out = node_index(&n.circuit.node_names, "out");
+    // The card carries the one dynamic-form scope note.
+    assert_eq!(n.warnings.len(), 1, "warnings: {:?}", n.warnings);
+    assert!(
+        n.warnings[0].contains("respond in AC"),
+        "warning: {:?}",
+        n.warnings[0]
+    );
+
+    assert_relative_eq!(r.dc.unwrap().node_voltages[out], 1.25, epsilon = 1e-9);
+    let ac = r.ac.unwrap();
+    let first = ac.points.first().unwrap().node_voltages[out];
+    assert_relative_eq!(first.norm(), 4.0 / 3.0, epsilon = 1e-6);
+    let last = ac.points.last().unwrap().node_voltages[out];
+    assert_relative_eq!(last.norm(), 1.0, epsilon = 1e-9);
+    assert!(first.arg().abs() < 1e-9);
+}
+
+/// An ABM card inside a `.subckt` flattens like a `B` card does: instance
+/// prefix on the name, output nodes mangled, probe rewritten — and the
+/// response still lands.
+#[test]
+fn abm_inside_subckt_flattens_with_its_form() {
+    let netlist = r#"
+.subckt amp a b
+E1 b 0 VALUE={V(a)*3}
+.ends
+V1 in 0 DC 2
+X1 in out amp
+.op
+.end
+"#;
+    let n = parse(netlist).unwrap();
+    assert!(n.warnings.is_empty(), "{:?}", n.warnings);
+    let r = run(&n).unwrap();
+    let out = node_index(&n.circuit.node_names, "out");
+    assert_relative_eq!(r.dc.unwrap().node_voltages[out], 6.0, epsilon = 1e-9);
+    // The flattened entry carries its VALUE form (and there is exactly one).
+    assert_eq!(n.circuit.behavioral.len(), 1);
+    assert!(matches!(
+        n.circuit.behavioral[0].abm,
+        Some(circuitsim::AbmForm::Value)
+    ));
+}
+
+// ── Ideal op-amp `U` (TODO §5, documented interpretation) ─────────────────────
+
+/// Closed-loop inverting amp with a bare `U`: finite-gain transfer
+/// `= −A·(1/R1) / (1/R1 + 1/RF + A/RF)` on the stamps the engine builds.
+/// The − input sits at `−Vout/A` exactly (the branch row's defining law).
+#[test]
+fn opamp_bare_u_closes_an_inverting_amplifier() {
+    let netlist = r#"
+V1 in 0 DC 1
+R1 in vn 1k
+RF vn out 10k
+U1 out 0 0 vn
+.op
+.end
+"#;
+    let n = parse(netlist).unwrap();
+    assert!(n.warnings.is_empty(), "{:?}", n.warnings);
+    let r = run(&n).unwrap();
+    let dc = r.dc.unwrap();
+
+    let (a, g1, gf) = (1e6, 1.0 / 1e3, 1.0 / 1e4);
+    let expect_out = -a * g1 / (g1 + gf + a * gf);
+    let out = node_index(&n.circuit.node_names, "out");
+    let vn = node_index(&n.circuit.node_names, "vn");
+    assert_relative_eq!(dc.node_voltages[out], expect_out, epsilon = 1e-9);
+    assert_relative_eq!(dc.node_voltages[vn], -expect_out / a, epsilon = 1e-9);
+
+    // The element convention: the branch unknown is the through-device
+    // current out+ → out−. The amplifier here *sinks* into the feedback
+    // path (vn sits above out), so the report reads positive RF current.
+    let i_rf = (dc.node_voltages[vn] - dc.node_voltages[out]) / 1e4;
+    assert_relative_eq!(dc.branch_currents.opamps[0], i_rf, max_relative = 1e-9);
+}
+
+/// A `.model u1 U(…)` card drives GAIN/RIN/VOS all at once: the transfer
+/// `= A·(VOS·G − Vin·g1) / (G + A·gf)` with `G = g1 + gf + gi` lands on the
+/// engine solution to 1e-9.
+#[test]
+fn opamp_model_card_requests_gain_rin_and_offset() {
+    let netlist = r#"
+.model u1 U(GAIN=1e5 RIN=100k ROUT=50 VOS=1m)
+V1 in 0 DC 1
+R1 in vn 1k
+RF vn out 10k
+U1 out 0 0 vn u1
+.op
+.end
+"#;
+    let n = parse(netlist).unwrap();
+    assert!(n.warnings.is_empty(), "{:?}", n.warnings);
+    let r = run(&n).unwrap();
+    let dc = r.dc.unwrap();
+
+    let (a, vos, g1, gf, gi) = (1e5, 1e-3, 1.0 / 1e3, 1.0 / 1e4, 1.0 / 1e5);
+    let big = g1 + gf + gi;
+    let expect = a * (vos * big - g1) / (big + a * gf);
+    let out = node_index(&n.circuit.node_names, "out");
+    assert_relative_eq!(dc.node_voltages[out], expect, epsilon = 1e-9);
+
+    // The annotated operating point carries the model summary plus v/i/p.
+    let points = circuitsim::analysis::device_op_points(
+        &n.circuit,
+        &dc.node_voltages,
+        &dc.branch_currents,
+        &dc.source_currents,
+    );
+    let u = points.iter().find(|p| p.name == "U1").expect("U1 op point");
+    let entry = |key: &str| u.entries.iter().find(|(k, _)| k == key).unwrap().1;
+    assert_relative_eq!(entry("a"), a, epsilon = 1e-9);
+    assert_relative_eq!(entry("v"), expect, epsilon = 1e-9);
+    assert_relative_eq!(entry("p"), expect * entry("i"), epsilon = 1e-12);
+}
+
+/// AC through a unity-gain buffer: the row law holds in complex arithmetic
+/// too, so the phasor gain is `A/(A+1)` with no phase.
+#[test]
+fn opamp_ac_buffer_transfer_matches_the_gain() {
+    let netlist = r#"
+.model u1 U(GAIN=1e6)
+V1 in 0 DC 0 AC 1
+RF out fb 1k
+U1 out 0 in fb u1
+.ac LIN 2 1k 2k
+.end
+"#;
+    let n = parse(netlist).unwrap();
+    assert!(n.warnings.is_empty(), "{:?}", n.warnings);
+    let r = run(&n).unwrap();
+    let ac = r.ac.expect("ac result");
+    assert_eq!(ac.points.len(), 2);
+    assert_relative_eq!(ac.points[0].freq, 1e3, epsilon = 1e-9);
+
+    // The finite gain folds in: V(out) = A/(A+1) · V(in), purely real.
+    let gain = 1e6 / (1e6 + 1.0);
+    let out = node_index(&n.circuit.node_names, "out");
+    let phasor = ac.points[0].node_voltages[out];
+    assert_relative_eq!(phasor.norm(), gain, epsilon = 1e-9);
+    assert_relative_eq!(phasor.arg().to_degrees(), 0.0, epsilon = 1e-9);
+}
+
+/// An unknown model name fails loudly at parse time, not as a silent
+/// default.A stray token after the model is warned, not lost.
+#[test]
+fn opamp_unknown_model_fails_loudly() {
+    let netlist = "V1 in 0 DC 1\nU1 out 0 in 0 nope\n.op\n.end\n";
+    let err = simulate(netlist).unwrap_err();
+    assert!(
+        err.to_string().contains("references unknown model 'nope'"),
+        "error mentions the model: {err}"
+    );
+}
+
+/// `U` inside a subckt flattens with instance-path nets: the closed loop
+/// keeps the finite-gain divider both across the subckt boundary and
+/// within it.
+#[test]
+fn opamp_inside_subckt_flattens_with_mangled_nets() {
+    let netlist = r#"
+.subckt amp a o
+U1 o 0 0 f
+Rin a f 1k
+RF f o 10k
+.ends
+V1 in 0 DC 1
+X1 in out amp
+.op
+.end
+"#;
+    let n = parse(netlist).unwrap();
+    assert!(n.warnings.is_empty(), "{:?}", n.warnings);
+    let r = run(&n).unwrap();
+    let dc = r.dc.unwrap();
+
+    // The classic inverting amp (test above) inside the flattened instance:
+    // out = −A·g1/(g1 + gf + A·gf), and the mangled in− net at −out/A.
+    let (a, g1, gf) = (1e6, 1.0 / 1e3, 1.0 / 1e4);
+    let expect = -a * g1 / (g1 + gf + a * gf);
+    let out = node_index(&n.circuit.node_names, "out");
+    let fee = node_index(&n.circuit.node_names, "X1.f");
+    assert_relative_eq!(dc.node_voltages[out], expect, epsilon = 1e-9);
+    assert_relative_eq!(dc.node_voltages[fee], -dc.node_voltages[out] / a, epsilon = 1e-9);
+
+    // The op-amp lands flattened with its instance path on the card name.
+    assert_eq!(n.circuit.opamps[0].name, "X1.U1");
 }

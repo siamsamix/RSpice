@@ -165,7 +165,8 @@ Known gaps toward the LTspice/PSpice parity baseline (tracked in `TODO.md`):
   factor reuse, and threaded sweeps are open P1 items (the benchmark shows the cost)
 - MOSFETs are level-1 with overlap and zero-bias junction capacitances (bias-dependent junction
   charge is still simplified); diode `RS`/`CJO`/`TT`/breakdown are stamped
-- No BJT, JFET, transmission line, behavioral `B` source, or PSpice ABM extensions yet
+- Transmission lines (`T`/`O`) are not parsed yet; BJT, JFET, switches, the ideal op-amp `U`,
+  the behavioral `B` source, and the PSpice ABM forms are in
 - The GUI has symbols for `R C L V` and ground only; waveform cursors, trace arithmetic, FFT,
   raw-file I/O, and cross-probing are open
 - `.tran` startup suppression of sources, and the full `.options` surface, are still open

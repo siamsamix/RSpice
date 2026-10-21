@@ -153,6 +153,274 @@
         }
     }
 
+    /// TODO §8: `.options seed=` raises the deck's base draw seed. It must
+    /// reach the parameter environment *before* element lines expand (they
+    /// draw at expansion), so a pre-scan lifts it — deck position does not
+    /// matter — and `emit(parse)` round-trips it like the convergence knobs.
+    #[test]
+    fn options_seed_rolls_the_draws() {
+        let deck = |seed: &str| {
+            format!(
+                "* seeded deck\n\
+                 .op\n\
+                 V1 1 0 {{rand(1)}}\n\
+                 R1 1 0 1k\n\
+                 .options seed={seed}\n\
+                 .end\n"
+            )
+        };
+        let seeded = parse(&deck("42")).unwrap();
+        assert_eq!(seeded.analysis.mc_seed, 42, "the walk records the value");
+        assert_ne!(seeded.mc_seed, 0, "the env seed left zero");
+        let draw = seeded.circuit.voltage_sources[0].voltage;
+        assert!((-1.0..=1.0).contains(&draw), "rand(1) inside ±1: {draw}");
+
+        // Deck order does not matter: the seed card at the top is the same
+        // env seed as at the bottom.
+        let deck_top = "* deck\n.options seed=42\nV1 1 0 {rand(1)}\nR1 1 0 1k\n.end\n";
+        let top = parse(deck_top).unwrap();
+        assert_eq!(top.mc_seed, seeded.mc_seed);
+        assert_eq!(top.circuit.voltage_sources[0].voltage, draw);
+
+        // A different seed re-rolls the draw (statistically certain to
+        // differ in bits; the hash is an avalanche).
+        let other = parse(&deck("43")).unwrap();
+        assert_ne!(
+            other.circuit.voltage_sources[0].voltage.to_bits(),
+            draw.to_bits()
+        );
+
+        // Round-trip: emit → re-parse keeps the seed and the draws.
+        let text = emit(&seeded);
+        assert!(text.contains("seed=42"), "emit lost the seed: {text}");
+        let reparsed = parse(&text).unwrap();
+        assert_eq!(reparsed.mc_seed, seeded.mc_seed);
+        assert_eq!(reparsed.circuit.voltage_sources[0].voltage, draw);
+
+        // A parameterized seed cannot reach the expansion-time draws — warn,
+        // keep the param expansions honest, don't half-apply.
+        let param_deck = "*. deck\n.param s = 42\n.op\nV1 1 0 {{rand(1)}}\n.options seed={{{s}}}\n.end\n";
+        let parameterized = parse(param_deck).unwrap();
+        assert!(parameterized
+            .warnings
+            .iter()
+            .any(|w| w.contains("seed") && w.contains("parameterized")),
+            "warnings: {:?}", parameterized.warnings);
+    }
+
+    /// TODO §4: `.op pon` / `.op all` record the operating-point report
+    /// style. The variant survives `parse(emit(parse))`, and a bare `.op`
+    /// stays bare in the emitted deck.
+    #[test]
+    fn op_modes_parse_and_round_trip() {
+        let plain = parse("* deck\n.op\n.end\n").unwrap();
+        assert_eq!(plain.analysis.op_mode, OpMode::Default);
+        assert!(emit(&plain).lines().any(|l| l.trim() == ".op"), "bare .op: {}", emit(&plain));
+
+        for (token, mode) in [("pon", OpMode::Pon), ("all", OpMode::All)] {
+            let netlist = parse(&format!("* deck\n.OP {token}\n.end\n")).unwrap();
+            assert_eq!(netlist.analysis.op_mode, mode, "token {token}");
+            let text = emit(&netlist);
+            assert!(
+                text.lines().any(|l| l.trim() == format!(".op {token}")),
+                "emit lost .op {token}: {text}"
+            );
+            let reparsed = parse(&text).unwrap();
+            assert_eq!(reparsed.analysis.op_mode, mode);
+        }
+
+        // Unknown spellings warn and fall back to the default report.
+        let unknown = parse("* deck\n.op sometimes\n.end\n").unwrap();
+        assert_eq!(unknown.analysis.op_mode, OpMode::Default);
+        assert!(
+            unknown.warnings.iter().any(|w| w.contains("sometimes")),
+            "warnings: {:?}",
+            unknown.warnings
+        );
+    }
+
+    /// TODO §5: the ABM forms (VALUE/EQUATION alias, TABLE, LAPLACE, FREQ,
+    /// CHEBYSHEV across the E/G/F/H output letters) parse into behavioral
+    /// entries and survive `parse(emit(parse))` — the emitter re-spells the
+    /// canonical card shape each form was parsed from (documented-
+    /// interpretation: dynamic forms respond in AC and stamp H(0) elsewhere;
+    /// gains plain/phases degrees unless `MEASURE=` says dB/radians).
+    #[test]
+    fn abm_parse_and_round_trip() {
+        let deck = "* abm forms\n\
+                    .param gain=4\n\
+                    Vin in 0 DC 0\n\
+                    Vs b 0 DC 0\n\
+                    E1 eout 0 VALUE={V(in)*gain}\n\
+                    E2 qout 0 EQUATION {V(in)*2}\n\
+                    E3 tout 0 TABLE {V(in)} = (2, 5) (0, 1) (-2, -1)\n\
+                    G1 gout 0 LAPLACE {V(in)/4} = {1, 2} {1, 0.5}\n\
+                    G2 fout 0 FREQ {V(in)} = <100, 5> <1, 0.5> MEASURE=DB\n\
+                    F1 cout 0 CHEBYSHEV {I(vs)} 0.5 0.25\n\
+                    H1 hout 0 VALUE = {I(vs)*1k}\n\
+                    .end\n";
+        let first = parse(deck).unwrap();
+
+        // Exactly three warnings: one dynamic-form note per LAPLACE/FREQ/
+        // CHEBYSHEV card. VALUE/TABLE/EQUATION are instant transfers.
+        let dynamic = "respond in AC";
+        assert_eq!(first.warnings.len(), 3, "{:?}", first.warnings);
+        assert!(first.warnings.iter().all(|w| w.contains(dynamic)));
+
+        let b = |name: &str| {
+            first
+                .circuit
+                .behavioral
+                .iter()
+                .find(|b| b.name.eq_ignore_ascii_case(name))
+        };
+        use crate::circuit::{AbmForm, BehavioralKind};
+
+        // E/H are voltage flavours, G/F current flavours (PSpice grammar).
+        assert_eq!(b("E1").unwrap().kind, BehavioralKind::Voltage);
+        assert_eq!(b("H1").unwrap().kind, BehavioralKind::Voltage);
+        assert_eq!(b("G1").unwrap().kind, BehavioralKind::Current);
+        assert_eq!(b("F1").unwrap().kind, BehavioralKind::Current);
+
+        // VALUE: text rides through verbatim; the parameter folds into the
+        // AST, so only the V(in) probe remains.
+        let e1 = b("E1").unwrap();
+        assert!(matches!(e1.abm, Some(AbmForm::Value)));
+        assert_eq!(e1.expr, "V(in)*gain");
+        assert_eq!(e1.behavior.probes.len(), 1);
+
+        // EQUATION is the alias of VALUE (same entry kind).
+        assert!(matches!(b("E2").unwrap().abm, Some(AbmForm::Value)));
+
+        // TABLE builds the AST table node: pairs travel sorted ascending
+        // (the deck lists them descending), zero output outside bounds.
+        let e3 = b("E3").unwrap();
+        assert!(matches!(e3.abm, Some(AbmForm::Table)));
+        match &e3.behavior.ast {
+            crate::behavior::BExpr::Table { points, .. } => {
+                assert_eq!(points.as_slice(), &[(-2.0, -1.0), (0.0, 1.0), (2.0, 5.0)]);
+            }
+            other => panic!("E3 AST: {other:?}"),
+        }
+
+        // LAPLACE lists travel descending (first = highest power of s), so
+        // `{1, 2}` is `s + 2` over `s + 0.5`; H(0) = 2/0.5 = 4.
+        let g1 = b("G1").unwrap();
+        match &g1.abm {
+            Some(AbmForm::Laplace { num, den }) => {
+                assert_eq!(num.as_slice(), &[1.0, 2.0]);
+                assert_eq!(den.as_slice(), &[1.0, 0.5]);
+                assert!((num.last().unwrap() / den.last().unwrap() - 4.0).abs() < 1e-12);
+            }
+            other => panic!("G1 form: {other:?}"),
+        }
+
+        // FREQ rows travel ascending with their MEASURE unit recorded.
+        let g2 = b("G2").unwrap();
+        match &g2.abm {
+            Some(AbmForm::Freq { rows, measure }) => {
+                assert_eq!(
+                    rows.as_slice(),
+                    &[(1.0, 0.5, 0.0), (100.0, 5.0, 0.0)]
+                );
+                assert_eq!(*measure, Some(crate::circuit::AbmMeasure::Db));
+            }
+            other => panic!("G2 form: {other:?}"),
+        }
+
+        // CHEBYSHEV keeps the second-order coefficient first.
+        match &b("F1").unwrap().abm {
+            Some(AbmForm::Chebyshev { coeffs }) => {
+                assert_eq!(coeffs.as_slice(), &[0.5, 0.25]);
+            }
+            other => panic!("F1 form: {other:?}"),
+        }
+
+        // Round trip: emitted text re-spells each exact form, sorted both
+        // ways, with the EQUATION alias canonicalized to VALUE=.
+        let text = emit(&first);
+        for fragment in [
+            "E1 eout 0 VALUE={V(in)*gain}",
+            "E2 qout 0 VALUE={V(in)*2}",
+            "E3 tout 0 TABLE {V(in)} = (-2, -1) (0, 1) (2, 5)",
+            "G1 gout 0 LAPLACE {V(in)/4} = {1, 2} {1, 0.5}",
+            "G2 fout 0 FREQ {V(in)} = <1, 0.5> <100, 5> MEASURE=DB",
+            "F1 cout 0 CHEBYSHEV {I(vs)} 0.5 0.25",
+            "H1 hout 0 VALUE={I(vs)*1k}",
+        ] {
+            assert!(
+                text.lines().any(|l| l.trim() == fragment),
+                "emit missed '{fragment}':\n{text}"
+            );
+        }
+        let second = parse(&text).unwrap();
+        assert_eq!(second.circuit.behavioral.len(), first.circuit.behavioral.len());
+        assert_eq!(second.warnings.len(), 3, "{:?}", second.warnings);
+        let dbg = format!("{:?}", first.circuit.behavioral);
+        assert_eq!(
+            format!("{:?}", second.circuit.behavioral),
+            dbg,
+            "re-parse changed the behavioral entries"
+        );
+    }
+
+    /// TODO §5: the ideal op-amp `U` (documented interpretation — the
+    /// reference tools reserve `U` for nothing) parses from both spellings —
+    /// a bare `U` (default GAIN 1e6, RIN ∞, ROUT 0, VOS 0) and a
+    /// `.model <name> U(…)` reference — and survives `parse(emit(parse))`
+    /// byte-stable on the circuit.
+    #[test]
+    fn opamp_parse_and_round_trip() {
+        let deck = "* op-amp cards\n\
+                    .model u1 U(GAIN=1e5 RIN=100k ROUT=50 VOS=1m)\n\
+                    U1 o1 0 b 0\n\
+                    U2 o2 0 a 0 u1\n\
+                    .end\n";
+        let first = parse(deck).unwrap();
+        assert!(first.warnings.is_empty(), "{:?}", first.warnings);
+
+        assert_eq!(first.circuit.opamps.len(), 2);
+        let bare = &first.circuit.opamps[0];
+        assert_eq!(bare.name, "U1");
+        assert!(bare.model.is_empty());
+        let fit = &first.circuit.opamps[1];
+        assert_eq!(fit.model, "u1");
+
+        // The card parameters land in the model table; the bare `U`
+        // resolves to the documented defaults.
+        let m = first.circuit.opamp_params_at("u1");
+        assert_eq!(m.gain, 1e5);
+        assert_eq!(m.rin, 1e5);
+        assert_eq!(m.rout, 50.0);
+        assert_eq!(m.vos, 1e-3);
+        let defaults = first.circuit.opamp_params_at("");
+        assert_eq!(defaults.gain, 1e6);
+        assert_eq!(defaults.rin, f64::INFINITY);
+        assert_eq!(defaults.rout, 0.0);
+        assert_eq!(defaults.vos, 0.0);
+
+        // Round trip: the emitted deck re-spells both cards, and a second
+        // parse reproduces the first circuit byte-for-byte.
+        let text = emit(&first);
+        for fragment in [
+            ".model u1 U(GAIN=100000 RIN=100000 ROUT=50 VOS=0.001)",
+            "U1 o1 0 b 0",
+            "U2 o2 0 a 0 u1",
+        ] {
+            assert!(
+                text.lines().any(|l| l.trim() == fragment),
+                "emit missed '{fragment}':\n{text}"
+            );
+        }
+        let second = parse(&text).unwrap();
+        assert!(second.warnings.is_empty(), "{:?}", second.warnings);
+        assert_eq!(
+            format!("{:?}", second.circuit),
+            format!("{:?}", first.circuit),
+            "re-parse changed the circuit"
+        );
+    }
+
     /// `*` only comments out a line from its start: mid-line `*` is data
     /// (the multiplication inside a quoted or braced expression).
     #[test]

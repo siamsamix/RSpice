@@ -15,19 +15,19 @@ pub mod netlist;
 pub mod params;
 pub mod units;
 
-pub use behavior::{Behavior, BehavioralRuntime, BExpr, MathFn, ProbeBinding, ProbeSpec};
+pub use behavior::{Behavior, BehavioralRuntime, BExpr, MathFn, NoiseKind, ProbeBinding, ProbeSpec};
 
 pub use analysis::{AcResult, run, DcResult, DcSweepPoint, DcSweepResult, FourOutput, FourResult,
-                   Harmonic, MeasureResult, NoisePoint, NoiseResult, SimulationResult, StepRun,
+                   Harmonic, MeasureResult, NoisePoint, NoiseResult, OpPoint, SimulationResult, StepRun,
                    TfResult, TranPoint, TranResult};
 pub use netlist::{AcCommand, AcScale, DcCommand, DcSweepSpec, DcSweepValues, MeasAnalysis,
                   FourCommand, NoiseCommand, MeasEdge, MeasFunc, MeasKind, Measurement, NodesetEntry,
                   ParseOptions, StepSpec, StepValues, TfCommand, TfOutput, parse,
                   parse_with_options};
-pub use circuit::{BehavioralKind, BehavioralSource, Circuit, ControlVar, ControlledSource,
-                  CurrentSource, Diode, DiodeModel, GenericModel, Jfet, JfetModel, ModelTolerance,
-                  Mosfet, MosfetModel, MutualInductance, Switch, SwitchControl, SwitchModel,
-                  Waveform};
+pub use circuit::{AbmForm, AbmMeasure, BehavioralKind, BehavioralSource, Circuit, ControlVar,
+                  ControlledSource, CurrentSource, Diode, DiodeModel, GenericModel, Jfet,
+                  JfetModel, ModelTolerance, Mosfet, MosfetModel, MutualInductance, OpAmp,
+                  OpAmpModel, Switch, SwitchControl, SwitchModel, Waveform};
 pub use error::{Result, SimError};
 pub use netlist::{Netlist, parse_with_overrides};
 

@@ -137,8 +137,11 @@ below is written against that state.
 - [x] **[P1] (both)** `.measure`/`.meas` family: `avg/rms/max/min/pp/max_at/min_at/rise/fall/cross/
   find…when/from…to/trig…targ` with expressions over the results, for `.tran`/`.ac`/`.dc` — done
   (rise/fall spelled through `TRIG … TARG`, expressions use the probe/parameter evaluator).
-- [ ] **[P1] (both)** Operating-point presentation: annotated device operating points (LTspice plot/data
-  view) and `.op` variants (`pon`, `all`) per PSpice.
+- [x] **[P1] (both)** Operating-point presentation: annotated device operating points (LTspice plot/data
+  view) and `.op` variants (`pon`, `all`) per PSpice — done (`analysis::device_op_points` prints the
+  per-card R/C/L/D/M/Q/J/E/F/G/H/B and source `v/i/p` family table for `.op all`; `.op pon|all` parse
+  through `OpMode`, plain bias print otherwise; PSpice's exact `pon`/`all` semantics are
+  unverifiable, documented interpretation: `pon` plain bias print, `all` device detail on top).
 - [ ] **[P2] (both)** `.ac` LIST frequency scales beyond dec/oct/lin.
 - [ ] **[P2] (both)** Small-signal secondary analyses: `.sens` (DC sensitivity), `.pz` (pole-zero),
   `.disto` (harmonic distortion).
@@ -147,14 +150,32 @@ below is written against that state.
 
 - [x] **[P0] (both)** Independent current source `I` — the most glaring single missing element; without
   it most textbook circuits can't even be drawn.
-- [ ] **[P1] (both)** Source waveform family: `EXP`, `SFFM`, `AM`, `PWL` (incl. `PWL FILE` and repeat
+- [x] **[P1] (both)** Source waveform family: `EXP`, `SFFM`, `AM`, `PWL` (incl. `PWL FILE` and repeat
   blocks in LTspice); noise stimulus sources (LTspice's white/flicker functions) `(LT)`; PSpice
-  synthesizes noise via `.noise` + IBIS interface nets instead `(PS)`.
+  synthesizes noise via `.noise` + IBIS interface nets instead `(PS)` — done: the waveform generators
+  (incl. `PWL FILE=<file>` and repeat blocks) plus `white(arg)`/`flicker(arg)` keyed-noise functions
+  on B sources: deterministic draws in `[−1, 1)` (flicker over six octave bands weighted for equal
+  power per octave), re-rolled only by their pacing argument — a bare `time()` counts accepted
+  steps, any other argument keys on its end-of-step `floor(arg)` — so a noise source is frozen
+  within one Newton solve and amplitudes ride the user expression (`V=white(time())*10m`).
 - [x] **[P1] (both)** Controlled sources `E/F/G/H` including `POLY(n)` multivariate forms.
 - [x] **[P1] (LT)** Behavioral sources `B` (arbitrary expressions of node voltages/branch currents,
   `time()`, `idt()`/`sdt()`, `delay()`, `table()`, Laplace/frequency-domain hybrids).
-- [ ] **[P1] (PS)** ABM extensions on E/F/G/H: `VALUE=`, `TABLE=`, `FREQ=`, `LAPLACE=`, `CHEBYSHEV=`,
-  `EQUATION=` blocks.
+- [x] **[P1] (PS)** ABM extensions on E/F/G/H: `VALUE=`, `TABLE=`, `FREQ=`, `LAPLACE=`, `CHEBYSHEV=`,
+  `EQUATION=` blocks — done: E/H spell the voltage flavour, G/F the current flavour, each parsed
+  into the same behavioral table (`BehavioralSource` + `abm: AbmForm`), emitting re-spells the
+  canonical card shape. `TABLE` is an instant AST lookup (linear in the input, **0 outside the
+  bracketing range** — PSpice ABM semantics, not LTspice clamping; the B-language `table()` call
+  stays rejected — the table exists only in ABM). `EQUATION=` is accepted as the `VALUE=` alias.
+  The dynamic forms respond in AC and stamp their DC gain H(0) in DC/transient (warned once per
+  card): `LAPLACE = {num} {den}` takes descending coefficient lists or `s`-polynomial spellings
+  (`2*s+s^2`), `FREQ` takes `<f, gain[, phase]>` rows interpolated in log f with `MEASURE=DB|
+  RADS|DEGREES` units (gains plain, phases degrees otherwise), `CHEBYSHEV` takes the second-order
+  gain coefficients and attenuates like `1/(1 + Σ|cᵢ·Tᵢ₊₂(f)|)`. Relaxed interpretation (the
+  reference grammar details are unverifiable here): keyword may glue (`VALUE={…}`, `CHEBYSHEV{…}`)
+  or carry a spaced/unglued `=`; braces are grammatical on ABM cards, so the substitution pass
+  leaves those lines untouched and numeric `{1}` groups survive; `.param` names fold into the
+  control expression.
 - [x] **[P1] (both)** Diode model completion: `RS`, `TT`, `CJO/M/VJ`, `EG/XTI`, `BV/IBV`, `KF/AF`
   (flicker noise), recombination params — with junction capacitance so transients are physical —
   done: `RS` splits into an internal junction node, `CJO`/`TT` are stamped as charge-based
@@ -193,8 +214,17 @@ below is written against that state.
   TC1/TC2 plus the parasitic split were done: nonzero slots materialize into real series/parallel arms
   with internal nodes after the deck walk, so stamps/AC/noise see plain elements; emitted decks keep
   the expanded arms and drop the slots to stay round-trip stable.)*
-- [ ] **[P1] (both)** Opamp primitives/macromodels: ideal op-amp element and universal/multi-pole
-  macromodel library entries, plus vendor `.subckt` opamps loadable from the library system.
+- [x] **[P1] (both)** Opamp primitives/macromodels: ideal op-amp element and universal/multi-pole
+  macromodel library entries, plus vendor `.subckt` opamps loadable from the library system. *(done:
+  `Uname out+ out− in+ in− [model]` — one branch row enforces `V(out) = gain·(V(in+) − V(in−) + VOS)`;
+  `.model <name> U(GAIN/RIN/ROUT/VOS)` with documented defaults 1e6/∞/0/0, bare-`U` resolution, and
+  the reserved DEV/LOT slot; the stamp serves DC/tran/AC with RIN/ROUT admittance rungs when
+  finite/non-zero, `I(U…)` rides the family reports, `.op all` annotates a/v/i/p, subckt flattening
+  carries instance paths, and parse/emit round-trips (∞ RIN is not re-printed, like every
+  non-finite slot). `libs/opamps.lib` also gained `opamp2`, a gm-RC two-pole macromodel
+  (A0 = 1e5, f1 = 10 Hz → GBW 1 MHz, f2 = 400 kHz) whose AC map the regression corpus pins; an
+  open-loop deck solves to the linear overdrive — the element is meant for feedback loops. Vendor
+  `.subckt` opamps were already loadable through the `.include` system.)*
 - [ ] **[P2] (PS)** Measurement/utility devices: wattmeter, fuse, varistor from the special libraries.
 
 ## 6. Waveform viewer & plotting
@@ -243,8 +273,10 @@ below is written against that state.
   control, multiple runs, histogram/yield readouts. First land the parametric `random()`/`gauss()`
   functions that LTspice uses to fake MC via `.step` `(LT)`. *(The parametric layer is landed:
   `random(x)` ∈ [0,x), `rand(x)` ∈ ±x, `gauss(x)` = x·N(0,1) as deterministic draws keyed off the
-  sweep overrides — `.step param …` re-rolls them per run bit-reproducibly. Remaining: consumers of
-  the `LOT`/`DEV` model tolerance slots, run histograms/yield, and a seed-control directive.)*
+  sweep overrides — `.step param …` re-rolls them per run bit-reproducibly. The seed-control
+  directive is landed too: `.options seed=<n>` raises the base seed before any element line
+  expands (a pre-scan lifts the literal, so deck position is free) and round-trips through emit.
+  Remaining: consumers of the `LOT`/`DEV` model tolerance slots, run histograms/yield.)*
 - [ ] **[P2] (PS AA)** Worst-case analysis from component/model tolerances with sensitivity ranking.
 - [ ] **[P2] (PS AA)** Sensitivity analysis: ranked parameter sensitivities of a target measurement.
 - [ ] **[P2] (PS AA)** Optimizer: curve-fitting parameter tuning against measurement goals

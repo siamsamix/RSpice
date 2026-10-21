@@ -26,3 +26,22 @@ Rin inp inn 1meg
 E1 out 0 inp inn {gain}
 Rout out 0 {rout}
 .ends comparator
+
+* Two-pole macromodel, gm-RC two-stage chain (documented interpretation:
+* the response is the exact two-pole map built here, not a fitted vendor
+* curve). Stage 1: G1 = A0 S into R1·C1 puts the dominant pole at
+* f1 = 1/(2π·R1·C1); stage 2 repeats the chain (G2·R2 = 1, second pole at
+* f2 = 1/(2π·R2·C2)) and E1 drives the 50 Ω output. Defaults: A0 = 1e5,
+* f1 = 10 Hz → GBW = 1 MHz, f2 = 400 kHz — at a closed-loop gain of 100
+* the crossover sits at 10 kHz with ≈76° phase margin.
+.subckt opamp2 inp inn out PARAMS: gain=1e5 r1=1 c1=15.9m c2=3.979u rout=50
+Rin inp inn 1meg
+G1 0 n1 inp inn {gain}
+R1 n1 0 {r1}
+C1 n1 0 {c1}
+G2 0 n2 n1 0 1
+R2 n2 0 1
+C2 n2 0 {c2}
+E1 out 0 n2 0 1
+Rout out 0 {rout}
+.ends opamp2

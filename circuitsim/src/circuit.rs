@@ -1,10 +1,11 @@
 use crate::error::{Result, SimError};
 use crate::behavior::{ProbeBinding, ProbeSpec};
+use num_complex::Complex64;
 use std::collections::HashMap;
 
 // Device model cards live in `model.rs` together with the device equations —
 // one module owns the physics. Re-exported here for the historical paths.
-pub use crate::model::{BjtModel, BjtType, DiodeModel, GenericModel, JfetModel, JfetType, ModelTolerance, MosfetModel, MosfetType};
+pub use crate::model::{BjtModel, BjtType, DiodeModel, GenericModel, JfetModel, JfetType, ModelTolerance, MosfetModel, MosfetType, OpAmpModel};
 
 #[derive(Debug, Clone)]
 pub struct Mosfet {
@@ -208,6 +209,170 @@ pub enum BehavioralKind {
     Current,
 }
 
+/// The frequency-domain gain units of an ABM `FREQ` table (TODO §5): gains
+/// plain by default, `MEASURE=DB` makes them dB (20·log₁₀); phases degrees by
+/// default, `MEASURE=RADS` makes them radians.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AbmMeasure {
+    /// Gains in dB (`MEASURE=DB`).
+    Db,
+    /// Phases in radians (`MEASURE=RADS`).
+    Rads,
+    /// Phases in degrees (`MEASURE=DEGREES`).
+    Degrees,
+}
+
+/// The PSpice ABM form one behavioral entry was parsed from (TODO §5).
+///
+/// ABM `VALUE`/`TABLE` responses are instant transfers, carried entirely in
+/// the compiled AST (a `Table` wraps the input expression there); this aux
+/// exists so `emit` can re-spell the exact card shape, and so the dynamic
+/// forms (LAPLACE/FREQ/CHEBYSHEV) can multiply the linearized coupling by
+/// their frequency response. Polynomials are stored **descending** (first
+/// entry = highest power), matching the PSpice spelling.
+#[derive(Debug, Clone)]
+pub enum AbmForm {
+    /// `VALUE={expr}` (and its `EQUATION` alias) — a plain instant transfer
+    /// in every analysis; gain 1, carried fully by the AST.
+    Value,
+    /// `TABLE {expr} = (x1,y1) (x2,y2) …` — piecewise-linear lookup; the
+    /// evaluation lives in the AST (zero outside the bracketing range).
+    Table,
+    /// `LAPLACE {expr} = {n1, n2, …} {d1, d2, …}` — s-domain polynomial
+    /// ratio, coefficients descending (`{2s+1}` → `2, 1`).
+    Laplace { num: Vec<f64>, den: Vec<f64> },
+    /// `FREQ {expr} = <f, g, p> …` — frequency table of gains/phases.
+    Freq { rows: Vec<(f64, f64, f64)>, measure: Option<AbmMeasure> },
+    /// `CHEBYSHEV {expr} c2 c3 c4 …` — magnitude response
+    /// `|H(f)| = 1 / (1 + |cᵢ·Tᵢ₊₂(f)|)`, Chebyshev polynomials in the
+    /// frequency in Hz, zero phase.
+    Chebyshev { coeffs: Vec<f64> },
+}
+
+impl AbmForm {
+    /// True for the frequency-domain forms whose output is multiplied by a
+    /// frequency response: their DC/transient stamps carry the DC gain, and
+    /// only AC carries the full complex response.
+    pub fn is_dynamic(&self) -> bool {
+        matches!(self, AbmForm::Laplace { .. } | AbmForm::Freq { .. } | AbmForm::Chebyshev { .. })
+    }
+
+    /// The DC transfer of a dynamic form: the response evaluated at zero
+    /// frequency (a LAPLACE ratio at s=0, the FREQ table clamped to its
+    /// lowest row, the CHEBYSHEV magnitude at f=0). Instant forms are 1 —
+    /// their feedback lives inside the AST.
+    pub fn dc_gain(&self) -> f64 {
+        match self {
+            AbmForm::Value | AbmForm::Table => 1.0,
+            AbmForm::Laplace { num, den } => {
+                let n0 = num.last().copied().unwrap_or(0.0);
+                let d0 = den.last().copied().unwrap_or(1.0);
+                if d0 != 0.0 { n0 / d0 } else { 0.0 }
+            }
+            AbmForm::Freq { rows, measure } => {
+                let Some(row) = rows.last().copied() else { return 0.0 };
+                freq_row_gain(row, *measure)
+            }
+            AbmForm::Chebyshev { coeffs } => chebyshev_gain(coeffs, 0.0),
+        }
+    }
+
+    /// The complex frequency response `H(jω)` of a dynamic form at test
+    /// frequency `f` (Hz). Instant forms answer 1 — the AC stamp then uses
+    /// the plain real linearization.
+    pub fn ac_gain(&self, f: f64) -> Complex64 {
+        match self {
+            AbmForm::Value | AbmForm::Table => Complex64::new(1.0, 0.0),
+            AbmForm::Laplace { num, den } => {
+                let s = Complex64::new(0.0, 2.0 * std::f64::consts::PI * f);
+                let eval = |coeffs: &[f64]| -> Complex64 {
+                    // Horner over the descending coefficients.
+                    coeffs
+                        .iter()
+                        .fold(Complex64::new(0.0, 0.0), |acc, c| acc * s + Complex64::new(*c, 0.0))
+                };
+                let den = eval(den);
+                if den.norm() < f64::EPSILON {
+                    Complex64::new(0.0, 0.0)
+                } else {
+                    eval(num) / den
+                }
+            }
+            AbmForm::Freq { rows, measure } => {
+                if rows.is_empty() {
+                    return Complex64::new(0.0, 0.0);
+                }
+                let (gain, phase) = if f >= rows[0].0 && f <= rows[rows.len() - 1].0 {
+                    // Linear interpolation in log(f) between the bracketing rows.
+                    let mut k = 0usize;
+                    while k + 1 < rows.len() && rows[k + 1].0 < f {
+                        k += 1;
+                    }
+                    let (f0, g0, p0) = rows[k];
+                    let (f1, g1, p1) = rows[(k + 1).min(rows.len() - 1)];
+                    if f1 == f0 {
+                        (g1, p1)
+                    } else {
+                        let frac = (f.log10() - f0.log10()) / (f1.log10() - f0.log10());
+                        (g0 + frac * (g1 - g0), p0 + frac * (p1 - p0))
+                    }
+                } else if f < rows[0].0 {
+                    (rows[0].1, rows[0].2)
+                } else {
+                    let last = rows[rows.len() - 1];
+                    (last.1, last.2)
+                };
+                let g = freq_row_gain((0.0, gain, 0.0), *measure);
+                Complex64::new(
+                    g * phase.to_radians().cos(),
+                    g * phase.to_radians().sin(),
+                )
+            }
+            AbmForm::Chebyshev { coeffs } => Complex64::new(chebyshev_gain(coeffs, f), 0.0),
+        }
+    }
+}
+
+/// Convert one FREQ row's numbers into a linear voltage gain, honoring the
+/// card's MEASURE selection (gains plain by default, dB under `MEASURE=DB`).
+fn freq_row_gain(row: (f64, f64, f64), measure: Option<AbmMeasure>) -> f64 {
+    match measure {
+        Some(AbmMeasure::Db) => 10f64.powf(row.1 / 20.0),
+        _ => row.1,
+    }
+}
+
+/// The ABM CHEBYSHEV magnitude response at frequency `f`:
+/// `|H(f)| = 1 / (1 + |c₂·T₂(f)| + |c₃·T₃(f)| + …)`, `Tₙ` the Chebyshev
+/// polynomials of the first kind evaluated at the frequency in Hz.
+fn chebyshev_gain(coeffs: &[f64], f: f64) -> f64 {
+    let mut penalty = 0.0;
+    for (i, c) in coeffs.iter().enumerate() {
+        let order = i + 2;
+        penalty += (c * chebyshev_tn(order, f)).abs();
+    }
+    1.0 / (1.0 + penalty)
+}
+
+/// Chebyshev polynomial of the first kind, order `n`, at `x` (recurrence).
+fn chebyshev_tn(n: usize, x: f64) -> f64 {
+    match n {
+        0 => 1.0,
+        1 => x,
+        _ => {
+            let mut t_im1 = 1.0;
+            let mut t_i = x;
+            for _ in 2..=n {
+                let t_next = 2.0 * x * t_i - t_im1;
+                t_im1 = t_i;
+                t_i = t_next;
+            }
+            t_i
+        }
+    }
+}
+
+
 /// Behavioral source, SPICE `B` card: `out = f(probes, time)` for an
 /// arbitrary expression of node voltages and branch currents (TODO §5).
 ///
@@ -225,6 +390,10 @@ pub struct BehavioralSource {
     pub expr: String,
     /// Compiled AST; probe indices refer to `behavior.probes`.
     pub behavior: crate::behavior::Behavior,
+    /// The PSpice ABM form this entry came from (`None` for a `B` card).
+    /// Carries the frequency response of the dynamic forms and lets `emit`
+    /// re-spell the ABM card shape.
+    pub abm: Option<AbmForm>,
 }
 
 impl ControlledSource {
@@ -242,6 +411,24 @@ impl ControlledSource {
     pub fn is_linear(&self) -> bool {
         self.controls.len() == 1 && self.constant() == 0.0 && self.coeffs.len() == 2
     }
+}
+
+// ─── Op-amps (U) ─────────────────────────────────────────────────────────────
+
+/// An ideal differential op-amp (`U` card, TODO §5): the output pair is held
+/// to `gain·(V(in+) − V(in−) + VOS)` on one branch row, like a VCVS driven
+/// from a single-ended VCVS; `RIN`/`ROUT` pull in two admittance rungs when
+/// their model slots are finite/non-zero (`'—'` defaults: neither). The bare
+/// `U` (no model name) resolves to [`OpAmpModel::default`].
+#[derive(Debug, Clone)]
+pub struct OpAmp {
+    pub name: String,
+    pub out_p: NodeId,
+    pub out_n: NodeId,
+    pub in_p: NodeId,
+    pub in_n: NodeId,
+    /// `.model` card name; empty for a bare `U` (the documented defaults).
+    pub model: String,
 }
 
 // ─── Switches (S/W) ─────────────────────────────────────────────────────────
@@ -726,12 +913,13 @@ pub enum ElementFamily {
     Jfets,
     CurrentSources,
     Behavioral,
+    OpAmps,
 }
 
 /// Canonical family order: the glossary's R, C, L, V, D, M, I with the
-/// three-terminal and behavioral families appended where those devices
-/// landed.
-pub const CURRENT_FAMILIES: [ElementFamily; 10] = [
+/// three-terminal, behavioral and op-amp families appended where those
+/// devices landed.
+pub const CURRENT_FAMILIES: [ElementFamily; 11] = [
     ElementFamily::Resistors,
     ElementFamily::Capacitors,
     ElementFamily::Inductors,
@@ -742,6 +930,7 @@ pub const CURRENT_FAMILIES: [ElementFamily; 10] = [
     ElementFamily::Jfets,
     ElementFamily::CurrentSources,
     ElementFamily::Behavioral,
+    ElementFamily::OpAmps,
 ];
 
 impl ElementFamily {
@@ -758,6 +947,7 @@ impl ElementFamily {
             Self::Jfets => "J",
             Self::CurrentSources => "I",
             Self::Behavioral => "B",
+            Self::OpAmps => "U",
         }
     }
 
@@ -784,6 +974,7 @@ impl ElementFamily {
             Self::Jfets => "JFET",
             Self::CurrentSources => "current source",
             Self::Behavioral => "behavioral source",
+            Self::OpAmps => "op-amp",
         }
     }
 }
@@ -831,6 +1022,10 @@ pub struct Circuit {
     pub switches: Vec<Switch>,
     /// Behavioral sources (`B` cards) with compiled expressions.
     pub behavioral: Vec<BehavioralSource>,
+    /// Ideal op-amps (`U`), one branch row each.
+    pub opamps: Vec<OpAmp>,
+    /// `.model … U(…)` op-amp cards.
+    pub opamp_models: HashMap<String, OpAmpModel>,
     /// `.model` cards of device types RSpice does not model yet (NPN, PNP,
     /// RES, …). Parsed so third-party decks import cleanly; no element kind
     /// consumes them yet.
@@ -926,6 +1121,17 @@ impl Circuit {
             .and_then(|name| self.inductor_models.get(name));
         let nominal = Self::passive_value(l.inductance, model);
         Self::passive_temperature(model, nominal, self.temperature)
+    }
+
+    /// The op-amp model parameters one `U` element resolves to: a named card
+    /// when it exists, the documented defaults for a bare `U`. `validate()`
+    /// has already rejected unknown model names, so the default returned
+    /// for a stale name is only reached through non-validated paths.
+    pub fn opamp_params_at(&self, model: &str) -> OpAmpModel {
+        if model.is_empty() {
+            return OpAmpModel::default();
+        }
+        self.opamp_models.get(model).cloned().unwrap_or_default()
     }
 
     /// Split every diode with a nonzero `RS` into a series resistor and an
@@ -1310,6 +1516,12 @@ impl Circuit {
             collect_used_node(&mut used, b.out_p);
             collect_used_node(&mut used, b.out_n);
         }
+        for u in &self.opamps {
+            collect_used_node(&mut used, u.out_p);
+            collect_used_node(&mut used, u.out_n);
+            collect_used_node(&mut used, u.in_p);
+            collect_used_node(&mut used, u.in_n);
+        }
         used.sort_unstable();
         // `used` is sorted and unique, so when the ids are already 0..n-1 in
         // order the map is the identity and there is nothing to compact. A
@@ -1378,6 +1590,12 @@ impl Circuit {
         for b in &mut self.behavioral {
             compact(&mut b.out_p);
             compact(&mut b.out_n);
+        }
+        for u in &mut self.opamps {
+            compact(&mut u.out_p);
+            compact(&mut u.out_n);
+            compact(&mut u.in_p);
+            compact(&mut u.in_n);
         }
         self.node_names = new_names;
         self.nodes = used.len();
@@ -1490,6 +1708,7 @@ impl Circuit {
                 self.current_sources.iter().map(|e| e.name.clone()).collect()
             }
             ElementFamily::Behavioral => self.behavioral.iter().map(|e| e.name.clone()).collect(),
+            ElementFamily::OpAmps => self.opamps.iter().map(|e| e.name.clone()).collect(),
         }
     }
 
@@ -1520,13 +1739,14 @@ impl Circuit {
             .map(|i| NodeId(i))
     }
 
-    /// The five branch-row families in stamp order, one count each: voltage
-    /// sources, inductors, VCVS `E`, CCVS `H`, and the voltage-flavour `B`
-    /// cards (the only behavioural flavour with a branch row).
+    /// The six branch-row families in stamp order, one count each: voltage
+    /// sources, inductors, VCVS `E`, CCVS `H`, the voltage-flavour `B`
+    /// cards (the only behavioural flavour with a branch row), and op-amp
+    /// `U` cards.
     /// `BranchLayout` — the layout owner — and `tran_matrix_size` both
     /// derive from this one count, so the twin row-counters this replaces
     /// can no longer drift apart.
-    pub fn branch_family_counts(&self) -> [usize; 5] {
+    pub fn branch_family_counts(&self) -> [usize; 6] {
         [
             self.voltage_sources.len(),
             self.inductors.len(),
@@ -1536,6 +1756,7 @@ impl Circuit {
                 .iter()
                 .filter(|b| b.kind == BehavioralKind::Voltage)
                 .count(),
+            self.opamps.len(),
         ]
     }
 
@@ -1704,6 +1925,37 @@ impl Circuit {
                         s.name
                     )));
                 }
+            }
+        }
+        for u in &self.opamps {
+            let (model_label, params) = if u.model.is_empty() {
+                ("(bare U)", self.opamp_params_at(""))
+            } else {
+                let name = u.model.as_str();
+                if !self.opamp_models.contains_key(name) {
+                    return Err(SimError::Circuit(format!(
+                        "op-amp {} references unknown model '{}'", u.name, name
+                    )));
+                }
+                (name, self.opamp_params_at(name))
+            };
+            if !params.gain.is_finite() || params.gain == 0.0 {
+                return Err(SimError::Circuit(format!(
+                    "op-amp {} model '{}' needs a finite, non-zero GAIN",
+                    u.name, model_label
+                )));
+            }
+            if params.rin != f64::INFINITY && params.rin <= 0.0 {
+                return Err(SimError::Circuit(format!(
+                    "op-amp {} model '{}' needs RIN > 0 (or unset for ∞)",
+                    u.name, model_label
+                )));
+            }
+            if params.rout < 0.0 {
+                return Err(SimError::Circuit(format!(
+                    "op-amp {} model '{}' needs ROUT >= 0",
+                    u.name, model_label
+                )));
             }
         }
         for q in &self.bjts {

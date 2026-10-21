@@ -3,7 +3,7 @@
 //! instantiation, net mapping, and name mangling.
 
 use super::*;
-use super::elements::split_b_card;
+use super::elements::{abm_card, split_abm, split_b_card};
 use super::nodeplan::element_letter;
 
 // ─── Subcircuit definitions ─────────────────────────────────────────────────
@@ -164,7 +164,7 @@ pub(super) fn node_slot_indices(kind: char) -> Option<&'static [usize]> {
     match kind.to_ascii_uppercase() {
         'M' => Some(&[1, 2, 3, 4]),
         'J' => Some(&[1, 2, 3]),
-        'E' | 'G' | 'S' | 'T' => Some(&[1, 2, 3, 4]),
+        'E' | 'G' | 'S' | 'T' | 'U' => Some(&[1, 2, 3, 4]),
         'R' | 'C' | 'L' | 'V' | 'I' | 'D' | 'F' | 'H' | 'W' | 'B' => Some(&[1, 2]),
         'K' => Some(&[]),
         _ => None,
@@ -172,12 +172,18 @@ pub(super) fn node_slot_indices(kind: char) -> Option<&'static [usize]> {
 }
 
 /// Node fields for one card, including the `POLY(n)` control pairs of an
-/// `E`/`G` source, whose positions depend on the card's own text.
+/// `E`/`G` source, whose positions depend on the card's own text. An ABM
+/// card (`KEYWORD {expr}` after the out nodes) has only its two output
+/// nodes — the expression and whatever follows belong to the card's own
+/// grammar, not the node space.
 pub(super) fn node_slots_for_tokens(tokens: &[&str]) -> Vec<usize> {
+    let kind = element_letter(tokens[0]).to_ascii_uppercase();
+    if matches!(kind, 'E' | 'G' | 'F' | 'H') && abm_card(tokens) {
+        return vec![1, 2];
+    }
     let mut slots = node_slot_indices(element_letter(tokens[0]))
         .unwrap_or(&[1, 2])
         .to_vec();
-    let kind = element_letter(tokens[0]).to_ascii_uppercase();
     if kind == 'Q' {
         let mut slots = vec![1, 2, 3];
         if q_is_four_terminal(tokens) {
@@ -219,9 +225,13 @@ pub(super) fn q_is_four_terminal(tokens: &[&str]) -> bool {
 
 /// Token positions that name *other elements* rather than nodes or values.
 /// Inside a subckt these names carry the instance path, like the card's own
-/// name (`X1.F1` must control `X1.V1`).
+/// name (`X1.F1` must control `X1.V1`). An ABM `F`/`H` card has no bare
+/// source-name field — its current reads ride the expression probes.
 pub(super) fn reference_slots_for_tokens(tokens: &[&str]) -> Vec<usize> {
     let kind = element_letter(tokens[0]).to_ascii_uppercase();
+    if matches!(kind, 'F' | 'H') && abm_card(tokens) {
+        return Vec::new();
+    }
     let is_poly = tokens
         .get(3)
         .is_some_and(|t| t.to_ascii_lowercase().starts_with("poly"));
@@ -358,12 +368,15 @@ pub(super) fn flatten_scope(
         let lower = line.to_ascii_lowercase();
         match lower.split_whitespace().next().unwrap_or("") {
             ".param" => {
-                // Expansion runs first: a multi-token brace/quote value
-                // (`x = '1k * gain'`) must resolve before the assignment
-                // token split sees the line (the contract on
-                // `parse_param_body`).
+                // Expansion runs first — and strict: the value is pure
+                // parameter language (no probe text), so a missing name
+                // fails loudly with that name instead of an unresolved
+                // `'…'` group reaching the assignment parser. A
+                // multi-token quote value (`x = '1k * gain'`) must also
+                // resolve before the assignment token split sees the line
+                // (the contract on `parse_param_body`).
                 let expanded =
-                    expand_line(line, env).map_err(|e| format!("line {line_no}: {e}"))?;
+                    expand_line_strict(line, env).map_err(|e| format!("line {line_no}: {e}"))?;
                 // Instance-scoped assignments may replay here: a body card
                 // re-assigning a key the `X` instance line provided is
                 // rolled back, because the instance line wins (the same
@@ -465,6 +478,47 @@ pub(super) fn flatten_scope(
             }
             // Malformed split: fall through with the generic rewrite so the
             // card walk raises the loud parse error for it.
+        }
+
+        // ABM cards (`E/F/G/H … KEYWORD {expr} …`, TODO §5) behave like `B`:
+        // the brace group is expression text, never a node or an element
+        // reference, and the generic slot pass would rewrite its tokens
+        // (slot 3/4 of an E card) into the instance namespace. The out nodes
+        // and the probes inside the expression scope like the B card's; the
+        // trailing detail (pairs, polynomial groups, rows, coefficients)
+        // travels verbatim.
+        if matches!(element_letter(tokens[0]), 'E' | 'G' | 'F' | 'H') && abm_card(&tokens) {
+            let text = tokens.join(" ");
+            // Split AFTER the two output nodes: parse the three head tokens,
+            // then hand the remainder to the ABM reader.
+            let head_len = tokens[0].len()
+                + 1
+                + tokens[1].len()
+                + 1
+                + tokens[2].len();
+            let tail_text = text[head_len.min(text.len())..].trim().to_string();
+            if let Some(split) = split_abm(&tail_text) {
+                let name = if prefix.is_empty() {
+                    tokens[0].to_string()
+                } else {
+                    format!("{prefix}.{}", tokens[0])
+                };
+                let op = scope_token(tokens[1], bindings, scope.globals, prefix);
+                let on = scope_token(tokens[2], bindings, scope.globals, prefix);
+                let expr =
+                    rewrite_b_probes(&split.expr, bindings, scope.globals, prefix);
+                let keyword = &split.keyword;
+                // Canonical spacing: `KEYWORD {expr} <tail>`.
+                let mut card = format!("{name} {op} {on} {keyword} {{{expr}}}");
+                if !split.tail.is_empty() {
+                    card.push(' ');
+                    card.push_str(&split.tail);
+                }
+                out.push((*line_no, card));
+                continue;
+            }
+            // Unrecognizable shape: fall through to the generic rewrite, the
+            // card walk reports the real error.
         }
 
         if node_slot_indices(kind).is_some() {

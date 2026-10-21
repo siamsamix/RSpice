@@ -4,8 +4,10 @@ use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
 use circuitsim::{
-    run, Circuit, DcSweepPoint, MeasureResult, Netlist, ParseOptions, SimError, SimulationResult,
+    run, Circuit, DcResult, DcSweepPoint, MeasureResult, Netlist, ParseOptions, SimError,
+    SimulationResult,
 };
+use circuitsim::netlist::OpMode;
 use circuitsim::circuit::CURRENT_FAMILIES;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -285,6 +287,34 @@ fn print_dc(report: &mut String, netlist: &Netlist, result: &SimulationResult) {
     }
     for (cur, r) in dc.branch_currents.resistors.iter().zip(&net.resistors) {
         let _ = writeln!(report, "  I({}) = {cur:.6e} A", r.name);
+    }
+    // `.op all` (PSpice variant): the annotated device operating points on
+    // top of the node/bias table — `.op pon` stays the plain bias point.
+    if netlist.analysis.op_mode == OpMode::All {
+        print_device_op_points(report, net, dc);
+    }
+}
+
+/// The `.op all` device table: card-order operating parameters, one line per
+/// element (`name key=value …`).
+fn print_device_op_points(report: &mut String, net: &Circuit, dc: &DcResult) {
+    let points = circuitsim::analysis::device_op_points(
+        net,
+        &dc.node_voltages,
+        &dc.branch_currents,
+        &dc.source_currents,
+    );
+    if points.is_empty() {
+        return;
+    }
+    let _ = writeln!(report, "\n--- Device Operating Points ---");
+    for point in &points {
+        let detail: Vec<String> = point
+            .entries
+            .iter()
+            .map(|(k, v)| format!("{k}={v:.6e}"))
+            .collect();
+        let _ = writeln!(report, "  {:<10} {}", point.name, detail.join("  "));
     }
 }
 

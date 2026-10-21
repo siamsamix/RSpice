@@ -468,7 +468,9 @@ fn arithmetic(l: ParamValue, r: ParamValue, op: char) -> Result<ParamValue, Eval
 
 /// SplitMix64 finalizer: one avalanche step gives well-mixed 64-bit words
 /// from small inputs, without carrying generator state between calls.
-fn mix64(mut x: u64) -> u64 {
+/// Also the keyed-draw primitive behind the B sources' `white()`/`flicker()`
+/// rolls ([`crate::behavior`]).
+pub(crate) fn mix64(mut x: u64) -> u64 {
     x = x.wrapping_add(0x9E37_79B9_7F4A_7C15);
     x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
     x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
@@ -492,7 +494,7 @@ fn draw_word(seed: u64, tag: &str, amplitude: f64) -> u64 {
 }
 
 /// Uniform deviate in `[0, 1)`.
-fn unit01(word: u64) -> f64 {
+pub(crate) fn unit01(word: u64) -> f64 {
     (word >> 11) as f64 * 2f64.powi(-53)
 }
 
@@ -523,13 +525,93 @@ pub fn seed_from_overrides(overrides: &HashMap<String, f64>) -> u64 {
     h
 }
 
+/// A stable tag word for one element name, mixed into keyed draws
+/// (`white()`/`flicker()` on B sources) so two sources never share a roll
+/// bit pattern. Names are unique per deck by the letter rule, so equality
+/// here can only be a false collision — and the name is folded verbatim,
+/// which also separates `X1.B1` from `X2.B1`.
+pub fn tag_word(name: &str) -> u64 {
+    mix_str(mix64(0), name)
+}
+
 // ─── Substitution pass ───────────────────────────────────────────────────────
+
+/// The keyword tokens an ABM card can open its tail with (`E`/`F`/`G`/`H`
+/// after their two output nodes): a classic gain spelling cannot produce
+/// `KEYWORD {expr}` — control names are bare tokens, never `=` with a
+/// brace group behind them. Shared with the element parsers (single
+/// source of truth for the keyword set).
+pub const ABM_KEYWORDS: &[&str] =
+    &["value", "equation", "table", "laplace", "freq", "chebyshev"];
+
+/// True when a line looks like an ABM card: one of the keywords spelled at
+/// the start of (or glued as `KEYWORD=` inside) a whitespace token, with a
+/// brace group on the same line — behind an `=`, or in the following token.
+///
+/// The substitution pass must **leave such a line untouched** (best-effort
+/// path only): the brace groups belong to the card's own grammar even when
+/// their text evaluates as a plain numeric constant (`LAPLACE {V(in)} = {1}`
+/// would otherwise lose its numerator's braces before the card parser ran),
+/// and the ABM parser folds deck parameters itself.
+pub fn is_abm_card_line(line: &str) -> bool {
+    let tokens = line.split_whitespace().collect::<Vec<&str>>();
+    for (i, tok) in tokens.iter().enumerate() {
+        let lower = tok.to_ascii_lowercase();
+        for keyword in ABM_KEYWORDS {
+            let glued = format!("{keyword}=");
+            let brace_glued = format!("{keyword}{{");
+            let hit = lower == *keyword
+                || lower.starts_with(&glued)
+                || lower.starts_with(&brace_glued);
+            if hit {
+                // The group can ride the token itself (`VALUE={…}`), sit in
+                // the next token (`TABLE {…}`), or detach across a spaced
+                // `=` (`LAPLACE = {…}` — two token positions of slack).
+                let groomed = tok.contains('{')
+                    || tokens.get(i + 1).is_some_and(|n| n.starts_with('{'))
+                    || tokens.get(i + 1).is_some_and(|n| {
+                        n.starts_with('=')
+                            && (n.contains('{')
+                                || tokens.get(i + 2).is_some_and(|m| m.starts_with('{')))
+                    });
+                return groomed;
+            }
+        }
+    }
+    false
+}
 
 /// Replace every `{expr}` and single-quoted `'expr'` in a line with its
 /// evaluated value. Double quotes pass through untouched (string literals on
 /// `.param` cards); unbalanced `'` stays literal (an apostrophe in a comment
 /// is already gone by this point — this line carries no comment text).
+///
+/// Best-effort: a group the parameter language cannot evaluate (behavioral
+/// probe text like `V={V(in)*gain}`) stays verbatim for the card-level
+/// parser to judge; a genuinely broken value still reaches a loud error
+/// there. See [`expand_line_strict`] for the variant `.param` cards use.
 pub fn expand_line(line: &str, env: &ParamEnv) -> Result<String, EvalError> {
+    expand_evaluated(line, env, true)
+}
+
+/// [`expand_line`] with the parameter language strictly enforced: a group
+/// that fails to evaluate is an error instead of verbatim text.
+///
+/// `.param` values are pure parameter language — a missing name must fail
+/// loudly here with that name. Passing an unresolved `'…'` group through
+/// would only move the failure into the assignment parser, which would then
+/// reject the quote characters and never mention the real cause.
+pub fn expand_line_strict(line: &str, env: &ParamEnv) -> Result<String, EvalError> {
+    expand_evaluated(line, env, false)
+}
+
+fn expand_evaluated(line: &str, env: &ParamEnv, verbatim: bool) -> Result<String, EvalError> {
+    // An ABM card's braces are grammatical, not grouping (see
+    // `is_abm_card_line`): the card parser folds parameters itself, so the
+    // substitution pass moves aside completely.
+    if verbatim && is_abm_card_line(line) {
+        return Ok(line.to_string());
+    }
     let chars: Vec<char> = line.chars().collect();
     let mut out = String::new();
     let mut i = 0usize;
@@ -553,8 +635,19 @@ pub fn expand_line(line: &str, env: &ParamEnv) -> Result<String, EvalError> {
                     return Err("unbalanced '{' without closing '}'".into());
                 }
                 let expr: String = chars[i + 1..j].iter().collect();
-                let v = env.eval(expr.trim())?;
-                out.push_str(&v.to_text());
+                match env.eval(expr.trim()) {
+                    Ok(v) => out.push_str(&v.to_text()),
+                    // Best-effort substitution: a group the parameter
+                    // language cannot evaluate stays verbatim and the
+                    // card-level parser judges it — B/default expressions
+                    // (`V={V(in)*gain}`) carry probe text the parameter
+                    // language must not touch, and a genuinely broken value
+                    // still reaches a loud error there.
+                    Err(_) if verbatim => {
+                        out.extend(chars[i..=j].iter().copied());
+                    }
+                    Err(e) => return Err(e),
+                }
                 i = j + 1;
             }
             '\'' => {
@@ -562,8 +655,13 @@ pub fn expand_line(line: &str, env: &ParamEnv) -> Result<String, EvalError> {
                 match close {
                     Some(k) => {
                         let expr: String = chars[i + 1..i + 1 + k].iter().collect();
-                        let v = env.eval(expr.trim())?;
-                        out.push_str(&v.to_text());
+                        match env.eval(expr.trim()) {
+                            Ok(v) => out.push_str(&v.to_text()),
+                            // Same best-effort rule: `'V(a)*gain'` belongs
+                            // to the device expression.
+                            Err(_) if verbatim => out.extend(chars[i..=i + 1 + k].iter().copied()),
+                            Err(e) => return Err(e),
+                        }
                         i = i + k + 2;
                     }
                     None => {
@@ -825,6 +923,52 @@ mod tests {
         assert_eq!(expand_line("V2 1 0 { {a} + 2 }", &env).unwrap(), "V2 1 0 5");
     }
 
+    /// ABM cards' braces are grammatical, not grouping — the substitution
+    /// pass leaves such a line alone (a plain-numeric LAPLACE group would
+    /// otherwise pre-evaluate into bare text ahead of the card parser).
+    #[test]
+    fn abm_cards_skip_the_substitution_pass() {
+        let env = env_of(&[("gain", 4.0)]);
+        let line = "E1 out 0 LAPLACE {V(in)} = {1} {1, gain}";
+        assert_eq!(expand_line(line, &env).unwrap(), line.to_string());
+        // The shape detector covers every spelling split_abm accepts.
+        assert!(is_abm_card_line("E1 o 0 VALUE={V(1)*2}"));
+        assert!(is_abm_card_line("E1 o 0 TABLE {V(1)} = (0,0)"));
+        assert!(is_abm_card_line("G1 o 0 VALUE ={V(1)*2}"));
+        assert!(is_abm_card_line("F1 o 0 CHEBYSHEV{V(1)} 1"));
+        // A keyword token with no brace group behind it is not an ABM card
+        // (a `freq`-named node still rides the classic grammar there).
+        assert!(!is_abm_card_line("E1 o 0 freq 2"));
+        // Non-ABM lines substitute exactly as before — the carve-out is
+        // scoped to the keyword+group shape.
+        let line = expand_line("R1 a 0 {1k*gain}", &env).unwrap();
+        assert_eq!(line, "R1 a 0 4000");
+    }
+
+    /// Best-effort vs strict expansion: element lines pass unevaluated
+    /// groups (probe text like `V={V(in)*gain}`) through verbatim for the
+    /// device parser to judge; `.param` card values are pure parameter
+    /// language, so the strict variant fails with the missing name.
+    #[test]
+    fn expand_verbatim_and_strict_split() {
+        let env = env_of(&[("t", 2.0)]);
+
+        // Probe text the parameter language must not touch — stays verbatim.
+        let line = expand_line("B1 out 0 V={V(in)*t}", &env).unwrap();
+        assert_eq!(line, "B1 out 0 V={V(in)*t}");
+        let line = expand_line("B2 out 0 V={'V(in)*gain'}", &env).unwrap();
+        assert_eq!(line, "B2 out 0 V={'V(in)*gain'}");
+
+        // The same quote text on a `.param` card is strict.
+        let err = expand_line_strict("r = '1k*gain'", &env).unwrap_err();
+        assert!(err.to_string().contains("gain"), "error was: {err}");
+
+        // And it resolves once the name is defined above.
+        let mut env = env_of(&[("t", 2.0)]);
+        env.params.insert("gain".into(), ParamValue::Num(4.0));
+        assert_eq!(expand_line_strict("r = '1k*gain'", &env).unwrap(), "r = 4000");
+    }
+
     #[test]
     fn param_cards_assign_and_override_wins() {
         let mut env = ParamEnv::default();
@@ -930,5 +1074,14 @@ mod tests {
             "pure function of the map"
         );
         assert_eq!(seed_from_overrides(&HashMap::new()), 0);
+    }
+
+    /// Element-name tags for keyed (B-source) draws: stable per name,
+    /// different across names.
+    #[test]
+    fn tag_words_separate_names_and_are_stable() {
+        assert_eq!(tag_word("B1"), tag_word("B1"), "stable per name");
+        assert_ne!(tag_word("B1"), tag_word("B2"));
+        assert_ne!(tag_word("X1.B1"), tag_word("X2.B1"), "instance paths count");
     }
 }

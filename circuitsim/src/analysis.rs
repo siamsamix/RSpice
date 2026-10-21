@@ -7,6 +7,7 @@ use crate::mna::{
     compute_branch_currents_at, node_voltage, seed_transient_state, AcBranchCurrents,
     BranchCurrents, BranchLayout, DcJunctionLimits, MnaSystem, Mode, TransientState,
 };
+use crate::behavior::BehavioralRuntime;
 use crate::circuit::IntegrationMethod;
 use crate::netlist::{
     AcCommand, AcScale, DcCommand, DcSweepValues, Netlist, NoiseCommand, NodesetEntry, StepSpec,
@@ -503,7 +504,14 @@ fn run_single(netlist: &Netlist) -> Result<SimulationResult> {
             } else {
                 dc_x.clone()
             };
-            result.tran = Some(run_transient(circuit, analysis, &x_seed, stop, startup)?);
+            result.tran = Some(run_transient(
+                circuit,
+                analysis,
+                &x_seed,
+                stop,
+                startup,
+                netlist.mc_seed,
+            )?);
         }
     }
 
@@ -515,6 +523,7 @@ fn run_single(netlist: &Netlist) -> Result<SimulationResult> {
             uic_state.as_ref().unwrap(),
             stop,
             false,
+            netlist.mc_seed,
         )?);
     }
 
@@ -740,6 +749,235 @@ fn extract_dc(circuit: &Circuit, x: &nalgebra::DVector<f64>) -> Result<DcResult>
     Ok(DcResult { node_voltages, source_currents, branch_currents })
 }
 
+// ─── Annotated operating points (`.op all`) ─────────────────────────────────
+
+/// One device's annotated operating point (TODO §4, the `.op all` view).
+#[derive(Debug, Clone)]
+pub struct OpPoint {
+    /// Element name as the deck spells it.
+    pub name: String,
+    /// Parameters at the operating point, in display order: short labels
+    /// with their quantity (`vd`, `ic`, `p`), engineering values. A switch's
+    /// state is encoded `s = 1` (on) / `s = 0` (off).
+    pub entries: Vec<(String, f64)>,
+}
+
+/// Annotated device operating points at a solved DC state (`.op all`):
+/// every stamped element line's card-order operating parameters derived
+/// from the reported node voltages and branch currents — the same data the
+/// reference tools show when clicking a component in op mode.
+pub fn device_op_points(
+    circuit: &Circuit,
+    node_voltages: &[f64],
+    currents: &BranchCurrents,
+    source_currents: &[f64],
+) -> Vec<OpPoint> {
+    let v = |node: crate::circuit::NodeId| node_voltages.get(node.0).copied().unwrap_or(0.0);
+    // (label, value) pusher keeping every family's loop body flat.
+    let at = |name: &str, entries: Vec<(&'static str, f64)>| -> OpPoint {
+        OpPoint {
+            name: name.to_string(),
+            entries: entries.into_iter().map(|(k, val)| (k.to_string(), val)).collect(),
+        }
+    };
+    let mut out = Vec::new();
+    for (i, r) in circuit.resistors.iter().enumerate() {
+        let vr = v(r.n1) - v(r.n2);
+        let ir = currents.resistors.get(i).copied().unwrap_or(0.0);
+        out.push(at(&r.name, vec![
+            ("r", circuit.resistance_at(r)),
+            ("v", vr),
+            ("i", ir),
+            ("p", vr * ir),
+        ]));
+    }
+    for c in circuit.capacitors.iter() {
+        // Steady state: a capacitor is an open circuit (current 0), so only
+        // the held voltage is annotated.
+        out.push(at(&c.name, vec![
+            ("c", circuit.capacitance_at(c)),
+            ("v", v(c.n1) - v(c.n2)),
+        ]));
+    }
+    for (i, l) in circuit.inductors.iter().enumerate() {
+        out.push(at(&l.name, vec![
+            ("l", circuit.inductance_at(l)),
+            ("i", currents.inductors.get(i).copied().unwrap_or(0.0)),
+        ]));
+    }
+    for s in &circuit.switches {
+        let control = match &s.control {
+            crate::circuit::SwitchControl::Voltage(p, n) => v(*p) - v(*n),
+            crate::circuit::SwitchControl::Current(name) => {
+                // The controlling source's branch unknown, raw — exactly the
+                // quantity the switch stamps threshold (missing source ⇒ 0).
+                circuit
+                    .voltage_sources
+                    .iter()
+                    .position(|vs| vs.name.eq_ignore_ascii_case(name))
+                    .and_then(|idx| source_currents.get(idx).copied())
+                    .unwrap_or(0.0)
+            }
+        };
+        let was_on = s.initial;
+        let (_g, on) = circuit
+            .switch_models
+            .get(&s.model)
+            .map(|m| m.conductance(control, was_on))
+            .unwrap_or((0.0, false));
+        let vs = v(s.n1) - v(s.n2);
+        out.push(at(&s.name, vec![
+            ("s", if on { 1.0 } else { 0.0 }),
+            ("v", vs),
+        ]));
+    }
+    for (i, d) in circuit.diodes.iter().enumerate() {
+        let vd = v(d.anode) - v(d.cathode);
+        let id = currents.diodes.get(i).copied().unwrap_or(0.0);
+        out.push(at(&d.name, vec![("vd", vd), ("id", id), ("p", vd * id)]));
+    }
+    for (i, m) in circuit.mosfets.iter().enumerate() {
+        let id = currents.mosfets.get(i).copied().unwrap_or(0.0);
+        out.push(at(&m.name, vec![
+            ("vgs", v(m.ng) - v(m.ns)),
+            ("vds", v(m.nd) - v(m.ns)),
+            ("vbs", v(m.nb) - v(m.ns)),
+            ("id", id),
+        ]));
+    }
+    for (i, q) in circuit.bjts.iter().enumerate() {
+        let ic = currents.bjts.get(i).copied().unwrap_or(0.0);
+        out.push(at(&q.name, vec![
+            ("vbe", v(q.nb) - v(q.ne)),
+            ("vbc", v(q.nb) - v(q.nc)),
+            ("vce", v(q.nc) - v(q.ne)),
+            ("ic", ic),
+            ("p", (v(q.nc) - v(q.ne)) * ic),
+        ]));
+    }
+    for (i, j) in circuit.jfets.iter().enumerate() {
+        let id = currents.jfets.get(i).copied().unwrap_or(0.0);
+        out.push(at(&j.name, vec![
+            ("vgs", v(j.ng) - v(j.ns)),
+            ("vds", v(j.nd) - v(j.ns)),
+            ("id", id),
+        ]));
+    }
+    for cs in &circuit.current_sources {
+        let is = match &cs.waveform {
+            Some(w) => w.value_at(0.0),
+            None => cs.current,
+        };
+        // Delivered power: the card convention drives `is` from μn1 through
+        // the source into μn2, so it supplies `is·(v(n2) − v(n1))`.
+        let vc = v(cs.n2) - v(cs.n1);
+        out.push(at(&cs.name, vec![("i", is), ("v", vc), ("p", is * vc)]));
+    }
+    for (idx, vs) in circuit.voltage_sources.iter().enumerate() {
+        let card = vs.value_at(0.0);
+        // `source_currents` is the raw branch unknown (element convention —
+        // a delivering source reads negative), so `p` is negative while the
+        // source is supplying, matching the classic SPICE sign.
+        let total = source_currents.get(idx).copied().unwrap_or(0.0);
+        out.push(at(
+            &vs.name,
+            vec![("v", card), ("i", total), ("p", card * total)],
+        ));
+    }
+    // E/F/G/H: the output value at the operating point — the polynomial
+    // evaluated on the converged controls. Branch-side controlled devices
+    // carry their current only in the solver's raw vector, so the annotated
+    // view reports the source's own output value, which the deck's transfer
+    // is expressed in.
+    for cs in circuit
+        .vcvs
+        .iter()
+        .chain(circuit.vccs.iter())
+        .chain(circuit.ccvs.iter())
+        .chain(circuit.cccs.iter())
+    {
+        let val = controlled_value(circuit, cs, node_voltages, source_currents);
+        out.push(at(&cs.name, vec![("val", val)]));
+    }
+    // Op-amps: output voltage, output current (the branch unknown) and the
+    // element-convention power product, with the driving gain recorded.
+    for (i, u) in circuit.opamps.iter().enumerate() {
+        let params = circuit.opamp_params_at(&u.model);
+        let vout = v(u.out_p) - v(u.out_n);
+        let io = currents.opamps.get(i).copied().unwrap_or(0.0);
+        out.push(at(&u.name, vec![
+            ("a", params.gain),
+            ("v", vout),
+            ("i", io),
+            ("p", vout * io),
+        ]));
+    }
+    for (i, b) in circuit.behavioral.iter().enumerate() {
+        // Evaluate the expression against the same probe snapshot the MNA
+        // stamps read: node differences and the raw branch unknowns.
+        let probe_values: Vec<f64> = b
+            .behavior
+            .probes
+            .iter()
+            .map(|probe| match probe {
+                crate::behavior::ProbeBinding::Voltage(p, m) => v(*p) - v(*m),
+                crate::behavior::ProbeBinding::SourceCurrent(i) => source_currents
+                    .get(*i)
+                    .copied()
+                    .unwrap_or(0.0),
+                crate::behavior::ProbeBinding::InductorCurrent(i) => {
+                    currents.inductors.get(*i).copied().unwrap_or(0.0)
+                }
+                crate::behavior::ProbeBinding::Unresolved(_) => {
+                    unreachable!("probes bind before any report runs")
+                }
+            })
+            .collect();
+        let value = b.behavior.evaluate(&probe_values, 0.0, 0.0, &BehavioralRuntime::default())
+            // Dynamic ABM forms report the DC transfer of the frequency data
+            // everywhere outside AC.
+            * b.abm.as_ref().map(|a| a.dc_gain()).unwrap_or(1.0);
+        let current = currents.behavioral.get(i).copied().unwrap_or(0.0);
+        match b.kind {
+            crate::circuit::BehavioralKind::Voltage => {
+                out.push(at(&b.name, vec![("v", value), ("i", current)]));
+            }
+            crate::circuit::BehavioralKind::Current => {
+                let vb = v(b.out_p) - v(b.out_n);
+                out.push(at(
+                    &b.name,
+                    vec![("i", value), ("v", vb), ("p", vb * value)],
+                ));
+            }
+        }
+    }
+    out
+}
+
+/// One controlled source's output value at the operating point.
+fn controlled_value(
+    circuit: &Circuit,
+    cs: &crate::circuit::ControlledSource,
+    node_voltages: &[f64],
+    source_currents: &[f64],
+) -> f64 {
+    let v = |node: crate::circuit::NodeId| node_voltages.get(node.0).copied().unwrap_or(0.0);
+    let mut val = cs.coeffs.first().copied().unwrap_or(0.0);
+    for (k, var) in cs.controls.iter().enumerate() {
+        let x = match var {
+            crate::circuit::ControlVar::Voltage(p, n) => v(*p) - v(*n),
+            crate::circuit::ControlVar::Current(name) => circuit
+                .voltage_sources
+                .iter()
+                .position(|vs| vs.name.eq_ignore_ascii_case(name))
+                .and_then(|idx| source_currents.get(idx).copied())
+                .unwrap_or(0.0),
+        };
+        val += cs.coeffs.get(k + 1).copied().unwrap_or(0.0) * x;
+    }
+    val
+}
+
 // ─── .dc sweep ────────────────────────────────────────────────────────────────
 
 /// Where one sweep spec's values get applied.
@@ -929,6 +1167,7 @@ fn run_transient(
     x_start: &nalgebra::DVector<f64>,
     t_stop: f64,
     startup: bool,
+    noise_seed: u64,
 ) -> Result<TranResult> {
     let dt_out = analysis.tran_step.ok_or_else(|| {
         SimError::Analysis("transient needs a print interval (.tran <tstep> <tstop>)".into())
@@ -949,7 +1188,7 @@ fn run_transient(
     let min_step = (t_stop * 1e-12).max(1e-18);
 
     let mut x = x_start.clone();
-    let mut state = seed_transient_state(circuit, &x);
+    let mut state = seed_transient_state(circuit, &x, noise_seed);
     let mut points = Vec::new();
     let eps = t_stop.abs() * 1e-12 + 1e-18;
 
@@ -1401,6 +1640,7 @@ fn collapse_ac(b: &AcBranchCurrents) -> BranchCurrents {
         bjts: mag(&b.bjts),
         jfets: mag(&b.jfets),
         behavioral: mag(&b.behavioral),
+        opamps: mag(&b.opamps),
     }
 }
 

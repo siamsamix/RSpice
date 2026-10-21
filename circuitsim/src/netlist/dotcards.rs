@@ -25,8 +25,15 @@ pub(super) fn parse_dot_command(
         ".model" => parse_model_card(line, &tokens, circuit, warnings, line_no)?,
         ".op" => {
             analysis.dc_op = true;
-            if tokens.len() > 1 {
-                warnings.push(ignored_tokens(line_no, ".op", &tokens[1..]));
+            for tok in &tokens[1..] {
+                match tok.to_ascii_lowercase().as_str() {
+                    // PSpice output-detail variants (TODO §4): `pon` prints
+                    // the plain bias point, `all` asks for the annotated
+                    // device operating-point view on top.
+                    "pon" => analysis.op_mode = OpMode::Pon,
+                    "all" => analysis.op_mode = OpMode::All,
+                    _ => warnings.push(ignored_tokens_owned(line_no, ".op", tok)),
+                }
             }
         }
         ".tran" => {
@@ -425,6 +432,16 @@ pub(super) fn parse_options(
             }
             "itl1" => analysis.itl1 = parse_value(value).map_err(SimError::Parse)?.max(1.0) as usize,
             "itl4" => analysis.itl4 = parse_value(value).map_err(SimError::Parse)?.max(1.0) as usize,
+            // TODO §8: `.options seed=` — the deck's base Monte-Carlo seed.
+            // Element lines expand (and draw) before dot commands execute,
+            // so the seed is ALSO lifted from the raw logical lines in
+            // [`crate::parse_featured`]; this arm records it for analysis
+            // visibility and the round-trip. Values that only the walk could
+            // read (e.g. parameterized) warn there instead of silently
+            // changing the expansion-time draws.
+            "seed" => {
+                analysis.mc_seed = parse_value(value).map_err(SimError::Parse)?.max(0.0) as u64;
+            }
             // Parsed but not applied yet; keep them as warnings instead of
             // pretending the engine honours them.
             "itl2" | "itl6" | "maxord" | "tnom" | "temp"
@@ -994,7 +1011,16 @@ pub(super) fn emit_commands(analysis: &AnalysisCommands, out: &mut String) {
         out.push('\n');
     }
     if analysis.dc_op {
-        out.push_str(".op\n");
+        let mut line = String::from(".op");
+        // The variants re-spell only when a card asked for them, so plain
+        // decks keep their plain text.
+        match analysis.op_mode {
+            OpMode::Default => {}
+            OpMode::Pon => line.push_str(" pon"),
+            OpMode::All => line.push_str(" all"),
+        }
+        out.push_str(&line);
+        out.push('\n');
     }
     if let (Some(step), Some(stop)) = (analysis.tran_step, analysis.tran_stop) {
         let mut line = format!(".tran {} {}", step, stop);
@@ -1062,6 +1088,10 @@ pub(super) fn emit_commands(analysis: &AnalysisCommands, out: &mut String) {
     }
     if analysis.itl4 != 100 {
         options.push_str(&format!(" itl4={}", analysis.itl4));
+    }
+    if analysis.mc_seed != 0 {
+        // TODO §8: the base Monte-Carlo seed round-trips like the knobs.
+        options.push_str(&format!(" seed={}", analysis.mc_seed));
     }
     out.push_str(&options);
     out.push('\n');

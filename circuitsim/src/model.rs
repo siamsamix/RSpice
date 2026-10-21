@@ -39,6 +39,40 @@ pub struct GenericModel {
     pub tolerance: ModelTolerance,
 }
 
+/// A `.model <name> U(…)` op-amp model card (TODO §5, documented
+/// interpretation — the reference tools reserve `U` for nothing, so RSpice
+/// spells its op-amp model with the element's own letter).
+///
+/// Parameters: `GAIN` (V/V, 1e6), `RIN` (Ω input resistance, ∞ — unset
+/// means no input rung), `ROUT` (Ω output resistance, 0) and `VOS` (V input
+/// offset, folded into the controlled row like a connected offset source).
+/// `DEV`/`LOT` land in the reserved Monte-Carlo slot (TODO §8).
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpAmpModel {
+    /// Open-loop voltage gain A0 (V/V).
+    pub gain: f64,
+    /// Differential input resistance (Ω); `INFINITY` disconnects the rung.
+    pub rin: f64,
+    /// Output resistance (Ω); 0 inserts no rung.
+    pub rout: f64,
+    /// Input offset voltage (V) — a real input wire sees `vos` at gain·vos.
+    pub vos: f64,
+    /// Reserved MC tolerance slot (`DEV`/`LOT` cards).
+    pub tolerance: ModelTolerance,
+}
+
+impl Default for OpAmpModel {
+    fn default() -> Self {
+        Self {
+            gain: 1e6,
+            rin: f64::INFINITY,
+            rout: 0.0,
+            vos: 0.0,
+            tolerance: ModelTolerance::default(),
+        }
+    }
+}
+
 /// Exponential I–V model: `I = IS·(exp(Vd / n·VT) − 1)`.
 ///
 /// The complete SPICE diode parameter list is parsed (grammar-complete per

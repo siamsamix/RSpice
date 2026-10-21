@@ -369,6 +369,29 @@ pub(super) fn parse_model_card(
         return Ok(());
     }
 
+    // Op-amp model cards: `.model m U(GAIN=… RIN=… ROUT=… VOS=…)`. The
+    // documented-interpretation card for RSpice's `U` element (the reference
+    // tools reserve no `U` model type); unset keys keep their defaults, so a
+    // bare `.model m U()` introduces the default op-amp under that name.
+    if type_lower == "u" || type_lower == "opamp" {
+        let mut model = crate::circuit::OpAmpModel::default();
+        for (key, raw) in pairs {
+            match key.as_str() {
+                "gain" | "a" | "av" | "aol" => model.gain = value(&raw)?,
+                "rin" | "rinp" => model.rin = value(&raw)?,
+                "rout" | "zout" => model.rout = value(&raw)?,
+                "vos" => model.vos = value(&raw)?,
+                "dev" => model.tolerance.dev = Some(parse_tolerance_value(&raw, &value)),
+                "lot" => model.tolerance.lot = Some(parse_tolerance_value(&raw, &value)),
+                other => warnings.push(format!(
+                    "line {line_no}: .model '{name}': op-amp parameter '{other}' is not supported — ignored"
+                )),
+            }
+        }
+        circuit.opamp_models.insert(name, model);
+        return Ok(());
+    }
+
     // Unknown device family — store the card so the deck still imports, and
     // a future element letter can consume it (TODO §2).
     let mut generic = GenericModel {
@@ -656,6 +679,25 @@ pub(super) fn emit_models(circuit: &Circuit, out: &mut String) {
             ".model {} SW(RON={} ROFF={} VT={} VH={})\n",
             name, m.ron, m.roff, m.vt, m.vh
         ));
+    }
+    // Op-amp model cards. `RIN` prints only when finite (the ∞ default would
+    // emit `inf`, which `parse_value` rejects) and `VOS`/`ROUT` join only
+    // when they depart from their defaults.
+    let mut opamp_names: Vec<&String> = circuit.opamp_models.keys().collect();
+    opamp_names.sort();
+    for name in opamp_names {
+        let m = &circuit.opamp_models[name];
+        let mut fields = format!("GAIN={}", m.gain);
+        if m.rin.is_finite() {
+            fields.push_str(&format!(" RIN={}", m.rin));
+        }
+        if m.rout != 0.0 {
+            fields.push_str(&format!(" ROUT={}", m.rout));
+        }
+        if m.vos != 0.0 {
+            fields.push_str(&format!(" VOS={}", m.vos));
+        }
+        out.push_str(&format!(".model {} U({})\n", name, fields));
     }
     // Device families without an element letter yet: emitted with their
     // stored numeric parameters so a re-parse reproduces the card.

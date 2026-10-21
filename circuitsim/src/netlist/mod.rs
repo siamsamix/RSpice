@@ -4,14 +4,14 @@ use std::path::{Path, PathBuf};
 use crate::circuit::{
     Ac, Am, BehavioralKind, BehavioralSource, Bjt, BjtModel, BjtType, Capacitor, Circuit,
     ControlVar, ControlledSource, CurrentSource, Diode, DiodeModel, Exp, GenericModel, Inductor,
-    Jfet, JfetModel, JfetType, Mosfet, MosfetModel, MosfetType, NodeId, Pwl, Pulse, Resistor,
-    Sffm, Sine, Switch, SwitchControl, SwitchModel, VoltageSource, Waveform,
+    Jfet, JfetModel, JfetType, Mosfet, MosfetModel, MosfetType, NodeId, OpAmp, Pwl, Pulse,
+    Resistor, Sffm, Sine, Switch, SwitchControl, SwitchModel, VoltageSource, Waveform,
 };
 use crate::error::{Result, SimError};
 use crate::model::ModelTolerance;
 use crate::params::{
-    expand_line, parse_func_body, parse_param_body, seed_from_overrides, FuncDef, ParamEnv,
-    ParamValue,
+    expand_line, expand_line_strict, mix64, parse_func_body, parse_param_body,
+    seed_from_overrides, FuncDef, ParamEnv, ParamValue,
 };
 use crate::units::parse_value;
 
@@ -21,7 +21,7 @@ use self::models::parse_model_card;
 use self::elements::{
     parse_behavioral_source, parse_bjt, parse_capacitor, parse_controlled_source,
     parse_current_source, parse_diode, parse_inductor, parse_jfet, parse_mosfet,
-    parse_mutual_inductance, parse_resistor, parse_switch, parse_voltage_source,
+    parse_mutual_inductance, parse_opamp, parse_resistor, parse_switch, parse_voltage_source,
 };
 use self::imports::splice_libraries;
 use self::nodeplan::{collect_global_nets, element_letter, scan_node_plan};
@@ -223,6 +223,8 @@ pub enum MeasKind {
 #[derive(Debug, Clone)]
 pub struct AnalysisCommands {
     pub dc_op: bool,
+    /// `.op pon|all` — the operating-point print detail (PSpice variants).
+    pub op_mode: OpMode,
     pub dc: Option<DcCommand>,
     pub tran_step: Option<f64>,
     pub tran_stop: Option<f64>,
@@ -261,6 +263,11 @@ pub struct AnalysisCommands {
     /// point. Default 100 (kept from the pre-options engine; the SPICE
     /// classic default of 10 starved the damped-Newton line search).
     pub itl4: usize,
+    /// `.options seed=` — the deck's base Monte-Carlo seed (TODO §8). It is
+    /// known before any element line expands (the pre-scan lifts it), so both
+    /// the expansion-time draws and the runtime keyed draws run off it.
+    /// 0 = unseeded; the effective seed mixes this with the sweep overrides.
+    pub mc_seed: u64,
     pub ac: Option<AcCommand>,
     /// `.tf <output> <input>` — DC transfer function.
     pub tf: Option<TfCommand>,
@@ -287,6 +294,7 @@ impl Default for AnalysisCommands {
     fn default() -> Self {
         Self {
             dc_op: false,
+            op_mode: OpMode::Default,
             dc: None,
             tran_step: None,
             tran_stop: None,
@@ -303,6 +311,7 @@ impl Default for AnalysisCommands {
             srcsteps: 10,
             itl1: 100,
             itl4: 100,
+            mc_seed: 0,
             ac: None,
             tf: None,
             steps: Vec::new(),
@@ -332,6 +341,22 @@ pub struct ParseOptions {
     /// CLI-provided model directories, the `RSPICE_LIB` env entries, and the
     /// `nom.lib`/user-lib conventions of the reference tools.
     pub search_paths: Vec<PathBuf>,
+}
+
+/// `.op` output variants (PSpice's `pon`/`all` spellings): what the
+/// operating-point report prints. `Pon` is the plain bias point;
+/// `All` asks for the annotated device operating-point view on top.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum OpMode {
+    /// `.op` — the engine's default report (node voltages, branch currents).
+    #[default]
+    Default,
+    /// `.op pon` — explicitly the plain bias-point print.
+    Pon,
+    /// `.op all` — the bias point plus per-device operating-point detail
+    /// (LTspice's annotated op-data view; the CLI renders it from the
+    /// resolved `simulation results`).
+    All,
 }
 
 #[derive(Debug, Clone)]
@@ -424,8 +449,15 @@ fn parse_featured(
     // node-mangled and `{}`-expanded, dot commands just `{}`-expanded.
     let mut env = ParamEnv::default();
     // Monte-Carlo draws key off the sweep overrides, so each stepped point
-    // re-rolls deterministically (TODO §8).
+    // re-rolls deterministically (TODO §8), and `.options seed=` raises the
+    // base seed — it must be known before the first element line expands,
+    // so a pre-scan lifts it from the logical lines (SPICE treats
+    // `.options` as order-independent, so deck position does not matter).
     env.mc_seed = seed_from_overrides(overrides);
+    let option_seed = scan_options_seed(&logical);
+    if option_seed != 0 {
+        env.mc_seed = mix64(env.mc_seed ^ option_seed);
+    }
     let mut scope = ScopeCtx {
         defs: &defs,
         globals: &globals,
@@ -476,13 +508,21 @@ fn parse_featured(
             'I' => parse_current_source(&tokens, &mut circuit, &plan, options)?,
             'M' => parse_mosfet(&tokens, &mut circuit, &plan, &mut warnings, line_no)?,
             'E' | 'G' | 'F' | 'H' => {
-                parse_controlled_source(&tokens, &mut circuit, &plan, line_no, &mut warnings)?
+                parse_controlled_source(
+                    &tokens,
+                    &mut circuit,
+                    &plan,
+                    line_no,
+                    &mut warnings,
+                    &env.params,
+                )?
             }
             'Q' => parse_bjt(&tokens, &mut circuit, &plan, &mut warnings, line_no)?,
             'J' => parse_jfet(&tokens, &mut circuit, &plan, &mut warnings, line_no)?,
             'S' | 'W' => parse_switch(&tokens, &mut circuit, &plan, line_no)?,
             'K' => parse_mutual_inductance(&tokens, &mut circuit, line_no)?,
-            'B' => parse_behavioral_source(&tokens, &mut circuit, &plan, line_no)?,
+            'B' => parse_behavioral_source(&tokens, &mut circuit, &plan, line_no, &env.params)?,
+            'U' => parse_opamp(&tokens, &mut circuit, &plan, line_no, &mut warnings)?,
             _ => {
                 // Device families RSpice does not model yet are skipped with
                 // a warning instead of failing the import (tolerant parsing).
@@ -509,6 +549,17 @@ fn parse_featured(
     // they never create nodes, so this runs before `validate`.
     circuit.resolve_behavioral()?;
     circuit.validate()?;
+    // A seed the walk recorded but the pre-scan could not lift is a
+    // parameterized value (only `{}`-expansion can read it): honor-able by
+    // the walk, not by the expansion-time draws. Warn, don't half-apply.
+    if analysis.mc_seed != 0 && analysis.mc_seed != option_seed {
+        warnings.push(format!(
+            ".options seed={} is parameterized — the draw seed must be a plain \
+             number to raise the base seed; keyed draws follow the sweep \
+             overrides instead",
+            analysis.mc_seed
+        ));
+    }
     Ok(Netlist {
         circuit,
         analysis,
@@ -597,6 +648,33 @@ fn logical_lines(source: &str) -> Result<Vec<(usize, String)>> {
         out.push((line_no, text.to_string()));
     }
     Ok(out)
+}
+
+/// Lift the literal `seed=` value of every `.options` card, before anything
+/// expands: element lines draw through the parameter environment (and the
+/// options card only *executes* during the final deck walk). Case-
+/// insensitive on the directive and the key, last card wins — the same read
+/// order the walk itself uses. Values that do not parse as a plain number
+/// (a `seed={n}` expansion) are ignored here and warned by the walk.
+fn scan_options_seed(logical: &[(usize, String)]) -> u64 {
+    let mut seed = 0u64;
+    for (_, line) in logical {
+        let mut tokens = line.split_whitespace();
+        if !tokens.next().is_some_and(|t| t.eq_ignore_ascii_case(".options")) {
+            continue;
+        }
+        for token in tokens {
+            let Some((key, value)) = token.split_once('=') else {
+                continue;
+            };
+            if key.trim().eq_ignore_ascii_case("seed") {
+                if let Ok(n) = crate::units::parse_value(value) {
+                    seed = n.max(0.0) as u64;
+                }
+            }
+        }
+    }
+    seed
 }
 
 /// The element letter of a card name. Subckt-internal names carry their

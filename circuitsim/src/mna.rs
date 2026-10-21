@@ -379,18 +379,29 @@ pub struct BranchLayout {
     pub ccvs_base: usize,
     /// First row of the voltage-flavour behavioral (`B`) branch block.
     pub behavioral_base: usize,
+    /// First row of the op-amp (`U`) branch block.
+    pub opamp_base: usize,
 }
 
 impl BranchLayout {
     pub fn for_circuit(circuit: &Circuit) -> Self {
-        let [vsrc, ind, vcvs, ccvs, _behavioral] = circuit.branch_family_counts();
+        let [vsrc, ind, vcvs, ccvs, behavioral, _opamp] = circuit.branch_family_counts();
         let n_nodes = circuit.nodes.saturating_sub(1);
         let vsrc_base = n_nodes;
         let ind_base = vsrc_base + vsrc;
         let vcvs_base = ind_base + ind;
         let ccvs_base = vcvs_base + vcvs;
         let behavioral_base = ccvs_base + ccvs;
-        Self { n_nodes, vsrc_base, ind_base, vcvs_base, ccvs_base, behavioral_base }
+        let opamp_base = behavioral_base + behavioral;
+        Self {
+            n_nodes,
+            vsrc_base,
+            ind_base,
+            vcvs_base,
+            ccvs_base,
+            behavioral_base,
+            opamp_base,
+        }
     }
 
     /// Row index of the current unknown of voltage source `i`.
@@ -411,6 +422,11 @@ impl BranchLayout {
     /// Row index of the output current unknown of CCVS `i`.
     pub fn ccvs_branch(&self, i: usize) -> usize {
         self.ccvs_base + i
+    }
+
+    /// Row index of the output current unknown of op-amp `i`.
+    pub fn opamp_branch(&self, i: usize) -> usize {
+        self.opamp_base + i
     }
 
     /// Value of the voltage-source `i` row in a solved unknown vector.
@@ -455,6 +471,7 @@ impl<T: Field> MnaSystem<T> {
                 vcvs_base: 0,
                 ccvs_base: 0,
                 behavioral_base: 0,
+                opamp_base: 0,
             },
         }
     }
@@ -580,7 +597,7 @@ pub fn build_system<T: Field>(circuit: &Circuit, mode: Mode) -> Result<MnaSystem
 
             stamp_voltage_sources(circuit, &mut sys, |v| v.voltage * src_scale);
             stamp_current_sources(circuit, &mut sys, |i| i.current * src_scale);
-            stamp_behavioral(circuit, &mut sys, guess, true, 0.0, 0.0, &[])?;
+            stamp_behavioral(circuit, &mut sys, guess, true, 0.0, 0.0, &[], 0.0)?;
 
             // The gmin floor across capacitors anchors the classic R–C island
             // (a node reachable only through capacitors would otherwise leave
@@ -619,7 +636,7 @@ pub fn build_system<T: Field>(circuit: &Circuit, mode: Mode) -> Result<MnaSystem
             stamp_inductors(circuit, &mut sys, dt, state, method);
             stamp_voltage_sources(circuit, &mut sys, |v| v.value_at(t) * startup_ramp(t, startup));
             stamp_current_sources(circuit, &mut sys, |i| i.value_at(t) * startup_ramp(t, startup));
-            stamp_behavioral(circuit, &mut sys, guess, true, t, dt, &state.behavioral)?;
+            stamp_behavioral(circuit, &mut sys, guess, true, t, dt, &state.behavioral, 0.0)?;
         }
         Mode::Ac { freq, bias } => {
             let omega = 2.0 * std::f64::consts::PI * freq;
@@ -676,8 +693,9 @@ pub fn build_system<T: Field>(circuit: &Circuit, mode: Mode) -> Result<MnaSystem
             }
 
             // Behavioral sources linearize at the DC bias with real-difference
-            // Jacobians; time/history terms behave as constants there.
-            stamp_behavioral(circuit, &mut sys, bias, false, 0.0, 0.0, &[])?;
+            // Jacobians; time/history terms behave as constants there. ABM
+            // dynamic forms ride the frequency response H(jω).
+            stamp_behavioral(circuit, &mut sys, bias, false, 0.0, 0.0, &[], freq)?;
         }
     }
 
@@ -776,6 +794,30 @@ fn stamp_controlled_sources<T: Field>(circuit: &Circuit, sys: &mut MnaSystem<T>)
         }
         let c0 = T::lift(c.constant());
         stamp_current_source(sys, c.out_p, c.out_n, c0);
+    }
+
+    // Op-amps (U): one branch row holds the output pair at
+    // `gain·(V(in+) − V(in−) + VOS)` — the same shape as a single-pair VCVS,
+    // so one stamp serves DC, transient, and AC. The RIN/ROUT slots pull in
+    // admittance rungs when finite/non-zero; unknown model names fall back
+    // to the documented defaults here (validate() rejects them loudly first).
+    for (i, u) in circuit.opamps.iter().enumerate() {
+        let model = circuit.opamp_params_at(&u.model);
+        let row = layout.opamp_branch(i);
+        stamp_branch_nodes(sys, row, u.out_p, u.out_n);
+        if let Some(ip) = node_index(u.in_p) {
+            sys.a[(row, ip)] -= T::lift(model.gain);
+        }
+        if let Some(im) = node_index(u.in_n) {
+            sys.a[(row, im)] += T::lift(model.gain);
+        }
+        sys.z[row] += T::lift(model.gain * model.vos);
+        if model.rin.is_finite() && model.rin > 0.0 {
+            stamp_admittance(sys, u.in_p, u.in_n, T::lift(1.0 / model.rin));
+        }
+        if model.rout > 0.0 {
+            stamp_admittance(sys, u.out_p, u.out_n, T::lift(1.0 / model.rout));
+        }
     }
 }
 
@@ -890,6 +932,10 @@ fn behavioral_probe_snapshot(
 ///   pure linearization (`z` gets nothing, like the other devices).
 /// * `runtimes` — one entry per source in card order (empty in DC/AC; the
 ///   stamp reads zeroed history, and `.get(i)` falls back to a default).
+/// * `freq` — the AC test frequency in Hz (0 elsewhere). ABM dynamic sources
+///   (LAPLACE/FREQ/CHEBYSHEV, TODO §5) multiply their linearized coupling by
+///   the complex response `H(jω)`; outside AC they carry the DC gain H(0)
+///   instead (a strictly s-domain source is silent there — the parse warns).
 fn stamp_behavioral<T: Field>(
     circuit: &Circuit,
     sys: &mut MnaSystem<T>,
@@ -898,10 +944,29 @@ fn stamp_behavioral<T: Field>(
     t: f64,
     dt: f64,
     runtimes: &[BehavioralRuntime],
+    freq: f64,
 ) -> Result<()> {
     if circuit.behavioral.is_empty() {
         return Ok(());
     }
+    // (real, imag) factors the couplings multiply by. Outside AC a dynamic
+    // form's factor is its DC gain on the real axis; instant forms are 1.
+    let source_factor = |b: &crate::circuit::BehavioralSource| -> (f64, f64) {
+        match &b.abm {
+            Some(abm) if abm.is_dynamic() => {
+                if with_companion {
+                    (abm.dc_gain(), 0.0)
+                } else {
+                    let g = abm.ac_gain(freq);
+                    (g.re, g.im)
+                }
+            }
+            _ => (1.0, 0.0),
+        }
+    };
+    let lift_factor = |g: (f64, f64)| -> T {
+        T::lift(g.0) + T::imag(g.1)
+    };
     let branch = sys.branch;
     // Voltage-flavour sources own branch rows in card order, independent of
     // the current-flavour ones interleaved between them.
@@ -909,15 +974,21 @@ fn stamp_behavioral<T: Field>(
     for (i, b) in circuit.behavioral.iter().enumerate() {
         let empty = BehavioralRuntime::default();
         let runtime = runtimes.get(i).unwrap_or(&empty);
+        let fact: (f64, f64) = source_factor(b);
         let snapshot = behavioral_probe_snapshot(circuit, b, values)?;
         let lin = behavioral_probe_lin(b, &snapshot, t, dt, runtime)?;
-        let constant = lin.f0
+        // The companion constant is real by construction (only the DC/transient
+        // stamp writes `z`, which never carries an imaginary part).
+        let constant = (lin.f0
             - lin
                 .dk
                 .iter()
                 .zip(&snapshot)
                 .map(|(d, x)| d * x)
-                .sum::<f64>();
+                .sum::<f64>())
+            * fact.0;
+        // One Jacobian coefficient scaled into this source's (complex) gain.
+        let dk_factor = |dk: f64| lift_factor((dk * fact.0, dk * fact.1));
 
         match b.kind {
             BehavioralKind::Voltage => {
@@ -930,22 +1001,23 @@ fn stamp_behavioral<T: Field>(
                     if dk == 0.0 {
                         continue;
                     }
+                    let g = dk_factor(dk);
                     match probe {
                         crate::behavior::ProbeBinding::Voltage(p, m) => {
                             if let Some(col) = node_index(*p) {
-                                sys.a[(row, col)] -= T::lift(dk);
+                                sys.a[(row, col)] -= g;
                             }
                             if let Some(col) = node_index(*m) {
-                                sys.a[(row, col)] += T::lift(dk);
+                                sys.a[(row, col)] += g;
                             }
                         }
                         crate::behavior::ProbeBinding::SourceCurrent(idx) => {
                             let col = branch.src_branch(*idx);
-                            sys.a[(row, col)] -= T::lift(dk);
+                            sys.a[(row, col)] -= g;
                         }
                         crate::behavior::ProbeBinding::InductorCurrent(idx) => {
                             let col = branch.ind_branch(*idx);
-                            sys.a[(row, col)] -= T::lift(dk);
+                            sys.a[(row, col)] -= g;
                         }
                         crate::behavior::ProbeBinding::Unresolved(_) => unreachable!(
                             "probes are bound before stamping (resolve_behavioral)"
@@ -966,20 +1038,21 @@ fn stamp_behavioral<T: Field>(
                         if dk == 0.0 {
                             continue;
                         }
+                        let g = dk_factor(dk);
                         match probe {
                             crate::behavior::ProbeBinding::Voltage(p, m) => {
                                 if let Some(col) = node_index(*p) {
-                                    sys.a[(row, col)] += T::lift(dk);
+                                    sys.a[(row, col)] += g;
                                 }
                                 if let Some(col) = node_index(*m) {
-                                    sys.a[(row, col)] -= T::lift(dk);
+                                    sys.a[(row, col)] -= g;
                                 }
                             }
                             crate::behavior::ProbeBinding::SourceCurrent(idx) => {
-                                sys.a[(row, branch.src_branch(*idx))] += T::lift(dk);
+                                sys.a[(row, branch.src_branch(*idx))] += g;
                             }
                             crate::behavior::ProbeBinding::InductorCurrent(idx) => {
-                                sys.a[(row, branch.ind_branch(*idx))] += T::lift(dk);
+                                sys.a[(row, branch.ind_branch(*idx))] += g;
                             }
                             crate::behavior::ProbeBinding::Unresolved(_) => unreachable!(
                                 "probes are bound before stamping (resolve_behavioral)"
@@ -992,20 +1065,21 @@ fn stamp_behavioral<T: Field>(
                         if dk == 0.0 {
                             continue;
                         }
+                        let g = dk_factor(dk);
                         match probe {
                             crate::behavior::ProbeBinding::Voltage(p, m) => {
                                 if let Some(col) = node_index(*p) {
-                                    sys.a[(row, col)] -= T::lift(dk);
+                                    sys.a[(row, col)] -= g;
                                 }
                                 if let Some(col) = node_index(*m) {
-                                    sys.a[(row, col)] += T::lift(dk);
+                                    sys.a[(row, col)] += g;
                                 }
                             }
                             crate::behavior::ProbeBinding::SourceCurrent(idx) => {
-                                sys.a[(row, branch.src_branch(*idx))] -= T::lift(dk);
+                                sys.a[(row, branch.src_branch(*idx))] -= g;
                             }
                             crate::behavior::ProbeBinding::InductorCurrent(idx) => {
-                                sys.a[(row, branch.ind_branch(*idx))] -= T::lift(dk);
+                                sys.a[(row, branch.ind_branch(*idx))] -= g;
                             }
                             crate::behavior::ProbeBinding::Unresolved(_) => unreachable!(
                                 "probes are bound before stamping (resolve_behavioral)"
@@ -1938,6 +2012,9 @@ pub struct BranchCurrents {
     /// Output current of each behavioral source (`n_p → n_n` element
     /// convention; for the voltage flavour, the branch unknown).
     pub behavioral: Vec<f64>,
+    /// Output current of each op-amp (the branch unknown, `out+ → out−`
+    /// element convention).
+    pub opamps: Vec<f64>,
 }
 
 impl BranchCurrents {
@@ -1956,6 +2033,7 @@ impl BranchCurrents {
             ElementFamily::Bjts => Some(&self.bjts),
             ElementFamily::Jfets => Some(&self.jfets),
             ElementFamily::Behavioral => Some(&self.behavioral),
+            ElementFamily::OpAmps => Some(&self.opamps),
         }
     }
 }
@@ -2086,6 +2164,12 @@ pub fn compute_branch_currents(
         }
     }
 
+    // Op-amps: the branch unknown is the output current in the element
+    // convention (out+ → out− through the device), like a V source's.
+    let opamps = circuit.opamps.iter().enumerate().map(|(i, _)| {
+        solution[branch.opamp_branch(i)]
+    }).collect();
+
     Ok(BranchCurrents {
         resistors,
         capacitors,
@@ -2097,6 +2181,7 @@ pub fn compute_branch_currents(
         bjts,
         jfets,
         behavioral,
+        opamps,
     })
 }
 
@@ -2155,8 +2240,14 @@ fn recompute_behavioral_current_reports(
 }
 
 /// State implied by a solved operating point / initial vector: voltages and
-/// currents known, every history term zero (DC steady state).
-pub fn seed_transient_state(circuit: &Circuit, solution: &DVector<f64>) -> TransientState {
+/// currents known, every history term zero (DC steady state). `noise_seed`
+/// is the deck's keyed-draw seed for the behavioral noise terms (`white()`/
+/// `flicker()`), threaded from the parsed netlist.
+pub fn seed_transient_state(
+    circuit: &Circuit,
+    solution: &DVector<f64>,
+    noise_seed: u64,
+) -> TransientState {
     let branch = BranchLayout::for_circuit(circuit);
     let mut state = TransientState {
         capacitor_voltages: circuit
@@ -2231,14 +2322,16 @@ pub fn seed_transient_state(circuit: &Circuit, solution: &DVector<f64>) -> Trans
 
     // Behavioral sources: the runtime module seeds its own history from the
     // DC operating point — `idt` previous values and every `delay` queue's
-    // t = 0 sample. mna only provides the converged operating-point probes.
+    // t = 0 sample. mna only provides the converged operating-point probes;
+    // the keyed noise roll starts from `noise_seed` so the transient's
+    // white()/flicker() draws reproduce the deck's seed exactly.
     state.behavioral = circuit
         .behavioral
         .iter()
         .map(|b| {
             let snapshot = behavioral_probe_snapshot(circuit, b, solution)
                 .unwrap_or_else(|_| vec![0.0; b.behavior.probes.len()]);
-            BehavioralRuntime::seeded(&b.behavior, &snapshot)
+            BehavioralRuntime::seeded(&b.behavior, &snapshot, noise_seed)
         })
         .collect();
     state
@@ -2590,6 +2683,8 @@ pub struct AcBranchCurrents {
     /// complex branch unknown; current flavour: `Σ dk·(probe phasor)` with the
     /// real-difference Jacobian evaluated at the DC bias.
     pub behavioral: Vec<Complex64>,
+    /// Small-signal output current phasor of each op-amp.
+    pub opamps: Vec<Complex64>,
 }
 
 impl AcBranchCurrents {
@@ -2607,6 +2702,7 @@ impl AcBranchCurrents {
             ElementFamily::Bjts => Some(&self.bjts),
             ElementFamily::Jfets => Some(&self.jfets),
             ElementFamily::Behavioral => Some(&self.behavioral),
+            ElementFamily::OpAmps => Some(&self.opamps),
         }
     }
 }
@@ -2809,6 +2905,12 @@ pub fn compute_ac_branch_currents(
         }
     }
 
+    // Op-amps: the output-current phasor is the branch unknown, as for a
+    // VCVS.
+    let opamps = circuit.opamps.iter().enumerate().map(|(i, _)| {
+        solution[branch.opamp_branch(i)]
+    }).collect();
+
     Ok(AcBranchCurrents {
         resistors,
         capacitors,
@@ -2820,6 +2922,7 @@ pub fn compute_ac_branch_currents(
         bjts,
         jfets,
         behavioral,
+        opamps,
     })
 }
 
@@ -2915,7 +3018,7 @@ pub fn initial_guess(circuit: &Circuit) -> DVector<f64> {
     // snapshot keeps the branch rows coupled. Errors here are fine — the
     // caller falls back to a zeroed vector anyway.
     let zero_probes = DVector::zeros(sys.size);
-    let _ = stamp_behavioral(circuit, &mut sys, &zero_probes, true, 0.0, 0.0, &[]);
+    let _ = stamp_behavioral(circuit, &mut sys, &zero_probes, true, 0.0, 0.0, &[], 0.0);
 
     match sys.solve() {
         Ok(x0) => x0,

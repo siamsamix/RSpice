@@ -67,6 +67,10 @@ deepening that has not landed yet.
 - **Step run** — one cell of the `.step` cartesian product. `StepRun` carries the swept values
   and that run's analyses; `SimulationResult.runs` holds them all, with the first mirrored into
   the top-level fields for single-run consumers.
+- **MC draw seed** — the 64-bit `ParamEnv.mc_seed` every keyed draw mixes in: the sweep
+  overrides hashed by `seed_from_overrides`, optionally raised by `.options seed=<n>`
+  (`mix64(overrides ⊕ literal)`, lifted before element lines expand). 0 stays the constant of
+  an unstepped, unseeded deck; a stepped re-parse re-rolls every draw bit-reproducibly.
 - **Measurement** — a `.meas` card parsed into `Measurement`/`MeasKind` and evaluated against
   sample points built from `.tran`/`.dc`/`.ac`/`.op`. A measurement parses once into a compiled
   program — `MeasProgram::compile` → `MeasPart::{Text, Node, NodeDiff, Current}` — and
@@ -77,9 +81,43 @@ deepening that has not landed yet.
 - **Noise analysis (`.noise`)** — output-referred PSD from the adjoint system at each frequency
   (`Aᵀy = e_out`), summing resistor thermal, diode shot/flicker, and MOSFET channel noise;
   input-referred by dividing by |gain|², integrated over the sweep for RMS totals.
+- **Behavioral source** — `Bname n+ n− V=<expr>|I=<expr>`, parsed into `behavior.rs` as a
+  `BExpr` AST plus a probe table (bound once node ids are final; probes never create nodes).
+  History terms (`idt`/`sdt`, `delay`) advance only on accepted steps via `BehavioralRuntime`
+  (`seeded`/`advance`), and keyed noise rolls live beside them (`noise_seed`, `noise_rolls`).
+  The emitted card carries the original expression text verbatim.
+- **ABM source** — PSpice behavioral shapes on `E`/`F`/`G`/`H` (TODO §5): KEYWORD `{expr}` —
+  `VALUE`/`EQUATION` (alias) as an instant transfer, `TABLE` as an AST `BExpr::Table` lookup
+  (linear between sorted pairs, 0 outside the bracketing range), and the dynamic forms
+  `LAPLACE` ({num} {den} in descending powers of s), `FREQ` (`<f, gain[, phase]>` rows
+  interpolated in logarithmic frequency under `MEASURE=DB|RADS|DEGREES`), `CHEBYSHEV`
+  (attenuation `1/(1 + Σ|cᵢ·Tᵢ₊₂(f)|)`). E/H carry the voltage flavour (branch row), G/F the
+  current flavour (+f at out−). Everyone lives in `circuit.behavioral` as a `BehavioralSource`
+  with its `abm: AbmForm`; derive facts live on `AbmForm::{is_dynamic, dc_gain, ac_gain}` and
+  emit re-spells the canonical card (`split_abm`'s keyword+brace shape, so the round trip
+  rides the same dispatch). Braces are grammatical on these cards — the substitution pass
+  skips keyword+brace lines entirely (`params::is_abm_card_line`), parameter folding happens
+  in the card parser.
+- **Keyed noise (`white`/`flicker`)** — B-source pseudo-noise functions (LTspice's noise
+  stimulus): unit draws in `[−1, 1)` keyed by deck seed ⊕ element tag, site, and roll — never
+  by `t` or a probe, so a Newton solve sees a constant. The pacing argument alone re-rolls:
+  a bare `time()` counts accepted steps, any other argument keys on its end-of-step
+  `floor(arg)` (settled in `advance`, one roll per accepted step). `flicker` sums six bands
+  keyed `roll >> o` with amplitude ∝ 1/√f (equal power per octave), normalized to `[−1, 1)`.
 - **Controlled source** — `E`/`F`/`G`/`H` with one control per `POLY(n)` term and a constant
   first coefficient; `E`/`H` add a branch row, `F`/`G` inject a dependent current. Current
   controls read the controlling voltage source's branch unknown (element convention).
+- **Op-amp (`U`)** — `Uname out+ out− in+ in− [model]` (TODO §5; documented interpretation —
+  the reference tools reserve `U` for nothing). One branch row holds the output pair at
+  `gain·(V(in+) − V(in−) + VOS)` — the single-pair-VCVS shape, so one stamp serves DC,
+  transient, and AC. The `.model <name> U(…)` card carries `GAIN` (1e6), `RIN` (∞), `ROUT` (0),
+  `VOS` (0) plus the reserved `DEV/LOT` slot; `RIN`/`ROUT` pull in `1/R` admittance rungs only
+  when finite/non-zero, and a bare `U` resolves to the defaults through
+  `Circuit::opamp_params_at(&model)`. The branch unknown reports as output current (element
+  convention out+ → out−) in `branch_currents.opamps` and the AC phasors; `.op all` annotates
+  `a/v/i/p`. Intended for feedback loops — an open-loop deck solves to the linear overdrive.
+  Vendor `.subckt` opamps keep loading through the `.include` system, and `libs/opamps.lib`
+  also carries `opamp2`, a gm-RC two-pole macromodel built out of G/R/C/E arms.
 - **Switch** — `S` (voltage-controlled) or `W` (current-controlled) with an `SW(RON ROFF VT VH)`
   model, stamped as a conductance and hysteresis-fed by the previous state in transient.
 - **Mutual inductance** — `Kname L1 L2 k`; `M = k√(L1L2)`, stamped as cross terms in the two

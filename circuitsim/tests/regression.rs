@@ -136,6 +136,42 @@ fn bundled_opamp_subckt_gives_the_feedback_gain() {
     assert_relative_eq!(tf.transfer, 10.0, max_relative = 1e-2);
 }
 
+/// The bundled two-pole macromodel (`opamp2` in `libs/opamps.lib`) is the
+/// exact two-pole map its header documents: |H| = A0/|1+jf/f1|·|1+jf/f2|
+/// with f1 = 1/(2π·R1·C1) and f2 = 1/(2π·R2·C2) from the gm-RC chain.
+#[test]
+fn bundled_two_pole_opamp_follows_the_documented_map() {
+    let deck = r#"
+.include opamps.lib
+V1 in 0 DC 0 AC 1
+X1 in 0 out opamp2
+.op
+.ac DEC 1 100 10k
+.end
+"#;
+    let n = parse_with_options(
+        deck,
+        &ParseOptions { deck_dir: None, search_paths: vec![root().join("libs")] },
+    )
+    .unwrap();
+    assert!(n.warnings.is_empty(), "{:?}", n.warnings);
+    let r = run(&n).unwrap();
+    let ac = r.ac.expect("ac result");
+
+    let (f1, f2) = (
+        1.0 / (2.0 * std::f64::consts::PI * 1.0 * 15.9e-3),
+        1.0 / (2.0 * std::f64::consts::PI * 1.0 * 3.979e-6),
+    );
+    let a0 = 1e5;
+    let out = node(&n, "out");
+    for pt in &ac.points {
+        let f = pt.freq;
+        let expect =
+            a0 / ((1.0 + (f / f1) * (f / f1)).sqrt() * (1.0 + (f / f2) * (f / f2)).sqrt());
+        assert_relative_eq!(pt.node_voltages[out].norm(), expect, max_relative = 1e-6);
+    }
+}
+
 #[test]
 fn every_example_deck_parses_and_simulates() {
     let mut seen = 0usize;

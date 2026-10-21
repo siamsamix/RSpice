@@ -5,11 +5,13 @@
 //! near-identical blocks guarded by string-parsing of twelve always-empty
 //! fields) and every tab re-wrote the same element walk with its own copy of
 //! the dB/phase math (twenty loops). One owner each here; the tabs only draw.
+//! The branch-current walk now goes through the simulator's named family
+//! interface (`ElementFamily`), so series are labelled from the deck
+//! (`I(RLOAD)`) instead of a positional guess.
 
-use circuitsim::analysis::{AcPoint, AcResult, DcSweepResult, TranPoint, TranResult};
-use circuitsim::mna::{AcBranchCurrents, BranchCurrents};
-use egui_plot::{Line, PlotPoints, PlotUi};
-use num_complex::Complex64;
+use circuitsim::analysis::{AcResult, DcSweepResult, TranResult};
+use circuitsim::circuit::{Circuit, ElementFamily, CURRENT_FAMILIES};
+use egui_plot::{Legend, Line, Plot, PlotPoints, PlotUi};
 
 use crate::theme::PLOT_COLORS;
 
@@ -29,7 +31,6 @@ pub struct Bounds {
     pub y_min: Option<f64>,
     pub y_max: Option<f64>,
 }
-
 impl Bounds {
     /// Clear to auto-fit (the "Auto Fit" button).
     pub fn reset(&mut self) {
@@ -121,6 +122,113 @@ pub fn apply_bounds(plot_ui: &mut PlotUi, bounds: &Bounds) {
     ));
 }
 
+/// One standard result-tab plot: axis labels, legend, scroll/drag/zoom
+/// gestures, the one-time bounds application and the series draw were the
+/// same nine lines chained at every tab — the caller now passes only the
+/// plot's identity, height, labels, series and optional bounds.
+pub fn plot_frame(
+    name: &str,
+    height: f32,
+    x_label: &str,
+    y_label: &str,
+    series: &[PlotSeries],
+    apply: Option<Bounds>,
+    ui: &mut egui::Ui,
+) {
+    let plot = Plot::new(name)
+        .height(height)
+        .x_axis_label(x_label)
+        .y_axis_label(y_label)
+        .y_axis_min_width(50.0)
+        .legend(Legend::default().position(egui_plot::Corner::RightTop))
+        .show_background(true)
+        .allow_scroll(true)
+        .allow_drag(true)
+        .allow_boxed_zoom(true);
+    plot.show(ui, |plot_ui| {
+        if let Some(bounds) = apply {
+            apply_bounds(plot_ui, &bounds);
+        }
+        draw(plot_ui, series, 2.0);
+    });
+}
+
+/// X scale of the AC panels, decided by the dB/Linear toggle.
+///
+/// (Moved here from app.rs — it is plot-layer vocabulary, and the cursor
+/// plumbing below is the only place that needs to know what "dB" means.)
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum AcMagScale { #[default] Db, Linear }
+
+/// The hover-label text of one AC panel.
+pub enum AcCursor {
+    /// `{name}\nf = … Hz\n{quantity} = …` with the panel's quantity label.
+    Quantity(String),
+    /// `{name}\nf = … Hz\nphase = …°`.
+    Phase,
+}
+
+/// One AC panel: the standard [frame][`plot_frame`] plus the frequency
+/// cursor plumbing all four panels share — dB mode draws log-spaced grid
+/// lines (and, on quantity plots, engineering-notation Hz ticks), linear
+/// mode plain ticks, and the hover label resolves the axis value (a
+/// `log10` exponent in dB mode) back to Hz before printing.
+pub fn ac_plot_frame(
+    name: &str,
+    height: f32,
+    scale: AcMagScale,
+    cursor: AcCursor,
+    y_label: &str,
+    series: &[PlotSeries],
+    apply: Option<Bounds>,
+    ui: &mut egui::Ui,
+) {
+    let mut plot = Plot::new(name)
+        .height(height)
+        .x_axis_label("frequency (Hz)")
+        .y_axis_label(y_label)
+        .y_axis_min_width(50.0)
+        .legend(Legend::default().position(egui_plot::Corner::RightTop))
+        .show_background(true)
+        .allow_scroll(true)
+        .allow_drag(true)
+        .allow_boxed_zoom(true);
+
+    if scale == AcMagScale::Db {
+        plot = plot.x_grid_spacer(egui_plot::log_grid_spacer(10));
+    }
+    if let AcCursor::Quantity(_) = cursor {
+        let frequency_of = |x: f64| match scale {
+            AcMagScale::Db => 10.0_f64.powf(x),
+            AcMagScale::Linear => x,
+        };
+        plot = plot.x_axis_formatter(move |mark, _range| {
+            let f = frequency_of(mark.value);
+            if f >= 1e9 { format!("{:.1} G", f / 1e9) }
+            else if f >= 1e6 { format!("{:.1} M", f / 1e6) }
+            else if f >= 1e3 { format!("{:.1} k", f / 1e3) }
+            else { format!("{:.1}", f) }
+        });
+    }
+    let plot = plot.label_formatter(move |name, val| {
+        if name.is_empty() { return String::new(); }
+        let f = match scale {
+            AcMagScale::Db => 10.0_f64.powf(val.x),
+            AcMagScale::Linear => val.x,
+        };
+        match &cursor {
+            AcCursor::Quantity(q) => format!("{name}\nf = {f:.3e} Hz\n{q} = {:.3e}", val.y),
+            AcCursor::Phase => format!("{name}\nf = {f:.3e} Hz\nphase = {:.2}°", val.y),
+        }
+    });
+    plot.show(ui, |plot_ui| {
+        if let Some(bounds) = apply {
+            apply_bounds(plot_ui, &bounds);
+        }
+        draw(plot_ui, series, 2.0);
+    });
+}
+
 /// Draw a batch of series in legend order.
 pub fn draw(plot_ui: &mut PlotUi, series: &[PlotSeries], width: f32) {
     for s in series {
@@ -193,85 +301,56 @@ pub fn tran_diff_series(
     }]
 }
 
-/// One branch family of the element walk; the M/I families completed the
-/// original R, C, L, V, D set.
-#[derive(Clone, Copy)]
-enum TranFamily {
-    Resistors,
-    Capacitors,
-    Inductors,
-    VoltageSources,
-    Diodes,
-    Mosfets,
-    CurrentSources,
+/// Labels for one family's report slots: the deck's element names, with the
+/// family letter + index as the fallback when a report outgrows the list.
+fn family_labels(circuit: &Circuit, family: ElementFamily, count: usize) -> Vec<String> {
+    let names = circuit.element_names(family);
+    (0..count)
+        .map(|i| {
+            names
+                .get(i)
+                .cloned()
+                .unwrap_or_else(|| format!("{}{}", family.letter(), i + 1))
+        })
+        .collect()
 }
 
-impl TranFamily {
-    fn letter(self) -> &'static str {
-        match self {
-            Self::Resistors => "R",
-            Self::Capacitors => "C",
-            Self::Inductors => "L",
-            Self::VoltageSources => "V",
-            Self::Diodes => "D",
-            Self::Mosfets => "M",
-            Self::CurrentSources => "I",
-        }
-    }
-
-    fn count(self, b: &BranchCurrents) -> usize {
-        match self {
-            Self::Resistors => b.resistors.len(),
-            Self::Capacitors => b.capacitors.len(),
-            Self::Inductors => b.inductors.len(),
-            Self::VoltageSources => b.voltage_sources.len(),
-            Self::Diodes => b.diodes.len(),
-            Self::Mosfets => b.mosfets.len(),
-            Self::CurrentSources => b.current_sources.len(),
-        }
-    }
-
-    fn value(self, b: &BranchCurrents, i: usize) -> f64 {
-        match self {
-            Self::Resistors => b.resistors.get(i).copied().unwrap_or_default(),
-            Self::Capacitors => b.capacitors.get(i).copied().unwrap_or_default(),
-            Self::Inductors => b.inductors.get(i).copied().unwrap_or_default(),
-            Self::VoltageSources => b.voltage_sources.get(i).copied().unwrap_or_default(),
-            Self::Diodes => b.diodes.get(i).copied().unwrap_or_default(),
-            Self::Mosfets => b.mosfets.get(i).copied().unwrap_or_default(),
-            Self::CurrentSources => b.current_sources.get(i).copied().unwrap_or_default(),
-        }
-    }
-}
-
-const TRAN_FAMILY_ORDER: [TranFamily; 7] = [
-    TranFamily::Resistors,
-    TranFamily::Capacitors,
-    TranFamily::Inductors,
-    TranFamily::VoltageSources,
-    TranFamily::Diodes,
-    TranFamily::Mosfets,
-    TranFamily::CurrentSources,
-];
-
-/// All transient branch series in canonical legend order R, C, L, V, D, M, I —
-/// the one element walk that replaced a copy per tab.
-pub fn tran_current_series(tran: &TranResult, x_mult: f64, y_mult: f64) -> Vec<PlotSeries> {
-    let points: &[TranPoint] = &tran.points;
+/// All transient branch series in canonical family order — the one element
+/// walk every tab shares. Series are labelled from the deck's element names
+/// (`I(RLOAD)`, `Ic(Q1)`), not a positional guess.
+pub fn tran_current_series(
+    tran: &TranResult,
+    circuit: &Circuit,
+    x_mult: f64,
+    y_mult: f64,
+) -> Vec<PlotSeries> {
+    let points = &tran.points;
     let mut out = Vec::new();
     let mut color_idx = 0usize;
-
-    for family in TRAN_FAMILY_ORDER {
-        for i in 0..points.first().map(|p| family.count(&p.branch_currents)).unwrap_or(0) {
-            out.push(PlotSeries {
-                name: format!("I({}{})", family.letter(), i + 1),
-                color: PLOT_COLORS[color_idx % PLOT_COLORS.len()],
-                points: points
-                    .iter()
-                    .map(|p| [p.time * x_mult, family.value(&p.branch_currents, i) * y_mult])
-                    .collect(),
-            });
-            color_idx += 1;
+    if let Some(first) = points.first() {
+        for family in CURRENT_FAMILIES {
+            let count = first.branch_currents.slice(family).unwrap_or(&[]).len();
+            if count == 0 {
+                continue;
+            }
+            for (i, label) in family_labels(circuit, family, count).into_iter().enumerate() {
+                out.push(PlotSeries {
+                    name: format!("{}({label})", family.probe_prefix()),
+                    color: PLOT_COLORS[color_idx % PLOT_COLORS.len()],
+                    points: points
+                        .iter()
+                        .map(|p| {
+                            let cur = p
+                                .branch_currents
+                                .slice(family)
+                                .and_then(|s| s.get(i).copied())
+                                .unwrap_or_default();
+                            [p.time * x_mult, cur * y_mult]
+                        })
+                        .collect(),
+                });
+                color_idx += 1;
+            }
         }
     }
     out
@@ -342,102 +421,52 @@ pub fn ac_voltage_series(
     out
 }
 
-/// One AC branch family; M/I close the set behind the original five.
-#[derive(Clone, Copy)]
-enum AcFamily {
-    Resistors,
-    Capacitors,
-    Inductors,
-    VoltageSources,
-    Diodes,
-    Mosfets,
-    CurrentSources,
-}
-
-impl AcFamily {
-    fn letter(self) -> &'static str {
-        match self {
-            Self::Resistors => "R",
-            Self::Capacitors => "C",
-            Self::Inductors => "L",
-            Self::VoltageSources => "V",
-            Self::Diodes => "D",
-            Self::Mosfets => "M",
-            Self::CurrentSources => "I",
-        }
-    }
-
-    fn count(self, b: &AcBranchCurrents) -> usize {
-        match self {
-            Self::Resistors => b.resistors.len(),
-            Self::Capacitors => b.capacitors.len(),
-            Self::Inductors => b.inductors.len(),
-            Self::VoltageSources => b.voltage_sources.len(),
-            Self::Diodes => b.diodes.len(),
-            Self::Mosfets => b.mosfets.len(),
-            Self::CurrentSources => b.current_sources.len(),
-        }
-    }
-
-    fn value(self, b: &AcBranchCurrents, i: usize) -> Complex64 {
-        match self {
-            Self::Resistors => b.resistors.get(i).copied().unwrap_or_default(),
-            Self::Capacitors => b.capacitors.get(i).copied().unwrap_or_default(),
-            Self::Inductors => b.inductors.get(i).copied().unwrap_or_default(),
-            Self::VoltageSources => b.voltage_sources.get(i).copied().unwrap_or_default(),
-            Self::Diodes => b.diodes.get(i).copied().unwrap_or_default(),
-            Self::Mosfets => b.mosfets.get(i).copied().unwrap_or_default(),
-            Self::CurrentSources => b.current_sources.get(i).copied().unwrap_or_default(),
-        }
-    }
-}
-
-const AC_FAMILY_ORDER: [AcFamily; 7] = [
-    AcFamily::Resistors,
-    AcFamily::Capacitors,
-    AcFamily::Inductors,
-    AcFamily::VoltageSources,
-    AcFamily::Diodes,
-    AcFamily::Mosfets,
-    AcFamily::CurrentSources,
-];
-
-/// All AC branch series in canonical legend order R, C, L, V, D, M, I — both
-/// the dB and the phase plot walk this once instead of loops per tab.
+/// All AC branch series in canonical family order — the dB and the phase plot
+/// walk this once. Series are labelled from the deck's element names.
 pub fn ac_current_series(
     ac: &AcResult,
+    circuit: &Circuit,
     qty: AcQuantity,
     x_mult: f64,
     y_mult: f64,
     log_x: bool,
 ) -> Vec<PlotSeries> {
-    let points: &[AcPoint] = &ac.points;
+    let points = &ac.points;
     let mut out = Vec::new();
     let mut color_idx = 0usize;
-
     let suffix = match qty {
         AcQuantity::Phase => " phase",
         _ => "",
     };
-    for family in AC_FAMILY_ORDER {
-        for i in 0..points.first().map(|p| family.count(&p.branch_currents)).unwrap_or(0) {
-            out.push(PlotSeries {
-                name: format!("I({}{}){suffix}", family.letter(), i + 1),
-                color: PLOT_COLORS[color_idx % PLOT_COLORS.len()],
-                points: points
-                    .iter()
-                    .map(|p| {
-                        let v = family.value(&p.branch_currents, i);
-                        let y = match qty {
-                            AcQuantity::MagnitudeDb => to_db(v.norm()) * y_mult,
-                            AcQuantity::MagnitudeLinear => v.norm() * y_mult,
-                            AcQuantity::Phase => v.arg().to_degrees() * y_mult,
-                        };
-                        [ac_x(p.freq, x_mult, log_x), y]
-                    })
-                    .collect(),
-            });
-            color_idx += 1;
+    if let Some(first) = points.first() {
+        for family in CURRENT_FAMILIES {
+            let count = first.branch_currents.slice(family).unwrap_or(&[]).len();
+            if count == 0 {
+                continue;
+            }
+            for (i, label) in family_labels(circuit, family, count).into_iter().enumerate() {
+                out.push(PlotSeries {
+                    name: format!("{}({label}){suffix}", family.probe_prefix()),
+                    color: PLOT_COLORS[color_idx % PLOT_COLORS.len()],
+                    points: points
+                        .iter()
+                        .map(|p| {
+                            let v = p
+                                .branch_currents
+                                .slice(family)
+                                .and_then(|s| s.get(i).copied())
+                                .unwrap_or_default();
+                            let y = match qty {
+                                AcQuantity::MagnitudeDb => to_db(v.norm()) * y_mult,
+                                AcQuantity::MagnitudeLinear => v.norm() * y_mult,
+                                AcQuantity::Phase => v.arg().to_degrees() * y_mult,
+                            };
+                            [ac_x(p.freq, x_mult, log_x), y]
+                        })
+                        .collect(),
+                });
+                color_idx += 1;
+            }
         }
     }
     out
@@ -475,4 +504,3 @@ pub fn dc_sweep_series(
     }
     out
 }
-

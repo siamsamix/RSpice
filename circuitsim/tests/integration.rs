@@ -679,6 +679,84 @@ C1 out 0 1u
     assert_relative_eq!(get("vfind").value.unwrap(), 2.5, epsilon = 1e-3);
 }
 
+/// `I(Q1)` resolves like every other family: the one probe lookup walks the
+/// BJT family too. (The old `.meas`-private copy of the current report was
+/// written before the BJT existed and never gained `bjts`, so a BJT deck
+/// could not be measured at all.)
+#[test]
+fn measurement_resolves_bjt_collector_current() {
+    let netlist = parse(
+        r#"
+.model npnq NPN(IS=1e-14 BF=100)
+Vb b 0 DC 0.7
+Q1 c b 0 npnq
+V1 vc 0 DC 3
+R1 vc c 1k
+.meas op irc max I(R1)
+.meas op iq max I(Q1)
+.meas op iq2 max 2*I(Q1)
+.op
+.end
+"#,
+    )
+    .unwrap();
+    let r = run(&netlist).unwrap();
+    let get = |name: &str| {
+        r.measurements
+            .iter()
+            .find(|m| m.name == name)
+            .unwrap_or_else(|| panic!("measurement {name} missing"))
+            .clone()
+    };
+    // KCL at the collector node: the series resistor carries exactly the
+    // element's collector current, whichever way the model equations land.
+    let irc = get("irc").value.expect("I(R1) measured");
+    let iq = get("iq").value.expect("I(Q1) compiled and measured");
+    assert_relative_eq!(irc, iq, max_relative = 1e-9);
+    let iq2 = get("iq2").value.expect("I(Q1) measured inside arithmetic");
+    assert_relative_eq!(iq2, 2.0 * iq, max_relative = 1e-9);
+}
+
+/// `.meas` expressions evaluate through the deck's `.func` table — the
+/// environment a measurement used to build dropped `funcs`, so user
+/// functions were unreachable exactly where decks want them.
+#[test]
+fn measurement_expressions_call_user_funcs() {
+    let netlist = parse(
+        r#"
+.func twice(x) {2*x}
+.func scale(a, b) {a*b}
+V1 in 0 DC 2
+R1 in out 1k
+R2 out 0 1k
+.meas op doubled max twice(V(out))
+.meas op scaled max scale(twice(V(out)),3)
+.op
+.end
+"#,
+    )
+    .unwrap();
+    let r = run(&netlist).unwrap();
+    let get = |name: &str| {
+        r.measurements
+            .iter()
+            .find(|m| m.name == name)
+            .unwrap_or_else(|| panic!("measurement {name} missing"))
+            .clone()
+    };
+    // The divider halves the 2 V source; `twice` puts it back.
+    assert_relative_eq!(
+        get("doubled").value.expect("twice(V(out)) evaluated"),
+        2.0,
+        epsilon = 1e-12
+    );
+    assert_relative_eq!(
+        get("scaled").value.expect("scale(twice(V(out)),3) evaluated"),
+        6.0,
+        epsilon = 1e-12
+    );
+}
+
 #[test]
 fn four_decomposes_a_sine_wave() {
     let netlist = r#"

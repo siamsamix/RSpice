@@ -6,9 +6,11 @@ deepening that has not landed yet.
 
 ## Circuit language
 
-- **Netlist** — SPICE-style text: element lines, directives (`.op` `.dc` `.tran` `.ac` `.model` `.param` `.func`), ends with `.end`. `*` comments only at line start, `;` inline, `+` continues the previous line. Parsed into a `Netlist` (`Circuit` + `AnalysisCommands` + `source` + `params`) by `netlist.rs`. The same text is both the GUI editor's content and what `.cir` files carry; the `source` field is kept so `.dc` sweeps of a parameter can re-read the deck.
+- **Netlist** — SPICE-style text: element lines, directives (`.op` `.dc` `.tran` `.ac` `.model` `.param` `.func`), ends with `.end`. `*` comments only at line start, `;` inline, `+` continues the previous line. Parsed into a `Netlist` (`Circuit` + `AnalysisCommands` + `source` + `params` + `funcs` + `mc_seed` + `options`/`overrides`) by the `netlist/` module family: `mod.rs` holds the vocabulary and the parse/emit pipeline, and every card family lives in its own module with its parse and its emit co-located (`elements`, `models`, `dotcards`, `waveforms`, `subckts`, `imports`, `nodeplan`) — a card's grammar is one file, not parse here emit there. `Netlist::param_env()` seeds the deck's parameter/function environment, so a run and its re-parses share one env; `mc_seed` travels on the deck for reproducible Monte Carlo.
+- **Source value (bridge)** — the value of a `V`/`I` card (`DC 5`, `AC 1 30`, `PULSE(…)`), typed as `netlist::SourceValue` with the round trip `parse_source_value` / `emit_source_value` at the tail of `netlist/mod.rs`. Frontends edit and display source values through this bridge, so whatever a GUI writes back is text the deck parser reads identically; the writer prints canonical decimal (no SPICE suffixes), which always re-parses to the same number.
 - **Netlist.warnings** — best-effort import diagnostics, never fatal: unknown directives (echoed with their arguments), unsupported element letters, stray `.endl` markers, unknown `.model` parameters. A third-party deck imports and simulates with warnings surfaced in both front-ends; ordering follows the parse pipeline (flatten first, card walk second).
 - **Element** — one component line. The first letter names the kind: `R` resistor, `C` capacitor, `L` inductor, `V` voltage source, `I` independent current source, `D` diode, `M` MOSFET. `X` is now also a kind: subcircuit instantiation (unmarshalled at parse time into its body's elements — `Circuit` never sees an `X`).
+- **Element family** — `ElementFamily`, the *named kind* of an element; `CURRENT_FAMILIES` fixes the canonical order `R C L V D M Q J I B`. Builders and report walkers name families instead of pattern-matching raw structs, and the frontends hold the `Circuit` itself — adding a device letter means one family + its model, not edits scattered across screens and tabs.
 - **Subckt definition** — a `.subckt name p1 p2 … / … / .ends` block, collected before any card walk (`collect_subckts`) so bodies may be referenced before their text appears. The header carries default parameters after the ports (`name a b PARAMS: rr=1k` and bare `key=value` forms both accepted); the body may nest definitions and `.param`/`.func` cards.
 - **Subcircuit instance (X line)** — `XName p1 … pn defname key=value …`: the port tokens bind to the caller's nets (not mangled), the trailing assignments override the defaults and may reference the parent env, and instance keys beat a body `.param` card re-assigning the same name (the reference tools' `PARAMS=` precedence).
 - **Mangling (instance path)** — flattening rewrites a body's internal nets and element names to the instance path (`X1.mid`, `X1.R1`, nested `X1.X2.mid`), so two instances of one definition never share a net or a branch-report slot. `.global` nets, `gnd` and `0` never mangle; `element_letter` reads the kind from the segment after the last dot.
@@ -39,16 +41,20 @@ deepening that has not landed yet.
 
 ## GUI language
 
-- **Schematic** — the grid-drawn circuit in the egui app; convertible to and from netlist text. Node numbering comes from a union-find over grid connectivity — one implementation, shared by the writer and the painter (cut #3).
+- **Schematic** — the grid-drawn circuit in the egui app. `schematic.rs` owns the editor's state machine — `SchematicState` with its mutations (place by tool, rotate with wire re-attach, drag with wire stretch, wire open/close, select, cancel, deletes) and both deck conversions: `build_netlist` (schematic → `Netlist` through the shared value grammar) and `from_netlist` (deck → schematic through the one `parse`, drawing `R C L V` and counting the rest instead of dropping them). The canvas computes pointer geometry and asks the module to mutate. Node numbering comes from a union-find over grid connectivity — one implementation, shared by the writer and the painter.
 - **Element kind / CompKind** — the GUI enum paralleling element letters; import draws `R C L V` and counts the rest (`D`/`M`/`I` have no symbol yet) instead of dropping silently.
-- **Plot series / PlotState** — the tab plotting adapter (cut #6): typed bounds state replacing the stringly scale fields, one `apply_bounds`, one element→series interface used by all tabs (current families in canonical order R, C, L, V, D, M, I). dB/phase math is GUI-internal, computed once, not re-derived per tab.
+- **Plot series / PlotState** — the tab plotting adapter: typed bounds state replacing the stringly scale fields, one `apply_bounds`, one element→series interface used by all tabs. Every result tab draws through `plot_frame` (axis labels, legend, gestures, the one-time bounds apply), and the four AC panels share `ac_plot_frame` with the frequency-cursor plumbing — log grid and 10ˣ→Hz hover labels in dB mode, plain ticks in linear mode; `AcMagScale` (default `Db`) and `AcCursor` live beside it. dB/phase math is GUI-internal, computed once, not re-derived per tab.
 - **Tabs** — Overview, DC (operating point; `.dc` sweep as a plot when flat, a table when nested), Waveforms (Voltage / Current / Differential), Frequency (magnitude / phase / branch plots).
 
 ## Roadmap language
 
 - **Integration method** — how `.tran` discretizes time: `Trapezoidal` (default), `Gear1`
   (backward Euler), `Gear2` (BDF2, variable-step coefficients). Selected through
-  `.options method=…`; the companion stamps and the state history live in `mna.rs`.
+  `.options method=…`. The integrator owns its companion models in one place (`mna.rs`):
+  `Companion` (α/β₁/β₂/γ per method) is built by `Companion::for_step` — the only remaining
+  `match method` — and `derivative(k, new, prev, older, &history)` is the one history consumer;
+  `BehavioralRuntime` owns its own delay-queue history advance (`seeded`/`advance`), with
+  `MAX_DELAY_SAMPLES` living beside the queue law it caps.
 - **Adaptive step / LTE** — the transient controller doubles each proposed step and compares
   the full-step solution with the two-half-step one; the normalized difference is the local
   truncation error, accepted under `reltol`/`vntol`/`abstol`. Source edges and print-grid
@@ -62,8 +68,11 @@ deepening that has not landed yet.
   and that run's analyses; `SimulationResult.runs` holds them all, with the first mirrored into
   the top-level fields for single-run consumers.
 - **Measurement** — a `.meas` card parsed into `Measurement`/`MeasKind` and evaluated against
-  sample points built from `.tran`/`.dc`/`.ac`/`.op`; probe operands (`V(n)`, `I(el)`) are
-  substituted per sample and the rest evaluates through the parameter grammar. Failures are
+  sample points built from `.tran`/`.dc`/`.ac`/`.op`. A measurement parses once into a compiled
+  program — `MeasProgram::compile` → `MeasPart::{Text, Node, NodeDiff, Current}` — and
+  re-evaluates per sample: probes (`V(n)`, `I(el)`) become per-sample values (`MeasSample`,
+  carrying `currents: BranchCurrents`; AC magnitudes collapse through `collapse_ac` in one
+  place) and the rest evaluates through the parameter grammar. Failures are
   reported per measurement, never fatal.
 - **Noise analysis (`.noise`)** — output-referred PSD from the adjoint system at each frequency
   (`Aᵀy = e_out`), summing resistor thermal, diode shot/flicker, and MOSFET channel noise;

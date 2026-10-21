@@ -6,6 +6,7 @@ use clap::{Parser, ValueEnum};
 use circuitsim::{
     run, Circuit, DcSweepPoint, MeasureResult, Netlist, ParseOptions, SimError, SimulationResult,
 };
+use circuitsim::circuit::CURRENT_FAMILIES;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum AnalysisKind {
@@ -297,11 +298,9 @@ fn print_dc_sweep(report: &mut String, netlist: &Netlist, result: &SimulationRes
         sweep.points.len(),
         sweep.targets.join(", ")
     );
-    let n = sweep
-        .points
-        .first()
-        .map(|p| p.node_voltages.len())
-        .unwrap_or(0);
+    // Node voltages are indexed by node id — the deck's node table is the
+    // count (post-compaction the arrays are `circuit.nodes` long).
+    let n = net.nodes;
     let mut header = String::new();
     for t in &sweep.targets {
         let _ = write!(header, "{t:>14}");
@@ -484,8 +483,8 @@ fn print_runs(report: &mut String, netlist: &Netlist, result: &SimulationResult)
         "  {:>3}  {:<24} {}",
         "#",
         result.step_targets.join(", "),
-        if let Some(first) = result.runs.first().and_then(|r| r.dc.as_ref()) {
-            format!("V({})", node_label(&netlist.circuit, first.node_voltages.len().saturating_sub(1)))
+        if result.runs.first().is_some_and(|r| r.dc.is_some()) {
+            format!("V({})", node_label(&netlist.circuit, netlist.circuit.nodes.saturating_sub(1)))
         } else {
             String::new()
         }
@@ -512,11 +511,7 @@ fn csv_body(netlist: &Netlist, result: &SimulationResult) -> String {
     let mut out = String::new();
     if let Some(tran) = &result.tran {
         let net = &netlist.circuit;
-        let n = tran
-            .points
-            .first()
-            .map(|p| p.node_voltages.len())
-            .unwrap_or(0);
+        let n = net.nodes;
         out.push_str("time");
         for i in 0..n {
             let _ = write!(out, ",V({})", node_label(net, i));
@@ -533,11 +528,7 @@ fn csv_body(netlist: &Netlist, result: &SimulationResult) -> String {
     }
     if let Some(sweep) = &result.dc_sweep {
         let net = &netlist.circuit;
-        let n = sweep
-            .points
-            .first()
-            .map(|p| p.node_voltages.len())
-            .unwrap_or(0);
+        let n = net.nodes;
         let mut header = sweep.targets.clone();
         for i in 1..n {
             header.push(format!("V({})", node_label(net, i)));
@@ -560,7 +551,8 @@ fn csv_body(netlist: &Netlist, result: &SimulationResult) -> String {
 }
 
 /// Full export surface: every node voltage and element current, with AC
-/// magnitude/phase when that is the only result.
+/// magnitude/phase when that is the only result. The element walk follows the
+/// simulator's canonical family order, labelled from the deck.
 fn waveform_csv(netlist: &Netlist, result: &SimulationResult) -> String {
     let net = &netlist.circuit;
     let mut out = String::new();
@@ -569,35 +561,10 @@ fn waveform_csv(netlist: &Netlist, result: &SimulationResult) -> String {
         for i in 0..net.nodes {
             let _ = write!(out, ",V({})", node_label(net, i));
         }
-        for r in &net.resistors {
-            let _ = write!(out, ",I({})", r.name);
-        }
-        for c in &net.capacitors {
-            let _ = write!(out, ",I({})", c.name);
-        }
-        for l in &net.inductors {
-            let _ = write!(out, ",I({})", l.name);
-        }
-        for v in &net.voltage_sources {
-            let _ = write!(out, ",I({})", v.name);
-        }
-        for i in &net.current_sources {
-            let _ = write!(out, ",I({})", i.name);
-        }
-        for b in &net.behavioral {
-            let _ = write!(out, ",I({})", b.name);
-        }
-        for d in &net.diodes {
-            let _ = write!(out, ",I({})", d.name);
-        }
-        for m in &net.mosfets {
-            let _ = write!(out, ",I({})", m.name);
-        }
-        for j in &net.jfets {
-            let _ = write!(out, ",Id({})", j.name);
-        }
-        for q in &net.bjts {
-            let _ = write!(out, ",Ic({})", q.name);
+        for family in CURRENT_FAMILIES {
+            for name in net.element_names(family) {
+                let _ = write!(out, ",{}({})", family.probe_prefix(), name);
+            }
         }
         out.push('\n');
         for pt in &tran.points {
@@ -605,35 +572,10 @@ fn waveform_csv(netlist: &Netlist, result: &SimulationResult) -> String {
             for v in &pt.node_voltages {
                 let _ = write!(out, ",{v:.9e}");
             }
-            for v in &pt.branch_currents.resistors {
-                let _ = write!(out, ",{v:.9e}");
-            }
-            for v in &pt.branch_currents.capacitors {
-                let _ = write!(out, ",{v:.9e}");
-            }
-            for v in &pt.branch_currents.inductors {
-                let _ = write!(out, ",{v:.9e}");
-            }
-            for v in &pt.branch_currents.voltage_sources {
-                let _ = write!(out, ",{v:.9e}");
-            }
-            for v in &pt.branch_currents.current_sources {
-                let _ = write!(out, ",{v:.9e}");
-            }
-            for v in &pt.branch_currents.behavioral {
-                let _ = write!(out, ",{v:.9e}");
-            }
-            for v in &pt.branch_currents.diodes {
-                let _ = write!(out, ",{v:.9e}");
-            }
-            for v in &pt.branch_currents.mosfets {
-                let _ = write!(out, ",{v:.9e}");
-            }
-            for v in &pt.branch_currents.jfets {
-                let _ = write!(out, ",{v:.9e}");
-            }
-            for v in &pt.branch_currents.bjts {
-                let _ = write!(out, ",{v:.9e}");
+            for family in CURRENT_FAMILIES {
+                for v in pt.branch_currents.slice(family).unwrap_or(&[]) {
+                    let _ = write!(out, ",{v:.9e}");
+                }
             }
             out.push('\n');
         }

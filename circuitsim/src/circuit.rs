@@ -707,6 +707,87 @@ impl CurrentSource {
     }
 }
 
+// ─── Element families (the named lookup interface) ──────────────────────────
+
+/// The element kinds that carry a branch-current report, in the canonical
+/// legend order R C L V D M Q J I B (see `CONTEXT.md`). One variant here
+/// corresponds to one `Vec` in the report structures, and every consumer —
+/// plots, CSV, `.meas` probes — walks the same list instead of re-spelling
+/// the family walk per file.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ElementFamily {
+    Resistors,
+    Capacitors,
+    Inductors,
+    VoltageSources,
+    Diodes,
+    Mosfets,
+    Bjts,
+    Jfets,
+    CurrentSources,
+    Behavioral,
+}
+
+/// Canonical family order: the glossary's R, C, L, V, D, M, I with the
+/// three-terminal and behavioral families appended where those devices
+/// landed.
+pub const CURRENT_FAMILIES: [ElementFamily; 10] = [
+    ElementFamily::Resistors,
+    ElementFamily::Capacitors,
+    ElementFamily::Inductors,
+    ElementFamily::VoltageSources,
+    ElementFamily::Diodes,
+    ElementFamily::Mosfets,
+    ElementFamily::Bjts,
+    ElementFamily::Jfets,
+    ElementFamily::CurrentSources,
+    ElementFamily::Behavioral,
+];
+
+impl ElementFamily {
+    /// The element letter the family is spoken with (label fallbacks).
+    pub fn letter(self) -> &'static str {
+        match self {
+            Self::Resistors => "R",
+            Self::Capacitors => "C",
+            Self::Inductors => "L",
+            Self::VoltageSources => "V",
+            Self::Diodes => "D",
+            Self::Mosfets => "M",
+            Self::Bjts => "Q",
+            Self::Jfets => "J",
+            Self::CurrentSources => "I",
+            Self::Behavioral => "B",
+        }
+    }
+
+    /// The probe symbol printed before the name: `I(name)`, with the
+    /// reference tools' `Ic`/`Id` spellings for the three-terminal devices.
+    pub fn probe_prefix(self) -> &'static str {
+        match self {
+            Self::Bjts => "Ic",
+            Self::Jfets => "Id",
+            _ => "I",
+        }
+    }
+
+    /// Human family word for error messages.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Resistors => "resistor",
+            Self::Capacitors => "capacitor",
+            Self::Inductors => "inductor",
+            Self::VoltageSources => "voltage source",
+            Self::Diodes => "diode",
+            Self::Mosfets => "MOSFET",
+            Self::Bjts => "BJT",
+            Self::Jfets => "JFET",
+            Self::CurrentSources => "current source",
+            Self::Behavioral => "behavioral source",
+        }
+    }
+}
+
 // ─── Circuit ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, Default)]
@@ -1302,20 +1383,6 @@ impl Circuit {
         self.nodes = used.len();
     }
 
-    pub fn tran_matrix_size(&self) -> usize {
-        let n = self.nodes.saturating_sub(1);
-        n + self.voltage_sources.len()
-            + self.inductors.len()
-            + self.vcvs.len()
-            + self.ccvs.len()
-            // Only voltage-flavour B sources carry a branch row.
-            + self
-                .behavioral
-                .iter()
-                .filter(|b| b.kind == BehavioralKind::Voltage)
-                .count()
-    }
-
     // ─── Behavioral probe binding ────────────────────────────────────────
 
     /// Bind the probes of every behavioral source against the final node
@@ -1330,16 +1397,15 @@ impl Circuit {
         if self.behavioral.is_empty() {
             return Ok(());
         }
-        let node_names: Vec<String> = self.node_names.clone();
         for i in 0..self.behavioral.len() {
             let card = self.behavioral[i].name.clone();
             let mut probes = std::mem::take(&mut self.behavioral[i].behavior.probes);
             for probe in probes.iter_mut() {
                 match probe {
                     ProbeBinding::Unresolved(ProbeSpec::Voltage(a, b)) => {
-                        let plus = self.probe_node_id(a, &card, &node_names)?;
+                        let plus = self.probe_node_id(a, &card)?;
                         let minus = match b {
-                            Some(name) => self.probe_node_id(name, &card, &node_names)?,
+                            Some(name) => self.probe_node_id(name, &card)?,
                             None => NodeId(0),
                         };
                         *probe = ProbeBinding::Voltage(plus, minus);
@@ -1357,23 +1423,14 @@ impl Circuit {
 
     /// Resolve one probe node name: exact (case-insensitive) first, then the
     /// probe spelled without its instance path.
-    fn probe_node_id(
-        &self,
-        token: &str,
-        card: &str,
-        node_names: &[String],
-    ) -> Result<NodeId> {
-        let lower = token.to_ascii_lowercase();
-        if lower == "0" || lower == "gnd" {
-            return Ok(NodeId(0));
-        }
-        if let Some(id) = node_names.iter().position(|n| n.eq_ignore_ascii_case(token)) {
-            return Ok(NodeId(id));
+    fn probe_node_id(&self, token: &str, card: &str) -> Result<NodeId> {
+        if let Some(id) = self.node_id(token) {
+            return Ok(id);
         }
         if let Some(dot) = card.rfind('.') {
             let candidate = format!("{}.{}", &card[..dot], token);
-            if let Some(id) = node_names.iter().position(|n| n.eq_ignore_ascii_case(&candidate)) {
-                return Ok(NodeId(id));
+            if let Some(id) = self.node_id(&candidate) {
+                return Ok(id);
             }
         }
         Err(SimError::Parse(format!(
@@ -1410,6 +1467,81 @@ impl Circuit {
              an independent voltage source or inductor",
             card, src
         )))
+    }
+
+    // ─── Element families (the named lookup interface) ──────────────────
+
+    /// Display names of one family, positioned exactly as the family's
+    /// report `Vec`. This — not an index guess — is what "which element is
+    /// row i" is asked of.
+    pub fn element_names(&self, family: ElementFamily) -> Vec<String> {
+        match family {
+            ElementFamily::Resistors => self.resistors.iter().map(|e| e.name.clone()).collect(),
+            ElementFamily::Capacitors => self.capacitors.iter().map(|e| e.name.clone()).collect(),
+            ElementFamily::Inductors => self.inductors.iter().map(|e| e.name.clone()).collect(),
+            ElementFamily::VoltageSources => {
+                self.voltage_sources.iter().map(|e| e.name.clone()).collect()
+            }
+            ElementFamily::Diodes => self.diodes.iter().map(|e| e.name.clone()).collect(),
+            ElementFamily::Mosfets => self.mosfets.iter().map(|e| e.name.clone()).collect(),
+            ElementFamily::Bjts => self.bjts.iter().map(|e| e.name.clone()).collect(),
+            ElementFamily::Jfets => self.jfets.iter().map(|e| e.name.clone()).collect(),
+            ElementFamily::CurrentSources => {
+                self.current_sources.iter().map(|e| e.name.clone()).collect()
+            }
+            ElementFamily::Behavioral => self.behavioral.iter().map(|e| e.name.clone()).collect(),
+        }
+    }
+
+    /// Where `name` lives for an `I(name)` probe: family plus index into the
+    /// family's report `Vec`, scanned in canonical order. Every consumer
+    /// resolves through here, so a new element family is added in one place
+    /// (the per-family chains this replaces forgot Q the moment BJT landed).
+    pub fn resolve_current_probe(&self, name: &str) -> Option<(ElementFamily, usize)> {
+        CURRENT_FAMILIES.iter().copied().find_map(|family| {
+            self.element_names(family)
+                .iter()
+                .position(|n| n.eq_ignore_ascii_case(name))
+                .map(|i| (family, i))
+        })
+    }
+
+    /// The net a probe name refers to: ground (`0`/`gnd` — the alias lore in
+    /// one place), then the case-insensitive first spelling from
+    /// `node_names`.
+    pub fn node_id(&self, name: &str) -> Option<NodeId> {
+        let lower = name.to_ascii_lowercase();
+        if lower == "0" || lower == "gnd" {
+            return Some(NodeId(0));
+        }
+        self.node_names
+            .iter()
+            .position(|n| n.eq_ignore_ascii_case(name))
+            .map(|i| NodeId(i))
+    }
+
+    /// The five branch-row families in stamp order, one count each: voltage
+    /// sources, inductors, VCVS `E`, CCVS `H`, and the voltage-flavour `B`
+    /// cards (the only behavioural flavour with a branch row).
+    /// `BranchLayout` — the layout owner — and `tran_matrix_size` both
+    /// derive from this one count, so the twin row-counters this replaces
+    /// can no longer drift apart.
+    pub fn branch_family_counts(&self) -> [usize; 5] {
+        [
+            self.voltage_sources.len(),
+            self.inductors.len(),
+            self.vcvs.len(),
+            self.ccvs.len(),
+            self.behavioral
+                .iter()
+                .filter(|b| b.kind == BehavioralKind::Voltage)
+                .count(),
+        ]
+    }
+
+    /// Branch rows plus node rows: the size of the transient matrix.
+    pub fn tran_matrix_size(&self) -> usize {
+        self.nodes.saturating_sub(1) + self.branch_family_counts().iter().sum::<usize>()
     }
 
     pub fn validate(&self) -> Result<()> {

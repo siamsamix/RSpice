@@ -4,8 +4,8 @@ use crate::circuit::{Circuit, ElementFamily};
 use crate::error::{Result, SimError};
 use crate::mna::{
     advance_transient_state, build_system, compute_ac_branch_currents, compute_branch_currents,
-    compute_branch_currents_at, node_voltage, seed_transient_state, AcBranchCurrents,
-    BranchCurrents, BranchLayout, DcJunctionLimits, MnaSystem, Mode, TransientState,
+    compute_branch_currents_at, device_model, node_voltage, seed_transient_state, BranchCurrents,
+    BranchLayout, DcJunctionLimits, MnaSystem, Mode, TransientState,
 };
 use crate::behavior::BehavioralRuntime;
 use crate::circuit::IntegrationMethod;
@@ -22,7 +22,7 @@ pub struct DcResult {
     pub node_voltages:   Vec<f64>,
     pub source_currents: Vec<f64>,
     /// Branch current through every circuit element (n1→n2 convention).
-    pub branch_currents: BranchCurrents,
+    pub branch_currents: BranchCurrents<f64>,
 }
 
 /// One point of a `.dc` sweep: the swept values plus the operating point
@@ -33,7 +33,7 @@ pub struct DcSweepPoint {
     pub values: Vec<f64>,
     pub node_voltages: Vec<f64>,
     pub source_currents: Vec<f64>,
-    pub branch_currents: BranchCurrents,
+    pub branch_currents: BranchCurrents<f64>,
 }
 
 /// Result of a real `.dc` sweep — the sweep arguments are never optional
@@ -53,7 +53,7 @@ pub struct TranPoint {
     pub time:            f64,
     pub node_voltages:   Vec<f64>,
     /// Branch current through every circuit element at this time point.
-    pub branch_currents: BranchCurrents,
+    pub branch_currents: BranchCurrents<f64>,
 }
 
 #[derive(Debug, Clone)]
@@ -68,7 +68,7 @@ pub struct AcPoint {
     /// Complex phasor voltage at each node.
     pub node_voltages:   Vec<Complex64>,
     /// Complex phasor branch currents through every circuit element.
-    pub branch_currents: AcBranchCurrents,
+    pub branch_currents: BranchCurrents<Complex64>,
 }
 
 /// Result of a small-signal AC (frequency sweep) analysis.
@@ -224,11 +224,7 @@ fn newton_raphson(
     for _ in 0..max_iters {
         let sys = build(&x)?;
         let x_raw = sys.solve()?;
-        let residual_at = |x: &nalgebra::DVector<f64>, sys: &MnaSystem<f64>| -> f64 {
-            let ax = &sys.a * x;
-            (&ax - &sys.z).amax()
-        };
-        let res0 = residual_at(&x, &sys);
+        let res0 = sys.residual(&x);
         let delta = &x_raw - &x;
         let mut alpha = 1.0f64;
         let mut x_next = x_raw;
@@ -237,7 +233,7 @@ fn newton_raphson(
         // from oscillating between iterates at a tiny timestep.
         for _ in 0..10 {
             let candidate_sys = build(&x_next)?;
-            let res = residual_at(&x_next, &candidate_sys);
+            let res = candidate_sys.residual(&x_next);
             if res <= res0.max(1e-12) || alpha <= 1.0 / 1024.0 {
                 break;
             }
@@ -770,7 +766,7 @@ pub struct OpPoint {
 pub fn device_op_points(
     circuit: &Circuit,
     node_voltages: &[f64],
-    currents: &BranchCurrents,
+    currents: &BranchCurrents<f64>,
     source_currents: &[f64],
 ) -> Vec<OpPoint> {
     let v = |node: crate::circuit::NodeId| node_voltages.get(node.0).copied().unwrap_or(0.0);
@@ -1443,7 +1439,6 @@ pub fn run_ac_sweep(circuit: &Circuit, cmd: &AcCommand, dc_x: &nalgebra::DVector
                                               circuit.voltage_sources.len()
         )));
     }
-    let stim_branch = BranchLayout::for_circuit(circuit).src_branch(stim_idx);
     let stim_node = circuit.voltage_sources[stim_idx].n1;
     let stim_amp = circuit.voltage_sources[stim_idx].ac.as_ref().ok_or_else(|| {
         SimError::Analysis(format!(
@@ -1460,7 +1455,7 @@ pub fn run_ac_sweep(circuit: &Circuit, cmd: &AcCommand, dc_x: &nalgebra::DVector
         let mut sys = build_system::<Complex64>(circuit, Mode::Ac { freq, bias: dc_x })?;
         // Drive the stimulus source with the AC amplitude.
         // All other sources remain at 0 V (short circuit in small-signal model).
-        sys.z[stim_branch] = Complex64::new(stim_amp, 0.0);
+        sys.drive_source(stim_idx, Complex64::new(stim_amp, 0.0));
 
         let x = sys.solve()?;
 
@@ -1564,9 +1559,9 @@ pub fn run_tf_analysis(
     let mut sys = build_system::<f64>(circuit, Mode::Ac { freq: 0.0, bias })?;
     // Small-signal: every independent source (and every constant offset) is
     // zero except the unit input.
-    sys.z.fill(0.0);
+    sys.clear_rhs();
     let layout = sys.branch;
-    sys.z[layout.src_branch(input_idx)] = 1.0;
+    sys.drive_source(input_idx, 1.0);
     let x = sys.solve()?;
 
     let (transfer, label) = tf_output_value(circuit, layout, &x, &cmd.output)?;
@@ -1585,13 +1580,9 @@ pub fn run_tf_analysis(
                 f64::NAN
             } else {
                 let mut probe = build_system::<f64>(circuit, Mode::Ac { freq: 0.0, bias })?;
-                probe.z.fill(0.0);
-                if p != 0 {
-                    probe.z[p - 1] += 1.0;
-                }
-                if n != 0 {
-                    probe.z[n - 1] -= 1.0;
-                }
+                probe.clear_rhs();
+                probe.drive_node(crate::circuit::NodeId(p), 1.0);
+                probe.drive_node(crate::circuit::NodeId(n), -1.0);
                 let xp = probe.solve()?;
                 node_voltage(&xp, crate::circuit::NodeId(p))
                     - node_voltage(&xp, crate::circuit::NodeId(n))
@@ -1616,19 +1607,19 @@ use crate::params::{ParamEnv, ParamValue};
 
 /// One point of the measured waveform: the abscissa plus every probed
 /// quantity, collapsed to real values (AC currents/voltages use magnitude).
-/// Branch reports are the simulator's own [`BranchCurrents`] — no
+/// Branch reports are the simulator's own [`BranchCurrents<f64>`] — no
 /// per-consumer family copy to fall out of step with (the old `MeasCurrents`
 /// clone dropped `bjts` when the BJT landed, so `I(Q1)` never resolved).
 #[derive(Debug, Clone)]
 struct MeasSample {
     x: f64,
     nodes: Vec<f64>,
-    currents: BranchCurrents,
+    currents: BranchCurrents<f64>,
 }
 
 /// AC branch currents collapse to magnitudes for measurement arithmetic: a
 /// `.meas` on an AC analysis reads the magnitudes the AC report prints.
-fn collapse_ac(b: &AcBranchCurrents) -> BranchCurrents {
+fn collapse_ac(b: &BranchCurrents<Complex64>) -> BranchCurrents<f64> {
     let mag = |v: &[Complex64]| v.iter().map(|c| c.norm()).collect();
     BranchCurrents {
         resistors: mag(&b.resistors),
@@ -2210,20 +2201,11 @@ fn noise_psd_at(
     out_n: usize,
 ) -> Result<(f64, f64)> {
     let mut sys = build_system::<Complex64>(circuit, Mode::Ac { freq, bias })?;
-    sys.z.fill(Complex64::new(0.0, 0.0));
-    // Adjoint excitation: unit current into the output port.
-    if out_p != 0 {
-        sys.z[out_p - 1] += Complex64::new(1.0, 0.0);
-    }
-    if out_n != 0 {
-        sys.z[out_n - 1] -= Complex64::new(1.0, 0.0);
-    }
-    let adjoint = sys
-        .a
-        .transpose()
-        .lu()
-        .solve(&sys.z)
-        .ok_or_else(|| SimError::Algebra("singular noise adjoint matrix".into()))?;
+    // Adjoint excitation: unit current into the output port (solve Aᵀx = z).
+    sys.clear_rhs();
+    sys.drive_node(crate::circuit::NodeId(out_p), Complex64::new(1.0, 0.0));
+    sys.drive_node(crate::circuit::NodeId(out_n), Complex64::new(-1.0, 0.0));
+    let adjoint = sys.solve_transposed()?;
 
     let transfer = |a: crate::circuit::NodeId, b: crate::circuit::NodeId| -> Complex64 {
         node_voltage(&adjoint, a) - node_voltage(&adjoint, b)
@@ -2241,9 +2223,7 @@ fn noise_psd_at(
     }
 
     for d in &circuit.diodes {
-        let model = circuit.diode_models.get(&d.model).ok_or_else(|| {
-            SimError::Circuit(format!("diode '{}' references unknown model '{}'", d.name, d.model))
-        })?;
+        let model = device_model(&circuit.diode_models, "diode", &d.name, &d.model)?;
         let v = node_voltage(bias, d.anode) - node_voltage(bias, d.cathode);
         let current = model.eval_for_at(v, d.area, circuit.temperature).i_d.abs();
         let h = transfer(d.anode, d.cathode).norm_sqr();
@@ -2257,9 +2237,7 @@ fn noise_psd_at(
     }
 
     for m in &circuit.mosfets {
-        let model = circuit.mosfet_models.get(&m.model).ok_or_else(|| {
-            SimError::Circuit(format!("MOSFET '{}' references unknown model '{}'", m.name, m.model))
-        })?;
+        let model = device_model(&circuit.mosfet_models, "MOSFET", &m.name, &m.model)?;
         let sign = if model.kind == MosfetType::Pmos { -1.0 } else { 1.0 };
         let vd = sign * node_voltage(bias, m.nd);
         let vg = sign * node_voltage(bias, m.ng);
@@ -2319,8 +2297,8 @@ pub fn run_noise_analysis(
         // Gain from the input source to the output: drive 1 V and read the
         // output phasor.
         let mut gain_sys = build_system::<Complex64>(circuit, Mode::Ac { freq, bias })?;
-        gain_sys.z.fill(Complex64::new(0.0, 0.0));
-        gain_sys.z[gain_sys.branch.src_branch(input_idx)] = Complex64::new(1.0, 0.0);
+        gain_sys.clear_rhs();
+        gain_sys.drive_source(input_idx, Complex64::new(1.0, 0.0));
         let gx = gain_sys.solve()?;
         let gain = node_voltage(&gx, crate::circuit::NodeId(out_p))
             - node_voltage(&gx, crate::circuit::NodeId(out_n));

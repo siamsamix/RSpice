@@ -3,8 +3,9 @@
 //! The unknown vector layout is owned by [`BranchLayout`]; a system is
 //! [`MnaSystem<T>`] over a field: `f64` for `.op` / `.tran`,
 //! [`Complex64`] for `.ac`. The single `build_system` constructor covers all
-//! three analyses through a [`Mode`]; the AC stimulus patch (which source to
-//! drive, what amplitude) stays with the analysis driver.
+//! three analyses through a [`Mode`]; the stimulus patch (which source to
+//! drive, at what amplitude) is [`MnaSystem::drive_source`], called from the
+//! analysis driver.
 
 use nalgebra::{DMatrix, DVector};
 use num_complex::Complex64;
@@ -16,6 +17,28 @@ use crate::circuit::{
 };
 use crate::error::{Result, SimError};
 use crate::model::thermal_voltage;
+
+/// Model lookup shared by every stamp and current-extraction loop: the one
+/// canonical `ok_or` for a device card whose model name does not resolve.
+///
+/// [`Circuit::validate`] runs the same cross-references before any solve
+/// (at parse time and again per analysis pass), so decks that reach the
+/// stamps through `analysis::run` can never fail here — the loud error
+/// stays for direct matrix users and keeps the message in exactly one
+/// place.
+pub(crate) fn device_model<'a, M>(
+    models: &'a std::collections::HashMap<String, M>,
+    kind: &str,
+    device: &str,
+    model: &str,
+) -> Result<&'a M> {
+    models.get(model).ok_or_else(|| {
+        SimError::Circuit(format!(
+            "{kind} '{}' references unknown model '{}'",
+            device, model
+        ))
+    })
+}
 
 /// Field arithmetic for one MNA system: [`f64`] for DC/transient,
 /// [`Complex64`] for the AC sweep. One stamping implementation serves both.
@@ -451,11 +474,11 @@ impl BranchLayout {
 // ─── System ─────────────────────────────────────────────────────────────────
 
 pub struct MnaSystem<T: Field> {
-    pub size: usize,
-    pub a: DMatrix<T>,
-    pub z: DVector<T>,
+    pub(crate) size: usize,
+    pub(crate) a: DMatrix<T>,
+    pub(crate) z: DVector<T>,
     /// Where the branch rows live in `a`/`z`.
-    pub branch: BranchLayout,
+    pub(crate) branch: BranchLayout,
 }
 
 impl<T: Field> MnaSystem<T> {
@@ -490,6 +513,50 @@ impl<T: Field> MnaSystem<T> {
             .lu()
             .solve(&self.z)
             .ok_or_else(|| SimError::Algebra("singular MNA matrix".into()))
+    }
+
+    /// Zero the RHS: every source silent. Small-signal analyses clear this
+    /// once and then patch exactly one excitation in (see
+    /// [`Self::drive_source`] and [`Self::drive_node`]).
+    pub fn clear_rhs(&mut self) {
+        self.z.fill(T::lift(0.0));
+    }
+
+    /// The RHS branch entry for independent source `i`: its branch unknown
+    /// solves `V(+) − V(−) = amp`. `.ac` uses this to sweep the stimulus at
+    /// its card amplitude; `.tf`/`.noise` unit-drive the input source.
+    pub fn drive_source(&mut self, i: usize, amp: T) {
+        self.z[self.branch.src_branch(i)] = amp;
+    }
+
+    /// Add `amp` to node `node`'s RHS row; ground contributes nothing. This
+    /// is the port-current probe: `.tf`'s output-impedance drive and the
+    /// noise adjoint both push unit current into the output port this way.
+    pub fn drive_node(&mut self, node: NodeId, amp: T) {
+        if node.0 != 0 {
+            self.z[node.0 - 1] += amp;
+        }
+    }
+
+    /// Solve Aᵀ·x = z, the adjoint system. Noise analysis drives unit
+    /// current into the output port of the *transposed* network and reads
+    /// every device port's response off `x`, all in one solve.
+    pub fn solve_transposed(&self) -> Result<DVector<T>> {
+        self.a
+            .transpose()
+            .lu()
+            .solve(&self.z)
+            .ok_or_else(|| SimError::Algebra("singular adjoint MNA matrix".into()))
+    }
+}
+
+impl MnaSystem<f64> {
+    /// Max |A·x − z|: the residual the damped-Newton line search tracks.
+    /// Real-field only — the metric is a magnitude, and AC solves are
+    /// single-shot linear systems with no iteration to measure.
+    pub fn residual(&self, x: &DVector<f64>) -> f64 {
+        let ax = &self.a * x;
+        (&ax - &self.z).amax()
     }
 }
 
@@ -1104,12 +1171,7 @@ fn switch_conductance(
     previous: &[Option<bool>],
 ) -> Result<f64> {
     let s = &circuit.switches[index];
-    let model = circuit.switch_models.get(&s.model).ok_or_else(|| {
-        SimError::Circuit(format!(
-            "switch '{}' references unknown model '{}'",
-            s.name, s.model
-        ))
-    })?;
+    let model = device_model(&circuit.switch_models, "switch", &s.name, &s.model)?;
     let layout = BranchLayout::for_circuit(circuit);
     let control = match &s.control {
         SwitchControl::Voltage(p, n) => node_voltage(guess, *p) - node_voltage(guess, *n),
@@ -1166,12 +1228,7 @@ fn stamp_diodes<T: Field>(
     gmin: f64,
 ) -> Result<()> {
     for (index, d) in circuit.diodes.iter().enumerate() {
-        let model = circuit.diode_models.get(&d.model).ok_or_else(|| {
-            SimError::Circuit(format!(
-                "diode '{}' references unknown model '{}'",
-                d.name, d.model
-            ))
-        })?;
+        let model = device_model(&circuit.diode_models, "diode", &d.name, &d.model)?;
         let v_anode = node_voltage(guess, d.anode);
         let v_cathode = node_voltage(guess, d.cathode);
         // Linearization, clamp, limit, and companion current all come from
@@ -1227,12 +1284,7 @@ fn stamp_diode_capacitances<T: Field>(
 ) -> Result<()> {
     let companion = Companion::for_step(method, dt, state.last_dt);
     for (i, d) in circuit.diodes.iter().enumerate() {
-        let model = circuit.diode_models.get(&d.model).ok_or_else(|| {
-            SimError::Circuit(format!(
-                "diode '{}' references unknown model '{}'",
-                d.name, d.model
-            ))
-        })?;
+        let model = device_model(&circuit.diode_models, "diode", &d.name, &d.model)?;
         if model.cjo == 0.0 && model.tt == 0.0 {
             continue;
         }
@@ -1263,12 +1315,7 @@ fn stamp_diode_capacitances_ac<T: Field>(
     omega: f64,
 ) -> Result<()> {
     for d in &circuit.diodes {
-        let model = circuit.diode_models.get(&d.model).ok_or_else(|| {
-            SimError::Circuit(format!(
-                "diode '{}' references unknown model '{}'",
-                d.name, d.model
-            ))
-        })?;
+        let model = device_model(&circuit.diode_models, "diode", &d.name, &d.model)?;
         if model.cjo == 0.0 && model.tt == 0.0 {
             continue;
         }
@@ -1302,12 +1349,7 @@ fn stamp_bjts<T: Field>(
     gmin: f64,
 ) -> Result<()> {
     for (index, q) in circuit.bjts.iter().enumerate() {
-        let model = circuit.bjt_models.get(&q.model).ok_or_else(|| {
-            SimError::Circuit(format!(
-                "BJT '{}' references unknown model '{}'",
-                q.name, q.model
-            ))
-        })?;
+        let model = device_model(&circuit.bjt_models, "BJT", &q.name, &q.model)?;
         let temp = circuit.temperature;
         let sign = if model.kind == BjtType::Pnp { -1.0 } else { 1.0 };
         // Normalized junction biases: forward is positive in this space for
@@ -1446,12 +1488,7 @@ fn stamp_jfets<T: Field>(
     gmin: f64,
 ) -> Result<()> {
     for (index, j) in circuit.jfets.iter().enumerate() {
-        let model = circuit.jfet_models.get(&j.model).ok_or_else(|| {
-            SimError::Circuit(format!(
-                "JFET '{}' references unknown model '{}'",
-                j.name, j.model
-            ))
-        })?;
+        let model = device_model(&circuit.jfet_models, "JFET", &j.name, &j.model)?;
         let temp = circuit.temperature;
         let sign = if model.kind == JfetType::Pjf { -1.0 } else { 1.0 };
         // Normalized gate-junction biases (forward is positive in this space).
@@ -1595,12 +1632,7 @@ fn stamp_mosfets<T: Field>(
     with_companion: bool,
 ) -> Result<()> {
     for m in &circuit.mosfets {
-        let model = circuit.mosfet_models.get(&m.model).ok_or_else(|| {
-            SimError::Circuit(format!(
-                "MOSFET '{}' references unknown model '{}'",
-                m.name, m.model
-            ))
-        })?;
+        let model = device_model(&circuit.mosfet_models, "MOSFET", &m.name, &m.model)?;
 
         // Raw node voltages from the current Newton-Raphson guess.
         let vd_raw = node_voltage(guess, m.nd);
@@ -1993,35 +2025,43 @@ pub fn node_voltage<T: Field>(solution: &DVector<T>, node: NodeId) -> T {
     node_index(node).map(|i| solution[i]).unwrap_or_else(|| T::lift(0.0))
 }
 
-// ─── Branch currents (DC / transient, real) ─────────────────────────────────
+// ─── Branch currents ────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Default)]
-pub struct BranchCurrents {
-    pub resistors: Vec<f64>,
-    pub capacitors: Vec<f64>,
-    pub inductors: Vec<f64>,
-    pub voltage_sources: Vec<f64>,
-    pub current_sources: Vec<f64>,
-    pub diodes: Vec<f64>,
-    /// Drain current (from drain to source) for each MOSFET.
-    pub mosfets: Vec<f64>,
+/// Every element family's branch current at one operating point, laid out
+/// exactly as `Circuit::element_names(family)`. Generic over the MNA field:
+/// `BranchCurrents<f64>` is the real report (`.op`/`.dc`/`.tran`), and the
+/// AC sweep instantiates the complex field, where every value is a phasor
+/// flowing n1 → n2 through the element, linearised at the DC bias.
+#[derive(Debug, Clone)]
+pub struct BranchCurrents<T> {
+    pub resistors: Vec<T>,
+    pub capacitors: Vec<T>,
+    pub inductors: Vec<T>,
+    pub voltage_sources: Vec<T>,
+    pub current_sources: Vec<T>,
+    pub diodes: Vec<T>,
+    /// Drain current for each MOSFET, drain → source. Small-signal:
+    /// Id = gm·Vgs + gds·Vds + gbs·Vbs.
+    pub mosfets: Vec<T>,
     /// Collector current (into the collector) for each BJT.
-    pub bjts: Vec<f64>,
+    pub bjts: Vec<T>,
     /// Drain current (into the drain) for each JFET.
-    pub jfets: Vec<f64>,
-    /// Output current of each behavioral source (`n_p → n_n` element
-    /// convention; for the voltage flavour, the branch unknown).
-    pub behavioral: Vec<f64>,
-    /// Output current of each op-amp (the branch unknown, `out+ → out−`
-    /// element convention).
-    pub opamps: Vec<f64>,
+    pub jfets: Vec<T>,
+    /// Output current of each behavioral source: `n_p → n_n` element
+    /// convention, with the voltage flavour reporting the branch unknown.
+    /// Small-signal current flavour: Σ dk·(probe phasor) with the
+    /// real-difference Jacobian evaluated at the DC bias.
+    pub behavioral: Vec<T>,
+    /// Output current of each op-amp: the branch unknown, `out+ → out−`
+    /// element convention.
+    pub opamps: Vec<T>,
 }
 
-impl BranchCurrents {
+impl<T> BranchCurrents<T> {
     /// The current values of one element family, positioned exactly as
     /// `Circuit::element_names(family)`. Family identity is resolved in one
     /// place instead of per-consumer `match` towers.
-    pub fn slice(&self, family: ElementFamily) -> Option<&[f64]> {
+    pub fn slice(&self, family: ElementFamily) -> Option<&[T]> {
         match family {
             ElementFamily::Resistors => Some(&self.resistors),
             ElementFamily::Capacitors => Some(&self.capacitors),
@@ -2044,7 +2084,7 @@ pub fn compute_branch_currents(
     dt: Option<f64>,
     prev_cap_voltages: Option<&[f64]>,
     t: Option<f64>,
-) -> Result<BranchCurrents> {
+) -> Result<BranchCurrents<f64>> {
     let branch = BranchLayout::for_circuit(circuit);
 
     let resistors = circuit.resistors.iter().map(|r| {
@@ -2086,12 +2126,7 @@ pub fn compute_branch_currents(
 
     let mut diodes = Vec::with_capacity(circuit.diodes.len());
     for d in &circuit.diodes {
-        let model = circuit.diode_models.get(&d.model).ok_or_else(|| {
-            SimError::Circuit(format!(
-                "diode '{}' references unknown model '{}'",
-                d.name, d.model
-            ))
-        })?;
+        let model = device_model(&circuit.diode_models, "diode", &d.name, &d.model)?;
         let v_a = node_voltage(solution, d.anode);
         let v_c = node_voltage(solution, d.cathode);
         diodes.push(model.eval_for_at(v_a - v_c, d.area, circuit.temperature).i_d);
@@ -2100,12 +2135,7 @@ pub fn compute_branch_currents(
     // MOSFET: re-evaluate Ids at the converged solution.
     let mut mosfets = Vec::with_capacity(circuit.mosfets.len());
     for m in &circuit.mosfets {
-        let model = circuit.mosfet_models.get(&m.model).ok_or_else(|| {
-            SimError::Circuit(format!(
-                "MOSFET '{}' references unknown model '{}'",
-                m.name, m.model
-            ))
-        })?;
+        let model = device_model(&circuit.mosfet_models, "MOSFET", &m.name, &m.model)?;
         let sign = if model.kind == MosfetType::Pmos { -1.0 } else { 1.0 };
         let vd = sign * node_voltage(solution, m.nd);
         let vg = sign * node_voltage(solution, m.ng);
@@ -2118,12 +2148,7 @@ pub fn compute_branch_currents(
 
     let mut bjts = Vec::with_capacity(circuit.bjts.len());
     for q in &circuit.bjts {
-        let model = circuit.bjt_models.get(&q.model).ok_or_else(|| {
-            SimError::Circuit(format!(
-                "BJT '{}' references unknown model '{}'",
-                q.name, q.model
-            ))
-        })?;
+        let model = device_model(&circuit.bjt_models, "BJT", &q.name, &q.model)?;
         let vbe = node_voltage(solution, q.nb) - node_voltage(solution, q.ne);
         let vbc = node_voltage(solution, q.nb) - node_voltage(solution, q.nc);
         bjts.push(model.currents(vbe, vbc, q.area, circuit.temperature).ic);
@@ -2131,12 +2156,7 @@ pub fn compute_branch_currents(
 
     let mut jfets = Vec::with_capacity(circuit.jfets.len());
     for j in &circuit.jfets {
-        let model = circuit.jfet_models.get(&j.model).ok_or_else(|| {
-            SimError::Circuit(format!(
-                "JFET '{}' references unknown model '{}'",
-                j.name, j.model
-            ))
-        })?;
+        let model = device_model(&circuit.jfet_models, "JFET", &j.name, &j.model)?;
         let vgs = node_voltage(solution, j.ng) - node_voltage(solution, j.ns);
         let vgd = node_voltage(solution, j.ng) - node_voltage(solution, j.nd);
         jfets.push(model.currents(vgs, vgd, j.area, circuit.temperature).id);
@@ -2192,7 +2212,7 @@ pub fn compute_branch_currents_at(
     solution: &DVector<f64>,
     t: f64,
     state: &TransientState,
-) -> Result<BranchCurrents> {
+) -> Result<BranchCurrents<f64>> {
     let mut currents = compute_branch_currents(circuit, solution, None, None, Some(t))?;
     currents.capacitors = state.capacitor_currents.clone();
     currents.inductors = state.inductor_currents.clone();
@@ -2662,51 +2682,6 @@ fn switch_states_after(
 
 // ─── Branch currents (AC, complex) ──────────────────────────────────────────
 
-/// Small-signal AC branch currents for one frequency point.
-///
-/// Positive convention: phasor current flows from n1 to n2 through the element.
-#[derive(Debug, Clone, Default)]
-pub struct AcBranchCurrents {
-    pub resistors: Vec<Complex64>,
-    pub capacitors: Vec<Complex64>,
-    pub inductors: Vec<Complex64>,
-    pub voltage_sources: Vec<Complex64>,
-    pub current_sources: Vec<Complex64>,
-    pub diodes: Vec<Complex64>,
-    /// Small-signal drain current phasor for each MOSFET: Id = gm·Vgs + gds·Vds + gbs·Vbs
-    pub mosfets: Vec<Complex64>,
-    /// Small-signal collector current phasor for each BJT.
-    pub bjts: Vec<Complex64>,
-    /// Small-signal drain current phasor for each JFET.
-    pub jfets: Vec<Complex64>,
-    /// Small-signal output of each behavioral source. Voltage flavour: the
-    /// complex branch unknown; current flavour: `Σ dk·(probe phasor)` with the
-    /// real-difference Jacobian evaluated at the DC bias.
-    pub behavioral: Vec<Complex64>,
-    /// Small-signal output current phasor of each op-amp.
-    pub opamps: Vec<Complex64>,
-}
-
-impl AcBranchCurrents {
-    /// The current phasors of one element family, positioned exactly as
-    /// `Circuit::element_names(family)`.
-    pub fn slice(&self, family: ElementFamily) -> Option<&[Complex64]> {
-        match family {
-            ElementFamily::Resistors => Some(&self.resistors),
-            ElementFamily::Capacitors => Some(&self.capacitors),
-            ElementFamily::Inductors => Some(&self.inductors),
-            ElementFamily::VoltageSources => Some(&self.voltage_sources),
-            ElementFamily::CurrentSources => Some(&self.current_sources),
-            ElementFamily::Diodes => Some(&self.diodes),
-            ElementFamily::Mosfets => Some(&self.mosfets),
-            ElementFamily::Bjts => Some(&self.bjts),
-            ElementFamily::Jfets => Some(&self.jfets),
-            ElementFamily::Behavioral => Some(&self.behavioral),
-            ElementFamily::OpAmps => Some(&self.opamps),
-        }
-    }
-}
-
 /// Compute small-signal AC branch currents from a solved AC system.
 ///
 /// * `solution`    — solved complex MNA unknown vector at this frequency.
@@ -2719,7 +2694,7 @@ pub fn compute_ac_branch_currents(
     solution: &DVector<Complex64>,
     freq: f64,
     dc_solution: &DVector<f64>,
-) -> Result<AcBranchCurrents> {
+) -> Result<BranchCurrents<Complex64>> {
     let omega = 2.0 * std::f64::consts::PI * freq;
     let branch = BranchLayout::for_circuit(circuit);
     let one = Complex64::new(1.0, 0.0);
@@ -2762,12 +2737,7 @@ pub fn compute_ac_branch_currents(
     // ── Diodes: linearised small-signal conductance gd * (V_a - V_c) ─────
     let mut diodes = Vec::with_capacity(circuit.diodes.len());
     for d in &circuit.diodes {
-        let model = circuit.diode_models.get(&d.model).ok_or_else(|| {
-            SimError::Circuit(format!(
-                "diode '{}' references unknown model '{}'",
-                d.name, d.model
-            ))
-        })?;
+        let model = device_model(&circuit.diode_models, "diode", &d.name, &d.model)?;
         let gd = model
             .eval_for_at(
                 node_voltage(dc_solution, d.anode) - node_voltage(dc_solution, d.cathode),
@@ -2793,12 +2763,7 @@ pub fn compute_ac_branch_currents(
     // linearised at the DC bias point, so this stays self-contained.
     let mut mosfets = Vec::with_capacity(circuit.mosfets.len());
     for m in &circuit.mosfets {
-        let model = circuit.mosfet_models.get(&m.model).ok_or_else(|| {
-            SimError::Circuit(format!(
-                "MOSFET '{}' references unknown model '{}'",
-                m.name, m.model
-            ))
-        })?;
+        let model = device_model(&circuit.mosfet_models, "MOSFET", &m.name, &m.model)?;
 
         let sign = if model.kind == MosfetType::Pmos { -1.0 } else { 1.0 };
 
@@ -2835,12 +2800,7 @@ pub fn compute_ac_branch_currents(
 
     let mut bjts = Vec::with_capacity(circuit.bjts.len());
     for q in &circuit.bjts {
-        let model = circuit.bjt_models.get(&q.model).ok_or_else(|| {
-            SimError::Circuit(format!(
-                "BJT '{}' references unknown model '{}'",
-                q.name, q.model
-            ))
-        })?;
+        let model = device_model(&circuit.bjt_models, "BJT", &q.name, &q.model)?;
         let vbe_dc = node_voltage(dc_solution, q.nb) - node_voltage(dc_solution, q.ne);
         let vbc_dc = node_voltage(dc_solution, q.nb) - node_voltage(dc_solution, q.nc);
         let h = 1e-6;
@@ -2857,12 +2817,7 @@ pub fn compute_ac_branch_currents(
 
     let mut jfets = Vec::with_capacity(circuit.jfets.len());
     for j in &circuit.jfets {
-        let model = circuit.jfet_models.get(&j.model).ok_or_else(|| {
-            SimError::Circuit(format!(
-                "JFET '{}' references unknown model '{}'",
-                j.name, j.model
-            ))
-        })?;
+        let model = device_model(&circuit.jfet_models, "JFET", &j.name, &j.model)?;
         let vgs_dc = node_voltage(dc_solution, j.ng) - node_voltage(dc_solution, j.ns);
         let vgd_dc = node_voltage(dc_solution, j.ng) - node_voltage(dc_solution, j.nd);
         let h = 1e-6;
@@ -2911,7 +2866,7 @@ pub fn compute_ac_branch_currents(
         solution[branch.opamp_branch(i)]
     }).collect();
 
-    Ok(AcBranchCurrents {
+    Ok(BranchCurrents {
         resistors,
         capacitors,
         inductors,

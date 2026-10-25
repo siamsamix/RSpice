@@ -981,6 +981,16 @@ impl ElementFamily {
 
 // ─── Circuit ─────────────────────────────────────────────────────────────────
 
+/// The parsed deck, element by element, ready for matrix stamping.
+///
+/// Boundary contract: netlist parsing is the *only* production writer of
+/// these fields (the GUI's schematic editor pushes R/C/L/V cards for
+/// rendering only, and never simulates its hand-built circuit), so
+/// [`Circuit::validate`] — run at the end of `parse` and again at the top
+/// of every analysis pass — is the single gate for cross-reference and
+/// positivity invariants. Matrix stamping trusts it: element lookups
+/// re-resolve models only through [`crate::mna::device_model`], never with
+/// a silent fallback.
 #[derive(Debug, Clone, Default)]
 pub struct Circuit {
     pub name: String,
@@ -994,42 +1004,42 @@ pub struct Circuit {
     /// spelling the parser saw.
     pub node_names: Vec<String>,
     pub resistors: Vec<Resistor>,
-    pub resistor_models: HashMap<String, PassiveModel>,
+    pub(crate) resistor_models: HashMap<String, PassiveModel>,
     pub capacitors: Vec<Capacitor>,
-    pub capacitor_models: HashMap<String, PassiveModel>,
+    pub(crate) capacitor_models: HashMap<String, PassiveModel>,
     pub inductors: Vec<Inductor>,
-    pub inductor_models: HashMap<String, PassiveModel>,
-    pub mutual_inductances: Vec<MutualInductance>,
+    pub(crate) inductor_models: HashMap<String, PassiveModel>,
+    pub(crate) mutual_inductances: Vec<MutualInductance>,
     pub voltage_sources: Vec<VoltageSource>,
     pub current_sources: Vec<CurrentSource>,
     pub diode_models: HashMap<String, DiodeModel>,
     pub diodes: Vec<Diode>,
-    pub mosfet_models: HashMap<String, MosfetModel>,
+    pub(crate) mosfet_models: HashMap<String, MosfetModel>,
     pub mosfets: Vec<Mosfet>,
-    pub bjt_models: HashMap<String, BjtModel>,
+    pub(crate) bjt_models: HashMap<String, BjtModel>,
     pub bjts: Vec<Bjt>,
-    pub jfet_models: HashMap<String, JfetModel>,
+    pub(crate) jfet_models: HashMap<String, JfetModel>,
     pub jfets: Vec<Jfet>,
     /// Voltage-controlled voltage sources (`E`), one branch row each.
-    pub vcvs: Vec<ControlledSource>,
+    pub(crate) vcvs: Vec<ControlledSource>,
     /// Voltage-controlled current sources (`G`), no branch row.
-    pub vccs: Vec<ControlledSource>,
+    pub(crate) vccs: Vec<ControlledSource>,
     /// Current-controlled voltage sources (`H`), one branch row each.
-    pub ccvs: Vec<ControlledSource>,
+    pub(crate) ccvs: Vec<ControlledSource>,
     /// Current-controlled current sources (`F`), no branch row.
-    pub cccs: Vec<ControlledSource>,
-    pub switch_models: HashMap<String, SwitchModel>,
+    pub(crate) cccs: Vec<ControlledSource>,
+    pub(crate) switch_models: HashMap<String, SwitchModel>,
     pub switches: Vec<Switch>,
     /// Behavioral sources (`B` cards) with compiled expressions.
     pub behavioral: Vec<BehavioralSource>,
     /// Ideal op-amps (`U`), one branch row each.
     pub opamps: Vec<OpAmp>,
     /// `.model … U(…)` op-amp cards.
-    pub opamp_models: HashMap<String, OpAmpModel>,
+    pub(crate) opamp_models: HashMap<String, OpAmpModel>,
     /// `.model` cards of device types RSpice does not model yet (NPN, PNP,
     /// RES, …). Parsed so third-party decks import cleanly; no element kind
     /// consumes them yet.
-    pub generic_models: HashMap<String, GenericModel>,
+    pub(crate) generic_models: HashMap<String, GenericModel>,
 }
 
 /// Append `id` to the used-node list when not present (first-seen order).

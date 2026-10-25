@@ -20,6 +20,7 @@ deepening that has not landed yet.
 - **ParseOptions** — where file-reading directives look: `deck_dir` (the parsed `.cir`'s own directory, set by the CLI) and `search_paths` (`RSPICE_LIB` split-paths, prepend order). `.include <file>` and `.lib <file>` (with optional section) resolve against deck_dir then the search list; a missing file or section is a loud parse error, an unresolvable `.lib <section>` *inside a library* is just a section boundary.
 - **Stamp** — writing one element's contribution into the MNA matrix/right-hand side at build time. Not a runtime mutation of results.
 - **Model card** — a `.model` line defining device physics (`DiodeModel`, `MosfetModel` level-1 Shichman–Hodges). Elements reference cards by name; `validate()` rejects unknown names.
+- **Boundary contract** — `Circuit` is written by parsing only (element vectors stay public for the schematic editor; the element-model maps and controlled-source/switch families are crate-internal), `validate()` — run at the end of parse and again at the top of every analysis pass — is the single cross-reference gate, and matrix stamping trusts it: model lookups go through `mna.rs`'s `device_model`, never re-checked, never silent-fallback. Rationale in `docs/adr/0001`.
 - **Model card grammar** — the full card: fused-paren (`NMOS(…)`) and paren-less (`D IS=…`) forms, type-word slicing safe against names that contain the search string, keys case-normalized, LEVEL validated against the device type, values read via `parse_value` (trailing `)`/`%`/`,` tolerated), complete diode/MOSFET parameter lists, `DEV`/`LOT` slots parsed into `ModelTolerance` (staged for the Monte Carlo work, TODO §8), and unknown families kept as `GenericModel` cards for future element letters.
 - **Sizing fields** — per-instance junction geometry: diode `AREA=…` (bare trailing number also accepted) and MOSFET `W/L` plus `AD/AS/PS/PD`, carried onto element fields and consumed by the device model (`eval_for(vd, area)`), not just stored.
 - **DeviceModel** — the module (`model.rs`, cut #1) owning device equations. Interface: `eval` takes f64 biases, returns f64 linearization (gm, gds, gbs, current equivalent); AC lifts values into Complex64 at the stamp, never inside the model.
@@ -28,7 +29,8 @@ deepening that has not landed yet.
 
 - **MNA** — modified nodal analysis. First rows are node voltages, then **branch rows**: voltage-source currents, inductor currents (in that order).
 - **BranchLayout** — the branch-row layout as a named structure built with the system (cut #3); accessors replace raw `n_nodes + i` arithmetic. Not owned by `Circuit`.
-- **MnaSystem(T)** — the solver system `a`, `z` generified over the field: `f64` for DC/transient, `Complex64` for AC (cut #2). `ac_mna.rs` folds into this.
+- **MnaSystem(T)** — the solver system `a`, `z` generified over the field: `f64` for DC/transient, `Complex64` for AC (cut #2). `ac_mna.rs` folds into this. The matrix is the system's own: `a`/`z` are crate-internal and the analysis driver patches stimulus through intent ops (`clear_rhs`, `drive_source`, `drive_node`, `solve_transposed` for the adjoint), never by indexing raw rows.
+- **Branch currents** — `BranchCurrents<T>`, every element family's current at one operating point, laid out as `Circuit::element_names(family)` with `slice(family)` resolving the family in one place: `<f64>` for real analyses, `<Complex64>` phasors for `.ac` (measurement collapses magnitudes via `collapse_ac`). One report shape for both fields.
 - **Field** — the small trait (`from_real`, arithmetic ops) letting one stamping implementation serve both fields.
 - **Mode** — `Dc`, `Tran { dt }`, `Ac { omega }`: three modes of one system build, replacing three builders.
 - **Operating point (`.op`)** — DC solve; nonlinear elements linearize via Newton–Raphson. Also the `DcResult` that seeds `.tran` and `.ac`.
@@ -75,7 +77,7 @@ deepening that has not landed yet.
   sample points built from `.tran`/`.dc`/`.ac`/`.op`. A measurement parses once into a compiled
   program — `MeasProgram::compile` → `MeasPart::{Text, Node, NodeDiff, Current}` — and
   re-evaluates per sample: probes (`V(n)`, `I(el)`) become per-sample values (`MeasSample`,
-  carrying `currents: BranchCurrents`; AC magnitudes collapse through `collapse_ac` in one
+  carrying `currents: BranchCurrents<f64>`; AC magnitudes collapse through `collapse_ac` in one
   place) and the rest evaluates through the parameter grammar. Failures are
   reported per measurement, never fatal.
 - **Noise analysis (`.noise`)** — output-referred PSD from the adjoint system at each frequency

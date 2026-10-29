@@ -883,6 +883,35 @@ R2 out 0 1k
 }
 
 #[test]
+fn noise_resistor_value_follows_model_card() {
+    let netlist = r#"
+.model rm R(TC1=1m)
+V1 in 0 DC 1
+R1 in out 1k rm
+R2 out 0 1k
+.temp 127
+.noise V(out) V1 DEC 3 1k 10k
+.end
+"#;
+    let n = parse(netlist).unwrap();
+    let r = run(&n).unwrap();
+    let noise = r.noise.expect(".noise produced a result");
+    // R1 rides the value law the stamps honor — model-card TC1 = 1m lifts it
+    // to 1k·(1 + 1e-3·(127−27)) = 1.1k at 127 °C while the raw card field
+    // stays 1k. R_eq = 1.1k ∥ 1k; the divider gain from V1 is 1000/2100, so
+    // both figures must read the effective resistor (the report used to
+    // divide by the raw field and model a 1k resistor the matrix never
+    // stamped).
+    let r_eq = 1100.0 * 1000.0 / 2100.0;
+    let output: f64 = (4.0f64 * BOLTZMANN * (127.0 + ZERO_CELSIUS_K) * r_eq).sqrt();
+    let gain = 1000.0 / 2100.0;
+    for p in &noise.points {
+        assert_relative_eq!(p.output_density, output, epsilon = 1e-13);
+        assert_relative_eq!(p.input_density, output / gain, epsilon = 1e-13);
+    }
+}
+
+#[test]
 fn passive_model_card_supplies_value_and_temperature_coefficient() {
     let netlist = r#"
 .model rm R(R=1k TC1=1m)

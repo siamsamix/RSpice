@@ -2311,7 +2311,10 @@ fn noise_psd_at(
 
     for r in &circuit.resistors {
         let h = transfer(r.n1, r.n2).norm_sqr();
-        psd += h * 4.0 * kt / r.resistance;
+        // The resistor's effective value (model card + TC1/TC2) — the same
+        // law the MNA stamps and the validate gate honor, so the noise
+        // report models the resistor its own matrix stamped.
+        psd += h * 4.0 * kt / circuit.resistance_at(r);
     }
 
     for d in &circuit.diodes {

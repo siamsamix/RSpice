@@ -86,7 +86,13 @@ below is written against that state.
 - [ ] **[P1] (both)** Sparse MNA solver replacing dense `nalgebra` LU — KLU-class with symbolic
   Markowitz ordering computed at netlist load; dense LU is infeasible beyond a few thousand nodes.
 - [ ] **[P1] (both)** LU factorization reuse across NR iterations and timesteps when the matrix changes
-  only by values, not topology — today the matrix is rebuilt and cloned per iterate.
+  only by values, not topology — today the matrix is rebuilt and cloned per iterate. *(Dense-buffer
+  restamp reuse was prototyped against the NR loop and is a measured loss on the dense path: a reused
+  `a` forces a full `n²` `fill(0.0)` per rebuild, while fresh `DMatrix::zeros` rides calloc's lazy
+  zero pages (probe: reuse-fill 76.2 µs vs fresh-zeros 10.9 µs at n=210; ladder-200 regressed
+  702→815 ms). Per-iterate allocation churn is the cheaper cost here; revisit behind the sparse
+  solver above, where restamp reset follows the stamp count, and factor-reuse for the
+  linear-only-per-iterate companion stamps rides the same symbolic pattern.)*
 - [ ] **[P1] (LT baseline)** Multithreaded matrix assembly/factorization and time-stepping loop;
   LTspice is threaded today, PSpice multithreading is unclear on this baseline.
 - [x] **[P1] (both)** Trapezoidal integration as the default companion model with `.options

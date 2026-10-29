@@ -568,6 +568,14 @@ impl BranchLayout {
 
 // ─── System ─────────────────────────────────────────────────────────────────
 
+/// Dense-kernel crossover for [`MnaSystem::solve`]: systems smaller than
+/// this skip the sparse attempt — planning and workspace setup outweigh a
+/// dense LU that costs ~n³/3 flops at these sizes. Measured A/B: the
+/// benchmark's tiny decks (n ≤ 9) lost ~30% wall to the sparse overhead
+/// while the 200-node ladder won ~5×; pooling the factor workspace inside
+/// the plan pool is the follow-up that would retire this gate.
+const SMALL_SYSTEM: usize = 16;
+
 pub struct MnaSystem<T: Field> {
     pub(crate) size: usize,
     pub(crate) a: DMatrix<T>,
@@ -625,7 +633,27 @@ impl<T: Field> MnaSystem<T> {
     }
 
     /// Solve A·x = z using LU decomposition.
+    ///
+    /// The structural record compiles to a pooled sparse plan (see
+    /// [`crate::sparse`]); when the pattern admits a Markowitz order and the
+    /// numeric factor succeeds, the sparse path answers. Anything else —
+    /// no order, a numerically zero pivot — rides the dense LU unchanged,
+    /// which keeps the sparse layer free of any behavioral say in what
+    /// comes out.
+    ///
+    /// Below [`SMALL_SYSTEM`] the dense LU is the better kernel and the
+    /// sparse attempt does not even run: measured A/B on the benchmark
+    /// suite showed the tiny decks (n ≤ 9) paying the plan/workspace setup
+    /// (~30% wall) while the 200-node ladder already wins ~5×.
     pub fn solve(&self) -> Result<DVector<T>> {
+        if self.size >= SMALL_SYSTEM {
+            let pattern = self.touched.compress();
+            if let Some(x) = crate::sparse::sparse_plan(&pattern)
+                .and_then(|plan| plan.factor_solve(&self.a, &self.z))
+            {
+                return Ok(x);
+            }
+        }
         self.a
             .clone()
             .lu()
@@ -3466,6 +3494,65 @@ mod tests {
         }
     }
 
+    /// The zoo solves through `solve()` and agrees with a dense reference in
+    /// all three arms — the wiring test over the exact numerics covered by
+    /// `sparse.rs`'s unit tests.
+    #[test]
+    fn zoo_sparse_solve_matches_dense_reference_in_every_arm() {
+        let circuit = zoo_circuit();
+
+        // DC, per the record-covers arm above.
+        {
+            let guess = DVector::zeros(circuit.tran_matrix_size());
+            let mut used = DcJunctionLimits::seed(&circuit, &guess);
+            let sys = build_system::<f64>(
+                &circuit,
+                Mode::Dc {
+                    guess: &guess,
+                    limits: &DcJunctionLimits::zeroed(&circuit),
+                    used: &mut used,
+                    gmin: 1e-12,
+                    src_scale: 1.0,
+                },
+            )
+            .unwrap();
+            assert_solve_matches_dense(&sys, "dc", |v| v.abs());
+        }
+
+        // Transient, one trapezoidal step on a default history.
+        {
+            let guess = DVector::zeros(circuit.tran_matrix_size());
+            let state = TransientState::default();
+            let sys = build_system::<f64>(
+                &circuit,
+                Mode::Tran {
+                    dt: 1e-6,
+                    t: 0.0,
+                    state: &state,
+                    method: IntegrationMethod::Trapezoidal,
+                    guess: &guess,
+                    startup: false,
+                },
+            )
+            .unwrap();
+            assert_solve_matches_dense(&sys, "tran", |v| v.abs());
+        }
+
+        // AC over the complex field at a zero bias.
+        {
+            let bias = DVector::zeros(circuit.tran_matrix_size());
+            let sys = build_system::<Complex64>(
+                &circuit,
+                Mode::Ac {
+                    freq: 1e3,
+                    bias: &bias,
+                },
+            )
+            .unwrap();
+            assert_solve_matches_dense(&sys, "ac", |v| v.norm());
+        }
+    }
+
     /// Every dense non-zero slot sits in the structural record.
     fn assert_record_covers<T: Field>(sys: &MnaSystem<T>, arm: &str) {
         for row in 0..sys.size {
@@ -3477,6 +3564,36 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// `sys.solve()` — the sparse path where the pattern admits an order,
+    /// dense otherwise — answers like a straight dense LU solve of the same
+    /// matrix. `mag` measures the field's magnitudes (`.abs()` real, `.norm()`
+    /// complex).
+    fn assert_solve_matches_dense<T, F>(sys: &MnaSystem<T>, arm: &str, mag: F)
+    where
+        T: Field,
+        F: Fn(T) -> f64,
+    {
+        let sparse = sys
+            .solve()
+            .unwrap_or_else(|e| panic!("{arm}: solve failed: {e}"));
+        let dense = sys
+            .a
+            .clone()
+            .lu()
+            .solve(&sys.z)
+            .unwrap_or_else(|| panic!("{arm}: dense reference solve failed"));
+        for (i, (s, d)) in sparse.iter().zip(dense.iter()).enumerate() {
+            let diff = mag(*s - *d);
+            let scale = 1.0 + mag(*s).max(mag(*d));
+            assert!(
+                diff <= 1e-8 * scale,
+                "{arm}: solve entry {i}: sparse {} vs dense {}",
+                mag(*s),
+                mag(*d)
+            );
         }
     }
 
@@ -3513,6 +3630,8 @@ mod tests {
              K1 L1 L2 0.9\n\
              Vc ctrl 0 DC 1\n\
              S1 s1 s2 ctrl 0 sw\n\
+             Rs1 s1 0 1k\n\
+             Rs2 s2 0 1k\n\
              Ep out 0 POLY(2) in 0 mid 0 1 2 3\n\
              El out2 0 in 0 10\n\
              G1 gi in mid 0 1m\n\
@@ -3528,11 +3647,15 @@ mod tests {
              Bi bi 0 I=I(V1)*10\n\
              Ub uo 0 0 in um\n\
              T1 ta 0 tb 0 Z0=50 TD=1n\n\
+             Rta ta 0 1k\n\
+             Rtb tb 0 1k\n\
              D1 da 0 dm\n\
              Q1 qc qb 0 qm\n\
              J1 jg 0 js jm\n\
              Rg mg 0 1meg\n\
              M1 md mg ms ms mm W=10u L=1u\n\
+             Rms ms 0 1k\n\
+             Rd md 0 1k\n\
              Rload out 0 1k\n\
              .op\n\
              .tran 1u 10u\n\

@@ -83,21 +83,26 @@ below is written against that state.
 
 ## 3. Engine & numerical core
 
-- [ ] **[P1] (both)** Sparse MNA solver replacing dense `nalgebra` LU — KLU-class with symbolic
-  Markowitz ordering computed at netlist load; dense LU is infeasible beyond a few thousand nodes. *(Groundwork
-  slice 1 landed as `sparse.rs` + the `stamp_add`/`stamp_sub` seam: one build records every matrix slot it
-  writes (`MnaSystem.touched`, a superset of the structural non-zeros — zoo-tested against the dense matrix in
-  all three arms), and the record compiles to CSR plus an unsymmetric full-Markowitz order with a no-stranding
-  guard. Dense `nalgebra` LU solves unchanged; the numeric sparse assembly/solve and load-time pattern reuse
-  remain open. See `docs/adr/0002`.)*
+- [x] **[P1] (both)** Sparse MNA solver replacing dense `nalgebra` LU — KLU-class with symbolic
+  Markowitz ordering computed at netlist load; dense LU is infeasible beyond a few thousand nodes. *(done: slice 1
+  landed `sparse.rs` + the `stamp_add`/`stamp_sub` seam (`MnaSystem.touched`, a zoo-tested superset record → CSR →
+  unsymmetric full-Markowitz order with a no-stranding guard, `ADR 0002`); slice 2 landed the numeric factor:
+  `SparsePlan` pools compiled orders per thread and `factor_solve` runs a fixed-order left-looking
+  Gilbert–Peierls LU (unit-L columns / U rows) in elimination space — sparse answers, dense LU falls back on any
+  sparse failure, zoo-tested sparse-vs-dense in all three arms (`ADR 0003`). Measured A/B on the benchmark suite:
+  ladder-200 ~4× faster (778→191 ms), ladder-50 ~1.3×, tiny decks gated back to the dense kernel (`SMALL_SYSTEM`
+  = 16). Remaining open, smaller: mark incremental the O(n·nnz) Markowitz scan, pool the per-solve factor
+  workspace (retires the small-n gate), factor-once/solve-many across NR iterates and timesteps.)*
 - [ ] **[P1] (both)** LU factorization reuse across NR iterations and timesteps when the matrix changes
   only by values, not topology — today the matrix is rebuilt and cloned per iterate. *(Dense-buffer
   restamp reuse was prototyped against the NR loop and is a measured loss on the dense path: a reused
   `a` forces a full `n²` `fill(0.0)` per rebuild, while fresh `DMatrix::zeros` rides calloc's lazy
   zero pages (probe: reuse-fill 76.2 µs vs fresh-zeros 10.9 µs at n=210; ladder-200 regressed
-  702→815 ms). Per-iterate allocation churn is the cheaper cost here; revisit behind the sparse
-  solver above, where restamp reset follows the stamp count, and factor-reuse for the
-  linear-only-per-iterate companion stamps rides the same symbolic pattern.)*
+  702→815 ms). Per-iterate allocation churn is the cheaper cost here. The sparse solver (line 86
+  slice 2) already eats part of this on the sparse path: `factor_solve` reads values straight off
+  the stamped dense matrix — no clone, no `n²` restamp — and re-factors per solve at sparse cost.
+  Still open on top: factor-once/solve-many when only the RHS changes between calls, and the
+  linear-only-per-iterate companion stamps riding the same symbolic pattern.)*
 - [ ] **[P1] (LT baseline)** Multithreaded matrix assembly/factorization and time-stepping loop;
   LTspice is threaded today, PSpice multithreading is unclear on this baseline.
 - [x] **[P1] (both)** Trapezoidal integration as the default companion model with `.options
@@ -126,6 +131,14 @@ below is written against that state.
   and bandgap terms recomputed from absolute temperature — done: diode `IS(T)`/`Vt` with
   `EG`/`XTI`/`TNOM`, MOSFET `TCV`/`BEX`/`TNOM`, passive `TC1`/`TC2` model cards, several
   `.temp` values or `.step temp` run the deck per temperature.
+- [ ] **[P1] (LT)** `.options trtol` transient error tolerance — LTspice uses `trtol` (default 2.0)
+  as the truncation-error overestimation factor in its adaptive timestep controller; RSpice's LTE
+  path has no `trtol` knob. Found as a string literal in `LTspice.exe` (reverse-engineered via
+  REA/rizin; see `docs/ltspice-parity-gap.md` §5.5).
+- [ ] **[P1] (LT)** AVX2/SIMD-optimized transcendental math — `LTspice.exe` ships `sin_avx2.c`,
+  `cos_avx2.c`, `tan_avx2.c`, `exp_avx2.c`, `log_avx2.c`, `log10_avx2.c`, `pow_avx2.c` etc. for
+  vectorized device/B-source evaluation; RSpice uses scalar `f64` math. Gate on
+  `target_feature = "avx2"` with scalar fallback. (Same REA source as above.)
 
 ## 4. Analyses
 

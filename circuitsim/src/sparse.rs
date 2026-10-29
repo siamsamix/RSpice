@@ -1,14 +1,17 @@
-//! Sparse MNA groundwork (TODO §3): the stamp record → structural pattern →
-//! symbolic pivot-order pipeline.
+//! Sparse MNA solver (TODO §3): the stamp record → structural pattern →
+//! symbolic pivot order → numeric LU pipeline.
 //!
-//! Nothing here changes numerics yet. [`MnaSystem`](crate::mna::MnaSystem)
-//! records which matrix slots each build wrote into through the
-//! `stamp_add`/`stamp_sub` seam ([`StampBits`]); the record compiles to a
-//! compressed structure ([`CompressedPattern`]); the structure compiles to a
-//! symbolic pivot order ([`markowitz_ordering`]). The dense LU keeps solving;
-//! a numeric sparse solver slots in behind this seam once it exists, and LU
-//! factorization reuse (the measured-out item next to this TODO line) rides
-//! the same pattern.
+//! [`MnaSystem`](crate::mna::MnaSystem) records which matrix slots each build
+//! wrote into through the `stamp_add`/`stamp_sub` seam ([`StampBits`]); the
+//! record compiles to a compressed structure ([`CompressedPattern`]); the
+//! structure compiles to a symbolic pivot order ([`markowitz_ordering`]);
+//! and [`SparsePlan`] turns a compiled order back into a numeric LU factor
+//! and solve against the system's live values. The dense `nalgebra` LU keeps
+//! solving as the fallback and reference: a sparse plan that fails — no
+//! admissible order, or a numerically zero pivot — is silently dropped and
+//! the dense path answers, so the sparse layer can only ever change what a
+//! solve *costs*, never what it *says*. (LU factorization reuse, the
+//! measured-out dense item next to this TODO line, rides the same plan.)
 //!
 //! The record is deliberately a *superset* of the matrix's structural
 //! non-zeros: a slot can be visited yet numerically zero (opposing stamps
@@ -16,8 +19,18 @@
 //! "Visited ⊆ non-zero" would be false; "non-zero ⊆ visited" is the
 //! invariant that holds, and it is the sound direction for a symbolic
 //! pattern — the compiler may only ever see extra structure, never miss any.
+//! The numeric factor carries the same direction through: visited-but-zero
+//! entries are scattered (they may be *resurrected* by fill from an earlier
+//! update arriving at that slot) but exact-zero factor entries are simply
+//! not stored — a stored zero could only ever contribute zero.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::hash::Hasher;
+use std::sync::Arc;
+
+use nalgebra::{DMatrix, DVector};
+
+use crate::mna::Field;
 
 /// Which matrix slots one MNA build wrote into: a bitset over the `n²`
 /// slots, [`visit`](Self::visit) is O(1) per stamp.
@@ -241,6 +254,255 @@ pub fn markowitz_ordering(pattern: &CompressedPattern) -> Option<SymbolicOrder> 
     Some(SymbolicOrder { order, fill })
 }
 
+// ─── Numeric solver ─────────────────────────────────────────────────────────
+
+/// A compiled pivot order ready to *factor and solve* against live system
+/// values: the numeric consumer of the record → pattern →
+/// [`markowitz_ordering`] pipeline.
+///
+/// Everything structural is precomputed once — the row/column permutations
+/// into elimination index space and the column-compile the scatter needs —
+/// so one solve after another pays only for values and arithmetic. Plans are
+/// immutable and pooled per thread (see [`sparse_plan`]).
+pub(crate) struct SparsePlan {
+    /// The exact pattern this plan was compiled from: a memo hit is only
+    /// used after a full pattern match, so a fingerprint collision can slow
+    /// the lookup but never hand back a wrong plan.
+    pattern: CompressedPattern,
+    /// Row permutation: `row_perm[r]` is elimination index of original row
+    /// `r` — the scatter direction.
+    row_perm: Vec<usize>,
+    /// `elim_rows[k]` / `elim_cols[k]`: the original row / column eliminated
+    /// at elimination `k`.
+    elim_rows: Vec<usize>,
+    elim_cols: Vec<usize>,
+    /// Columns-compile of `pattern`: `col_rows[col_ptr[c]..col_ptr[c+1]]`
+    /// lists the original rows with an entry in original column `c`.
+    col_ptr: Vec<usize>,
+    col_rows: Vec<usize>,
+}
+
+impl SparsePlan {
+    /// Compile a plan for `pattern`, or `None` when no Markowitz order
+    /// exists (structurally stuck shapes keep solving densely).
+    fn compile(pattern: &CompressedPattern) -> Option<Self> {
+        let order = markowitz_ordering(pattern)?;
+        let n = pattern.n();
+        let mut row_perm = vec![0; n];
+        let mut elim_rows = Vec::with_capacity(n);
+        let mut elim_cols = Vec::with_capacity(n);
+        for (k, (r, c)) in order.order.iter().enumerate() {
+            let (r, c) = (*r as usize, *c as usize);
+            row_perm[r] = k;
+            elim_rows.push(r);
+            elim_cols.push(c);
+        }
+        // Transposed compile: per original column, its original rows. The
+        // count-then-place pass keeps columns internally row-ascending.
+        let mut counts = vec![0; n];
+        for &col in &pattern.col_idx {
+            counts[col] += 1;
+        }
+        let mut col_ptr = Vec::with_capacity(n + 1);
+        let mut offset = 0;
+        for count in counts {
+            col_ptr.push(offset);
+            offset += count;
+        }
+        col_ptr.push(offset);
+        let mut cursor = col_ptr[..n].to_vec();
+        let mut col_rows = vec![0; pattern.nnz()];
+        for row in 0..n {
+            for &col in pattern.columns_of(row) {
+                col_rows[cursor[col]] = row;
+                cursor[col] += 1;
+            }
+        }
+        Some(Self {
+            pattern: pattern.clone(),
+            row_perm,
+            elim_rows,
+            elim_cols,
+            col_ptr,
+            col_rows,
+        })
+    }
+
+    /// Factor the live matrix values and solve A·x = rhs.
+    ///
+    /// The pivot sequence is the compiled Markowitz order, fixed at plan
+    /// compile time — no magnitude reselection happens at factor time. A
+    /// numerically zero pivot (the exact-zero test, the dense LU's own
+    /// singularity notion) returns `None`, and the caller solves densely: a
+    /// sparse failure never changes what a solve reports, only what it
+    /// costs. NaNs propagate into the result like any other value, exactly
+    /// as they would through the dense path.
+    pub(crate) fn factor_solve<T: Field>(
+        &self,
+        a: &DMatrix<T>,
+        rhs: &DVector<T>,
+    ) -> Option<DVector<T>> {
+        let n = self.pattern.n();
+        // Permutation-space workspace for the column being factored. `x[i]`
+        // is live when `stamp[i] == gen`, with `touched` naming every live
+        // slot; the counter resets the workspace without clearing it.
+        let mut x = vec![T::lift(0.0); n];
+        let mut stamp = vec![0u32; n];
+        let mut touched: Vec<usize> = Vec::with_capacity(n);
+        let mut gen: u32 = 0;
+        // Discovery frontier of the left-looking gather (Gilbert–Peierls
+        // reach): rows joined by the L factors of already-gathered rows,
+        // cleared per column.
+        let mut frontier = BTreeSet::new();
+        // The factors: U by rows (each push's column is strictly later in
+        // its row's push history, so per-row stores stay sorted), L by
+        // columns (unit diagonal implied), the diagonal separately.
+        let mut urow: Vec<Vec<(usize, T)>> = Vec::new();
+        let mut lcol: Vec<Vec<(usize, T)>> = Vec::new();
+        urow.resize_with(n, Vec::new);
+        lcol.resize_with(n, Vec::new);
+        let mut diag = vec![T::lift(0.0); n];
+
+        for pk in 0..n {
+            gen += 1;
+            touched.clear();
+            frontier.clear();
+            // Scatter the elimination column: original column `elim_cols[pk]`
+            // spread over its pattern rows in permutation space. Every pivot
+            // slot is structurally present — the order was picked from this
+            // pattern — so the diagonal is seeded with the scatter.
+            let col = self.elim_cols[pk];
+            for &r in &self.col_rows[self.col_ptr[col]..self.col_ptr[col + 1]] {
+                let i = self.row_perm[r];
+                stamp[i] = gen;
+                touched.push(i);
+                frontier.insert(i);
+                x[i] = a[(r, col)];
+            }
+            // Gather the column down its reach walking rows ascending. Every
+            // legal feed into `x[j]` comes from a smaller row, so pop-first
+            // order is topological for free: when `j` pops, every feeding
+            // row already radiated into it. A gathered row's final value
+            // is its U slot in this column; it feeds every row its L-column
+            // touches. At the pivot the column stops radiating — rows beyond
+            // it belong to this column's L, and their elimination belongs to
+            // later columns.
+            let mut d = T::lift(0.0);
+            while let Some(j) = frontier.pop_first() {
+                let jx = x[j];
+                if j == pk {
+                    d = jx;
+                    break;
+                }
+                if jx == T::lift(0.0) {
+                    continue;
+                }
+                urow[j].push((pk, jx));
+                for &(i, l) in &lcol[j] {
+                    if stamp[i] == gen {
+                        x[i] -= l * jx;
+                    } else {
+                        stamp[i] = gen;
+                        x[i] = T::lift(0.0) - l * jx;
+                        touched.push(i);
+                        frontier.insert(i);
+                    }
+                }
+            }
+            if d == T::lift(0.0) {
+                return None;
+            }
+            diag[pk] = d;
+            // The rows gathered beyond the pivot are this column's L entries.
+            for &i in &touched {
+                if i <= pk {
+                    continue;
+                }
+                let v = x[i];
+                if v != T::lift(0.0) {
+                    lcol[pk].push((i, v / d));
+                }
+            }
+        }
+
+        // Solve the permuted system: y = P·rhs, the unit-L forward pass, the
+        // U back pass over the same buffer (entries above each pivot are the
+        // factor values already solved), then unpermute into the caller's
+        // column order.
+        let mut y: Vec<T> = vec![T::lift(0.0); n];
+        for k in 0..n {
+            y[k] = rhs[self.elim_rows[k]];
+        }
+        for j in 0..n {
+            let yj = y[j];
+            if yj == T::lift(0.0) {
+                continue;
+            }
+            for &(i, l) in &lcol[j] {
+                y[i] -= l * yj;
+            }
+        }
+        for k in (0..n).rev() {
+            let mut s = y[k];
+            for &(c, u) in &urow[k] {
+                s -= u * y[c];
+            }
+            y[k] = s / diag[k];
+        }
+        let mut out = vec![T::lift(0.0); n];
+        for (k, &v) in y.iter().enumerate() {
+            out[self.elim_cols[k]] = v;
+        }
+        Some(DVector::from_vec(out))
+    }
+}
+
+/// Cheap plan fingerprint: size, entry count, and the sorted column list.
+/// Collisions are expected-but-rare; a full pattern equality check inside
+/// the pool keeps them honest ([`SparsePlan::pattern`]).
+fn fingerprint(pattern: &CompressedPattern) -> u64 {
+    use std::collections::hash_map::DefaultHasher;
+    let mut hasher = DefaultHasher::new();
+    hasher.write_usize(pattern.n());
+    hasher.write_usize(pattern.nnz());
+    for &col in &pattern.col_idx {
+        hasher.write_usize(col);
+    }
+    hasher.finish()
+}
+
+/// The plan pool. Structural patterns recur — the same record is compressed
+/// on every NR iterate and every timestep — and the Markowitz scan dominates
+/// a plan's cost, so plans are pooled in a thread-local map keyed by the
+/// fingerprint above. Pool entries never go stale: a candidate is used only
+/// after matching the full pattern, and the scan is the honest O(n·nnz)
+/// version, so the *first* build per pattern pays it once.
+pub(crate) fn sparse_plan(pattern: &CompressedPattern) -> Option<Arc<SparsePlan>> {
+    thread_local! {
+        static PLANS: std::cell::RefCell<HashMap<u64, Vec<Arc<SparsePlan>>>> =
+            std::cell::RefCell::new(HashMap::new());
+    }
+
+    let key = fingerprint(pattern);
+    PLANS.with(|pool| {
+        let mut pool = pool.borrow_mut();
+        // Unbounded structural churn would be a leak; a proportional cap
+        // trades the tail of the pool away. MNA per thread has a handful of
+        // distinct patterns, so clearing at four digits is already generous.
+        if pool.len() >= 1024 {
+            pool.clear();
+        }
+        if let Some(bucket) = pool.get(&key) {
+            if let Some(found) = bucket.iter().find(|plan| plan.pattern == *pattern) {
+                return Some(Arc::clone(found));
+            }
+        }
+        let plan = Arc::new(SparsePlan::compile(pattern)?);
+        pool.entry(key).or_default().push(Arc::clone(&plan));
+        Some(plan)
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -384,5 +646,97 @@ mod tests {
         bits.visit(0, 0);
         let pat = bits.compress();
         assert!(markowitz_ordering(&pat).is_none());
+    }
+
+    // ─── Numeric solver ────────────────────────────────────────────────────
+
+    /// The 3-cycle, the pure-MNA shape with no diagonals and different
+    /// row/column permutations: the factor must respect both axes.
+    #[test]
+    fn sparse_lu_solves_the_three_cycle() {
+        let mut bits = StampBits::zeros(3);
+        bits.visit(0, 1);
+        bits.visit(1, 2);
+        bits.visit(2, 0);
+        let plan = SparsePlan::compile(&bits.compress()).unwrap();
+        // A = [[0, 2, 0], [0, 0, 3], [1, 0, 0]]: x = (b₂, b₀/2, b₁/3).
+        let a = DMatrix::from_row_slice(3, 3, &[0.0, 2.0, 0.0, 0.0, 0.0, 3.0, 1.0, 0.0, 0.0]);
+        let rhs = DVector::from_vec(vec![4.0, 3.0, 2.0]);
+        let x = plan.factor_solve(&a, &rhs).unwrap();
+        assert_eq!(x.as_slice(), &[2.0, 2.0, 1.0]);
+    }
+
+    /// A structurally absent diagonal the ordering promised as fill: the
+    /// first elimination creates the (1,1) pivot value out of a visited-zero
+    /// slot, and the elimination continues on the resurrected value.
+    #[test]
+    fn sparse_lu_carries_the_promised_fill() {
+        let mut bits = StampBits::zeros(3);
+        bits.visit(0, 0);
+        bits.visit(0, 1);
+        bits.visit(1, 0);
+        bits.visit(1, 2);
+        bits.visit(2, 1);
+        bits.visit(2, 2);
+        let plan = SparsePlan::compile(&bits.compress()).unwrap();
+        // [[2, 1, 0], [2, 0, 3], [0, 1, 1]]: A·x with x = (1, 2, 3) is
+        // (4, 11, 5); the (1,1) slot is visited-zero yet pivots because the
+        // promised fill arrives there with value −L₁₀·U₀₁.
+        let a = DMatrix::from_row_slice(3, 3, &[2.0, 1.0, 0.0, 2.0, 0.0, 3.0, 0.0, 1.0, 1.0]);
+        let rhs = DVector::from_vec(vec![4.0, 11.0, 5.0]);
+        let x = plan.factor_solve(&a, &rhs).unwrap();
+        assert_eq!(x.as_slice(), &[1.0, 2.0, 3.0]);
+    }
+
+    /// A pivot that revisits exactly zero goes back to the dense solver:
+    /// `None` is the caller's fallback signal, never a panic or a NaN flood.
+    #[test]
+    fn sparse_lu_reports_none_on_zero_pivot() {
+        let mut bits = StampBits::zeros(2);
+        for row in 0..2 {
+            for col in 0..2 {
+                bits.visit(row, col);
+            }
+        }
+        let plan = SparsePlan::compile(&bits.compress()).unwrap();
+        let a = DMatrix::from_row_slice(2, 2, &[1.0, 1.0, 0.0, 0.0]);
+        let rhs = DVector::from_vec(vec![1.0, 0.0]);
+        assert!(plan.factor_solve(&a, &rhs).is_none());
+    }
+
+    /// Visited-but-zero factor entries are simply not stored; the answer is
+    /// unaffected because a stored zero could only contribute zero.
+    #[test]
+    fn zero_valued_entries_skip_storage_without_changing_the_answer() {
+        let mut bits = StampBits::zeros(2);
+        for row in 0..2 {
+            for col in 0..2 {
+                bits.visit(row, col);
+            }
+        }
+        let plan = SparsePlan::compile(&bits.compress()).unwrap();
+        // [[1, 1], [0, 2]]·x = [2, 4] → x = [0, 2]; the (1,0) slot is
+        // visited but exactly zero, so L keeps no entry for it.
+        let a = DMatrix::from_row_slice(2, 2, &[1.0, 1.0, 0.0, 2.0]);
+        let rhs = DVector::from_vec(vec![2.0, 4.0]);
+        let x = plan.factor_solve(&a, &rhs).unwrap();
+        assert_eq!(x.as_slice(), &[0.0, 2.0]);
+    }
+
+    /// Identical patterns share one pooled plan; a pattern that differs
+    /// gets its own. (`Arc::ptr_eq` is the observable.)
+    #[test]
+    fn sparse_plan_pool_reuses_identical_patterns() {
+        let mut bits = StampBits::zeros(3);
+        for i in 0..3 {
+            bits.visit(i, i);
+        }
+        let diagonal = bits.compress();
+        let first = sparse_plan(&diagonal).expect("diagonal pattern orders");
+        let second = sparse_plan(&diagonal).expect("same pattern");
+        assert!(Arc::ptr_eq(&first, &second));
+        bits.visit(0, 1);
+        let richer = sparse_plan(&bits.compress()).expect("the richer pattern orders too");
+        assert!(!Arc::ptr_eq(&first, &richer));
     }
 }

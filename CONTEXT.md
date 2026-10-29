@@ -40,8 +40,20 @@ deepening that has not landed yet.
   `mna.rs`. Rationale and one-writer rule in `docs/adr/0002`.
 - **Structural pattern (sparse groundwork)** — `sparse.rs`'s CSR form (`CompressedPattern`) of a
   stamp record, compiled by `markowitz_ordering` into an unsymmetric full-Markowitz pivot order
-  (`SymbolicOrder`, fill counts included) with a no-stranding guard. Numerics unchanged: the dense
-  `nalgebra` LU still solves; the numeric sparse solver consumes this layer later (TODO §3).
+  (`SymbolicOrder`, fill counts included) with a no-stranding guard. Numerics via `SparsePlan`
+  below — a `solve()` hit uses the plan, everything else rides the dense LU.
+- **Sparse LU (numeric solver)** — `SparsePlan`: the compiled order plus its permutations and a
+  columns-compile of the pattern, pooling per thread (`sparse_plan`; fingerprint-keyed with full
+  pattern equality on hit, so a collision never returns a stale plan). `factor_solve` runs a
+  left-looking Gilbert–Peierls factor in elimination space: scatter `elim_cols[k]`, walk the
+  discovery frontier ascending (topological for free — all feeds come from smaller rows), store
+  no exact-zero factor entries, and a numerically zero pivot returns `None` (the caller's dense
+  fallback). Fixed order, no magnitude reselection; NaNs propagate like values.
+- **Dense-kernel crossover (`SMALL_SYSTEM`)** — `MnaSystem::solve` skips the sparse attempt below
+  16 unknowns: measured A/B on the benchmark suite showed tiny decks (n ≤ 9) paying ~30% wall for
+  shape/workspace setup while the 200-node ladder wins ~4×. Pooling the factor workspace inside
+  the plan is the follow-up that would retire the gate. `ADR 0003` owns the numbers and the
+  sparse-failures-fall-back invariant.
 - **Operating point (`.op`)** — DC solve; nonlinear elements linearize via Newton–Raphson. Also the `DcResult` that seeds `.tran` and `.ac`.
 - **DC sweep (`.dc`)** — a real sweep: one or two `DcSweepSpec`s over a `V`/`I` source or a parameter, values from linear start/stop/increment or `LIST`. Runs per point (`run_dc_sweep`), the second sweep nested inside the first, capped at `MAX_SWEEP_POINTS`. Results are `DcSweepResult`/`DcSweepPoint`; arguments are validated or rejected — never dropped.
 - **Newton–Raphson (NR)** — the nonlinear convergence loop, tolerance 1e-6, 100 iterations. One loop shared by DC and transient (cut #4); `analysis` owns it, `mna` owns stamping.

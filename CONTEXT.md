@@ -33,6 +33,15 @@ deepening that has not landed yet.
 - **Branch currents** — `BranchCurrents<T>`, every element family's current at one operating point, laid out as `Circuit::element_names(family)` with `slice(family)` resolving the family in one place: `<f64>` for real analyses, `<Complex64>` phasors for `.ac` (measurement collapses magnitudes via `collapse_ac`). One report shape for both fields.
 - **Field** — the small trait (`from_real`, arithmetic ops) letting one stamping implementation serve both fields.
 - **Mode** — `Dc`, `Tran { dt }`, `Ac { omega }`: three modes of one system build, replacing three builders.
+- **Stamp record (touched)** — the `StampBits` bitset a build fills through the
+  `stamp_add`/`stamp_sub` seam: every matrix slot any stamp wrote into, one entry per build.
+  Deliberately a *superset* of the matrix's structural non-zeros (opposing stamps can cancel to
+  exact 0.0); "non-zero ⊆ record" is the invariant, kept per analysis arm by the zoo tripwire in
+  `mna.rs`. Rationale and one-writer rule in `docs/adr/0002`.
+- **Structural pattern (sparse groundwork)** — `sparse.rs`'s CSR form (`CompressedPattern`) of a
+  stamp record, compiled by `markowitz_ordering` into an unsymmetric full-Markowitz pivot order
+  (`SymbolicOrder`, fill counts included) with a no-stranding guard. Numerics unchanged: the dense
+  `nalgebra` LU still solves; the numeric sparse solver consumes this layer later (TODO §3).
 - **Operating point (`.op`)** — DC solve; nonlinear elements linearize via Newton–Raphson. Also the `DcResult` that seeds `.tran` and `.ac`.
 - **DC sweep (`.dc`)** — a real sweep: one or two `DcSweepSpec`s over a `V`/`I` source or a parameter, values from linear start/stop/increment or `LIST`. Runs per point (`run_dc_sweep`), the second sweep nested inside the first, capped at `MAX_SWEEP_POINTS`. Results are `DcSweepResult`/`DcSweepPoint`; arguments are validated or rejected — never dropped.
 - **Newton–Raphson (NR)** — the nonlinear convergence loop, tolerance 1e-6, 100 iterations. One loop shared by DC and transient (cut #4); `analysis` owns it, `mna` owns stamping.

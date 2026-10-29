@@ -17,6 +17,7 @@ use crate::circuit::{
 };
 use crate::error::{Result, SimError};
 use crate::model::thermal_voltage;
+use crate::sparse::StampBits;
 
 /// Model lookup shared by every stamp and current-extraction loop: the one
 /// canonical `ok_or` for a device card whose model name does not resolve.
@@ -571,6 +572,12 @@ pub struct MnaSystem<T: Field> {
     pub(crate) size: usize,
     pub(crate) a: DMatrix<T>,
     pub(crate) z: DVector<T>,
+    /// Structural record of this build: every `a` slot any stamp wrote into
+    /// (via [`Self::stamp_add`] / [`Self::stamp_sub`]). A *superset* of the
+    /// numerical non-zeros — a visited slot may still hold 0.0 (cancelling
+    /// stamps, a switch conductance landing exactly on a stub) — which is
+    /// the sound direction for pattern compilation; see `crate::sparse`.
+    pub(crate) touched: StampBits,
     /// Where the branch rows live in `a`/`z`.
     pub(crate) branch: BranchLayout,
 }
@@ -581,6 +588,7 @@ impl<T: Field> MnaSystem<T> {
             size,
             a: DMatrix::zeros(size, size),
             z: DVector::zeros(size),
+            touched: StampBits::zeros(size),
             branch: BranchLayout {
                 n_nodes: 0,
                 vsrc_base: 0,
@@ -598,6 +606,22 @@ impl<T: Field> MnaSystem<T> {
         let mut sys = Self::new(circuit.tran_matrix_size());
         sys.branch = BranchLayout::for_circuit(circuit);
         sys
+    }
+
+    /// The stamp seam: whatever the build writes into `a` goes through here
+    /// (add) or [`Self::stamp_sub`] (subtract) so one build leaves a complete
+    /// structural record in `touched` for the sparse compiler (TODO §3).
+    pub fn stamp_add(&mut self, row: usize, col: usize, v: T) {
+        self.a[(row, col)] += v;
+        self.touched.visit(row, col);
+    }
+
+    /// The subtracting twin of [`Self::stamp_add`] — the stamps accumulate
+    /// both signs, and spelling `-v` generically would need a `Neg` bound on
+    /// [`Field`].
+    pub fn stamp_sub(&mut self, row: usize, col: usize, v: T) {
+        self.a[(row, col)] -= v;
+        self.touched.visit(row, col);
     }
 
     /// Solve A·x = z using LU decomposition.
@@ -747,12 +771,12 @@ pub fn build_system<T: Field>(circuit: &Circuit, mode: Mode) -> Result<MnaSystem
             for (i, l) in circuit.inductors.iter().enumerate() {
                 let branch = sys.branch.ind_branch(i);
                 if let Some(i1) = node_index(l.n1) {
-                    sys.a[(i1, branch)] += T::lift(1.0);
-                    sys.a[(branch, i1)] += T::lift(1.0);
+                    sys.stamp_add(i1, branch, T::lift(1.0));
+                    sys.stamp_add(branch, i1, T::lift(1.0));
                 }
                 if let Some(i2) = node_index(l.n2) {
-                    sys.a[(i2, branch)] -= T::lift(1.0);
-                    sys.a[(branch, i2)] -= T::lift(1.0);
+                    sys.stamp_sub(i2, branch, T::lift(1.0));
+                    sys.stamp_sub(branch, i2, T::lift(1.0));
                 }
             }
 
@@ -847,14 +871,14 @@ pub fn build_system<T: Field>(circuit: &Circuit, mode: Mode) -> Result<MnaSystem
                 let branch = sys.branch.ind_branch(i);
                 let z_l = T::imag(omega * circuit.inductance_at(l));
                 if let Some(i1) = node_index(l.n1) {
-                    sys.a[(i1, branch)] += T::lift(1.0);
-                    sys.a[(branch, i1)] += T::lift(1.0);
+                    sys.stamp_add(i1, branch, T::lift(1.0));
+                    sys.stamp_add(branch, i1, T::lift(1.0));
                 }
                 if let Some(i2) = node_index(l.n2) {
-                    sys.a[(i2, branch)] -= T::lift(1.0);
-                    sys.a[(branch, i2)] -= T::lift(1.0);
+                    sys.stamp_sub(i2, branch, T::lift(1.0));
+                    sys.stamp_sub(branch, i2, T::lift(1.0));
                 }
-                sys.a[(branch, branch)] -= z_l;
+                sys.stamp_sub(branch, branch, z_l);
             }
             stamp_ac_mutual_inductances(circuit, &mut sys, omega);
 
@@ -880,8 +904,8 @@ pub fn build_system<T: Field>(circuit: &Circuit, mode: Mode) -> Result<MnaSystem
                     (line.n2, line.n3, -y12),
                 ] {
                     if let (Some(ia), Some(ib)) = (node_index(a), node_index(b)) {
-                        sys.a[(ia, ib)] += value;
-                        sys.a[(ib, ia)] += value;
+                        sys.stamp_add(ia, ib, value);
+                        sys.stamp_add(ib, ia, value);
                     }
                 }
             }
@@ -956,10 +980,10 @@ fn stamp_controlled_sources<T: Field>(circuit: &Circuit, sys: &mut MnaSystem<T>)
             let coeff = c.coeff(k);
             if let ControlVar::Voltage(p, n) = control {
                 if let Some(col) = node_index(*p) {
-                    sys.a[(row, col)] -= T::lift(coeff);
+                    sys.stamp_sub(row, col, T::lift(coeff));
                 }
                 if let Some(col) = node_index(*n) {
-                    sys.a[(row, col)] += T::lift(coeff);
+                    sys.stamp_add(row, col, T::lift(coeff));
                 }
             }
         }
@@ -975,7 +999,7 @@ fn stamp_controlled_sources<T: Field>(circuit: &Circuit, sys: &mut MnaSystem<T>)
             if let ControlVar::Current(name) = control {
                 if let Some(idx) = voltage_source_index(circuit, name) {
                     let col = layout.src_branch(idx);
-                    sys.a[(row, col)] -= T::lift(coeff);
+                    sys.stamp_sub(row, col, T::lift(coeff));
                 }
             }
         }
@@ -1004,10 +1028,10 @@ fn stamp_controlled_sources<T: Field>(circuit: &Circuit, sys: &mut MnaSystem<T>)
                 if let Some(idx) = voltage_source_index(circuit, name) {
                     let col = layout.src_branch(idx);
                     if let Some(out) = node_index(c.out_p) {
-                        sys.a[(out, col)] += T::lift(coeff);
+                        sys.stamp_add(out, col, T::lift(coeff));
                     }
                     if let Some(out) = node_index(c.out_n) {
-                        sys.a[(out, col)] -= T::lift(coeff);
+                        sys.stamp_sub(out, col, T::lift(coeff));
                     }
                 }
             }
@@ -1026,10 +1050,10 @@ fn stamp_controlled_sources<T: Field>(circuit: &Circuit, sys: &mut MnaSystem<T>)
         let row = layout.opamp_branch(i);
         stamp_branch_nodes(sys, row, u.out_p, u.out_n);
         if let Some(ip) = node_index(u.in_p) {
-            sys.a[(row, ip)] -= T::lift(model.gain);
+            sys.stamp_sub(row, ip, T::lift(model.gain));
         }
         if let Some(im) = node_index(u.in_n) {
-            sys.a[(row, im)] += T::lift(model.gain);
+            sys.stamp_add(row, im, T::lift(model.gain));
         }
         sys.z[row] += T::lift(model.gain * model.vos);
         if model.rin.is_finite() && model.rin > 0.0 {
@@ -1044,12 +1068,12 @@ fn stamp_controlled_sources<T: Field>(circuit: &Circuit, sys: &mut MnaSystem<T>)
 /// `V(a) − V(b) = 0` row plus the symmetric branch couplings.
 fn stamp_branch_nodes<T: Field>(sys: &mut MnaSystem<T>, row: usize, p: NodeId, n: NodeId) {
     if let Some(i) = node_index(p) {
-        sys.a[(i, row)] += T::lift(1.0);
-        sys.a[(row, i)] += T::lift(1.0);
+        sys.stamp_add(i, row, T::lift(1.0));
+        sys.stamp_add(row, i, T::lift(1.0));
     }
     if let Some(j) = node_index(n) {
-        sys.a[(j, row)] -= T::lift(1.0);
-        sys.a[(row, j)] -= T::lift(1.0);
+        sys.stamp_sub(j, row, T::lift(1.0));
+        sys.stamp_sub(row, j, T::lift(1.0));
     }
 }
 
@@ -1063,12 +1087,12 @@ fn stamp_transconductance<T: Field>(
     g: T,
 ) {
     if let Some(row) = node_index(out_p) {
-        if let Some(col) = node_index(cp) { sys.a[(row, col)] += g; }
-        if let Some(col) = node_index(cn) { sys.a[(row, col)] -= g; }
+        if let Some(col) = node_index(cp) { sys.stamp_add(row, col, g); }
+        if let Some(col) = node_index(cn) { sys.stamp_sub(row, col, g); }
     }
     if let Some(row) = node_index(out_n) {
-        if let Some(col) = node_index(cp) { sys.a[(row, col)] -= g; }
-        if let Some(col) = node_index(cn) { sys.a[(row, col)] += g; }
+        if let Some(col) = node_index(cp) { sys.stamp_sub(row, col, g); }
+        if let Some(col) = node_index(cn) { sys.stamp_add(row, col, g); }
     }
 }
 
@@ -1225,19 +1249,19 @@ fn stamp_behavioral<T: Field>(
                     match probe {
                         crate::behavior::ProbeBinding::Voltage(p, m) => {
                             if let Some(col) = node_index(*p) {
-                                sys.a[(row, col)] -= g;
+                                sys.stamp_sub(row, col, g);
                             }
                             if let Some(col) = node_index(*m) {
-                                sys.a[(row, col)] += g;
+                                sys.stamp_add(row, col, g);
                             }
                         }
                         crate::behavior::ProbeBinding::SourceCurrent(idx) => {
                             let col = branch.src_branch(*idx);
-                            sys.a[(row, col)] -= g;
+                            sys.stamp_sub(row, col, g);
                         }
                         crate::behavior::ProbeBinding::InductorCurrent(idx) => {
                             let col = branch.ind_branch(*idx);
-                            sys.a[(row, col)] -= g;
+                            sys.stamp_sub(row, col, g);
                         }
                         crate::behavior::ProbeBinding::Unresolved(_) => unreachable!(
                             "probes are bound before stamping (resolve_behavioral)"
@@ -1262,17 +1286,17 @@ fn stamp_behavioral<T: Field>(
                         match probe {
                             crate::behavior::ProbeBinding::Voltage(p, m) => {
                                 if let Some(col) = node_index(*p) {
-                                    sys.a[(row, col)] += g;
+                                    sys.stamp_add(row, col, g);
                                 }
                                 if let Some(col) = node_index(*m) {
-                                    sys.a[(row, col)] -= g;
+                                    sys.stamp_sub(row, col, g);
                                 }
                             }
                             crate::behavior::ProbeBinding::SourceCurrent(idx) => {
-                                sys.a[(row, branch.src_branch(*idx))] += g;
+                                sys.stamp_add(row, branch.src_branch(*idx), g);
                             }
                             crate::behavior::ProbeBinding::InductorCurrent(idx) => {
-                                sys.a[(row, branch.ind_branch(*idx))] += g;
+                                sys.stamp_add(row, branch.ind_branch(*idx), g);
                             }
                             crate::behavior::ProbeBinding::Unresolved(_) => unreachable!(
                                 "probes are bound before stamping (resolve_behavioral)"
@@ -1289,17 +1313,17 @@ fn stamp_behavioral<T: Field>(
                         match probe {
                             crate::behavior::ProbeBinding::Voltage(p, m) => {
                                 if let Some(col) = node_index(*p) {
-                                    sys.a[(row, col)] -= g;
+                                    sys.stamp_sub(row, col, g);
                                 }
                                 if let Some(col) = node_index(*m) {
-                                    sys.a[(row, col)] += g;
+                                    sys.stamp_add(row, col, g);
                                 }
                             }
                             crate::behavior::ProbeBinding::SourceCurrent(idx) => {
-                                sys.a[(row, branch.src_branch(*idx))] -= g;
+                                sys.stamp_sub(row, branch.src_branch(*idx), g);
                             }
                             crate::behavior::ProbeBinding::InductorCurrent(idx) => {
-                                sys.a[(row, branch.ind_branch(*idx))] -= g;
+                                sys.stamp_sub(row, branch.ind_branch(*idx), g);
                             }
                             crate::behavior::ProbeBinding::Unresolved(_) => unreachable!(
                                 "probes are bound before stamping (resolve_behavioral)"
@@ -1538,9 +1562,9 @@ fn stamp_bjts<T: Field>(
             let ve = -dbe;
             let vc = -dbc;
             if let Some(row) = node_index(node) {
-                if let Some(col) = node_index(q.nb) { sys.a[(row, col)] += T::lift(vb); }
-                if let Some(col) = node_index(q.ne) { sys.a[(row, col)] += T::lift(ve); }
-                if let Some(col) = node_index(q.nc) { sys.a[(row, col)] += T::lift(vc); }
+                if let Some(col) = node_index(q.nb) { sys.stamp_add(row, col, T::lift(vb)); }
+                if let Some(col) = node_index(q.ne) { sys.stamp_add(row, col, T::lift(ve)); }
+                if let Some(col) = node_index(q.nc) { sys.stamp_add(row, col, T::lift(vc)); }
                 if with_companion {
                     let constant = i0 - dbe * vbe - dbc * vbc;
                     sys.z[row] -= T::lift(constant);
@@ -1685,9 +1709,9 @@ fn stamp_jfets<T: Field>(
             let vs = -dgs;
             let vd = -dgd;
             if let Some(row) = node_index(node) {
-                if let Some(col) = node_index(j.ng) { sys.a[(row, col)] += T::lift(vg); }
-                if let Some(col) = node_index(j.ns) { sys.a[(row, col)] += T::lift(vs); }
-                if let Some(col) = node_index(j.nd) { sys.a[(row, col)] += T::lift(vd); }
+                if let Some(col) = node_index(j.ng) { sys.stamp_add(row, col, T::lift(vg)); }
+                if let Some(col) = node_index(j.ns) { sys.stamp_add(row, col, T::lift(vs)); }
+                if let Some(col) = node_index(j.nd) { sys.stamp_add(row, col, T::lift(vd)); }
                 if with_companion {
                     let constant = i0 - dgs * vgs - dgd * vgd;
                     sys.z[row] -= T::lift(constant);
@@ -1834,18 +1858,18 @@ fn stamp_mosfets<T: Field>(
         //     +gm at (nd, ng), -gm at (nd, ns), -gm at (ns, ng), +gm at (ns, ns)
         if let Some(id_idx) = node_index(drain) {
             if let Some(ig_idx) = node_index(gate) {
-                sys.a[(id_idx, ig_idx)] += T::lift(s * gm);
+                sys.stamp_add(id_idx, ig_idx, T::lift(s * gm));
             }
             if let Some(is_idx) = node_index(source) {
-                sys.a[(id_idx, is_idx)] -= T::lift(s * gm);
+                sys.stamp_sub(id_idx, is_idx, T::lift(s * gm));
             }
         }
         if let Some(is_idx) = node_index(source) {
             if let Some(ig_idx) = node_index(gate) {
-                sys.a[(is_idx, ig_idx)] -= T::lift(s * gm);
+                sys.stamp_sub(is_idx, ig_idx, T::lift(s * gm));
             }
             if let Some(is2_idx) = node_index(source) {
-                sys.a[(is_idx, is2_idx)] += T::lift(s * gm);
+                sys.stamp_add(is_idx, is2_idx, T::lift(s * gm));
             }
         }
 
@@ -1853,18 +1877,18 @@ fn stamp_mosfets<T: Field>(
         //   Current gbs*Vbs flows from drain to source.
         if let Some(id_idx) = node_index(drain) {
             if let Some(ib_idx) = node_index(bulk) {
-                sys.a[(id_idx, ib_idx)] += T::lift(s * gbs);
+                sys.stamp_add(id_idx, ib_idx, T::lift(s * gbs));
             }
             if let Some(is_idx) = node_index(source) {
-                sys.a[(id_idx, is_idx)] -= T::lift(s * gbs);
+                sys.stamp_sub(id_idx, is_idx, T::lift(s * gbs));
             }
         }
         if let Some(is_idx) = node_index(source) {
             if let Some(ib_idx) = node_index(bulk) {
-                sys.a[(is_idx, ib_idx)] -= T::lift(s * gbs);
+                sys.stamp_sub(is_idx, ib_idx, T::lift(s * gbs));
             }
             if let Some(is2_idx) = node_index(source) {
-                sys.a[(is_idx, is2_idx)] += T::lift(s * gbs);
+                sys.stamp_add(is_idx, is2_idx, T::lift(s * gbs));
             }
         }
 
@@ -2015,14 +2039,14 @@ fn stamp_inductors<T: Field>(
         let branch = sys.branch.ind_branch(i);
 
         if let Some(i1) = node_index(l.n1) {
-            sys.a[(i1, branch)] += T::lift(1.0);
-            sys.a[(branch, i1)] += T::lift(1.0);
+            sys.stamp_add(i1, branch, T::lift(1.0));
+            sys.stamp_add(branch, i1, T::lift(1.0));
         }
         if let Some(i2) = node_index(l.n2) {
-            sys.a[(i2, branch)] -= T::lift(1.0);
-            sys.a[(branch, i2)] -= T::lift(1.0);
+            sys.stamp_sub(i2, branch, T::lift(1.0));
+            sys.stamp_sub(branch, i2, T::lift(1.0));
         }
-        sys.a[(branch, branch)] -= T::lift(r_eq);
+        sys.stamp_sub(branch, branch, T::lift(r_eq));
         sys.z[branch] = T::lift(v_eq);
     }
     stamp_mutual_inductances(circuit, sys, dt, state, method);
@@ -2066,8 +2090,8 @@ fn stamp_mutual_inductances<T: Field>(
         let eq_j = companion.dual(m, prev_i, older_i, v_mutual).1;
         let bi = sys.branch.ind_branch(i);
         let bj = sys.branch.ind_branch(j);
-        sys.a[(bi, bj)] -= T::lift(coef);
-        sys.a[(bj, bi)] -= T::lift(coef);
+        sys.stamp_sub(bi, bj, T::lift(coef));
+        sys.stamp_sub(bj, bi, T::lift(coef));
         sys.z[bi] += T::lift(eq_i);
         sys.z[bj] += T::lift(eq_j);
     }
@@ -2093,8 +2117,8 @@ fn stamp_ac_mutual_inductances<T: Field>(
         let zm = T::imag(omega * m);
         let bi = sys.branch.ind_branch(i);
         let bj = sys.branch.ind_branch(j);
-        sys.a[(bi, bj)] -= zm;
-        sys.a[(bj, bi)] -= zm;
+        sys.stamp_sub(bi, bj, zm);
+        sys.stamp_sub(bj, bi, zm);
     }
 }
 
@@ -2122,12 +2146,12 @@ where
     for (i, v) in circuit.voltage_sources.iter().enumerate() {
         let branch = sys.branch.src_branch(i);
         if let Some(i1) = node_index(v.n1) {
-            sys.a[(i1, branch)] += T::lift(1.0);
-            sys.a[(branch, i1)] += T::lift(1.0);
+            sys.stamp_add(i1, branch, T::lift(1.0));
+            sys.stamp_add(branch, i1, T::lift(1.0));
         }
         if let Some(i2) = node_index(v.n2) {
-            sys.a[(i2, branch)] -= T::lift(1.0);
-            sys.a[(branch, i2)] -= T::lift(1.0);
+            sys.stamp_sub(i2, branch, T::lift(1.0));
+            sys.stamp_sub(branch, i2, T::lift(1.0));
         }
         sys.z[branch] = T::lift(value_at(v));
     }
@@ -2148,14 +2172,14 @@ where
 
 fn stamp_admittance<T: Field>(sys: &mut MnaSystem<T>, n1: NodeId, n2: NodeId, y: T) {
     if let Some(i) = node_index(n1) {
-        sys.a[(i, i)] += y;
+        sys.stamp_add(i, i, y);
     }
     if let Some(j) = node_index(n2) {
-        sys.a[(j, j)] += y;
+        sys.stamp_add(j, j, y);
     }
     if let (Some(i), Some(j)) = (node_index(n1), node_index(n2)) {
-        sys.a[(i, j)] -= y;
-        sys.a[(j, i)] -= y;
+        sys.stamp_sub(i, j, y);
+        sys.stamp_sub(j, i, y);
     }
 }
 
@@ -3199,12 +3223,12 @@ pub fn initial_guess(circuit: &Circuit) -> DVector<f64> {
     for (i, v) in circuit.voltage_sources.iter().enumerate() {
         let branch = sys.branch.src_branch(i);
         if let Some(i1) = node_index(v.n1) {
-            sys.a[(i1, branch)] += 1.0;
-            sys.a[(branch, i1)] += 1.0;
+            sys.stamp_add(i1, branch, 1.0);
+            sys.stamp_add(branch, i1, 1.0);
         }
         if let Some(i2) = node_index(v.n2) {
-            sys.a[(i2, branch)] -= 1.0;
-            sys.a[(branch, i2)] -= 1.0;
+            sys.stamp_sub(i2, branch, 1.0);
+            sys.stamp_sub(branch, i2, 1.0);
         }
         sys.z[branch] = v.voltage;
     }
@@ -3213,12 +3237,12 @@ pub fn initial_guess(circuit: &Circuit) -> DVector<f64> {
     for (i, l) in circuit.inductors.iter().enumerate() {
         let branch = sys.branch.ind_branch(i);
         if let Some(i1) = node_index(l.n1) {
-            sys.a[(i1, branch)] += 1.0;
-            sys.a[(branch, i1)] += 1.0;
+            sys.stamp_add(i1, branch, 1.0);
+            sys.stamp_add(branch, i1, 1.0);
         }
         if let Some(i2) = node_index(l.n2) {
-            sys.a[(i2, branch)] -= 1.0;
-            sys.a[(branch, i2)] -= 1.0;
+            sys.stamp_sub(i2, branch, 1.0);
+            sys.stamp_sub(branch, i2, 1.0);
         }
     }
 
@@ -3375,5 +3399,147 @@ mod tests {
         assert_eq!(seeded.diode.len(), circuit.diodes.len());
         assert_eq!(seeded.bjt.len(), circuit.bjts.len());
         assert_eq!(seeded.jfet.len(), circuit.jfets.len());
+    }
+
+    /// The stamp-seam zoo: one deck containing every element family, built
+    /// in all three arms. The structural record must cover every dense
+    /// non-zero — the sound superset direction (`record ⊇ non-zeros`; a
+    /// visited-but-zero slot is allowed, a missed non-zero is a bug) — and
+    /// the record must compile to a Markowitz pivot order on every arm.
+    #[test]
+    fn zoo_stamp_record_covers_dense_nonzeros_in_every_arm() {
+        let circuit = zoo_circuit();
+
+        // DC: junction limiter tables per the dc-stage convention.
+        {
+            let guess = DVector::zeros(circuit.tran_matrix_size());
+            let mut used = DcJunctionLimits::seed(&circuit, &guess);
+            let sys = build_system::<f64>(
+                &circuit,
+                Mode::Dc {
+                    guess: &guess,
+                    limits: &DcJunctionLimits::zeroed(&circuit),
+                    used: &mut used,
+                    gmin: 1e-12,
+                    src_scale: 1.0,
+                },
+            )
+            .unwrap();
+            assert_record_covers(&sys, "dc");
+            assert_record_orders(&sys, "dc");
+        }
+
+        // Transient: fresh history, a real step, trapezoidal (the default).
+        {
+            let guess = DVector::zeros(circuit.tran_matrix_size());
+            let state = TransientState::default();
+            let sys = build_system::<f64>(
+                &circuit,
+                Mode::Tran {
+                    dt: 1e-6,
+                    t: 0.0,
+                    state: &state,
+                    method: IntegrationMethod::Trapezoidal,
+                    guess: &guess,
+                    startup: false,
+                },
+            )
+            .unwrap();
+            assert_record_covers(&sys, "tran");
+            assert_record_orders(&sys, "tran");
+        }
+
+        // AC: everything linearizes at a zero bias — only the record's
+        // completeness matters here, not the values.
+        {
+            let bias = DVector::zeros(circuit.tran_matrix_size());
+            let sys = build_system::<Complex64>(
+                &circuit,
+                Mode::Ac {
+                    freq: 1e3,
+                    bias: &bias,
+                },
+            )
+            .unwrap();
+            assert_record_covers(&sys, "ac");
+            assert_record_orders(&sys, "ac");
+        }
+    }
+
+    /// Every dense non-zero slot sits in the structural record.
+    fn assert_record_covers<T: Field>(sys: &MnaSystem<T>, arm: &str) {
+        for row in 0..sys.size {
+            for col in 0..sys.size {
+                if sys.a[(row, col)] != T::lift(0.0) {
+                    assert!(
+                        sys.touched.is_set(row, col),
+                        "{arm}: dense non-zero at ({row},{col}) missed by the stamp record"
+                    );
+                }
+            }
+        }
+    }
+
+    /// The record compiles: a Markowitz order exists for the arm's pattern,
+    /// one pivot per index.
+    fn assert_record_orders<T: Field>(sys: &MnaSystem<T>, arm: &str) {
+        let pattern = sys.touched.compress();
+        let order = crate::sparse::markowitz_ordering(&pattern)
+            .unwrap_or_else(|| panic!("{arm}: structural pattern has no Markowitz order"));
+        assert_eq!(order.order.len(), pattern.n(), "{arm}: one pivot per index");
+    }
+
+    /// One of every element family: R, C, L, mutual `(K)`, V, I, both `E`
+    /// forms (linear and `POLY`), `G`, `F`, `H`, `S`, both `B` flavours, `U`
+    /// (model form), `T`, `D`, `Q`, `J`, `M`. The three arm tests build this
+    /// deck directly (no analysis run): the record's completeness is a
+    /// stamping property, not a numerics one.
+    fn zoo_circuit() -> Circuit {
+        crate::netlist::parse(
+            "* structural zoo: every element family\n\
+             .model dm D(IS=1e-14)\n\
+             .model qm NPN(IS=1e-14 BF=100)\n\
+             .model jm NJF(VTO=-2 BETA=2e-4 IS=1e-14)\n\
+             .model mm NMOS(LEVEL=1 KP=110u VTO=1)\n\
+             .model sw SW(RON=1 ROFF=1meg VT=0.5)\n\
+             .model um U(GAIN=1e5)\n\
+             V1 in 0 DC 1\n\
+             I1 ib 0 DC 1m\n\
+             Rib ib 0 1meg\n\
+             R1 in mid 1k\n\
+             C1 mid cb 1n\n\
+             L1 la 0 1m\n\
+             L2 lb 0 1m\n\
+             K1 L1 L2 0.9\n\
+             Vc ctrl 0 DC 1\n\
+             S1 s1 s2 ctrl 0 sw\n\
+             Ep out 0 POLY(2) in 0 mid 0 1 2 3\n\
+             El out2 0 in 0 10\n\
+             G1 gi in mid 0 1m\n\
+             Rgi gi 0 1k\n\
+             Rf fi 0 1k\n\
+             F1 fi fin V1 2\n\
+             Rfin fin 0 1k\n\
+             Rh hi 0 1k\n\
+             H1 hi hin V1 2000\n\
+             Rhin hin 0 1k\n\
+             Bv bv 0 V=V(in)*2\n\
+             Rb bi 0 1meg\n\
+             Bi bi 0 I=I(V1)*10\n\
+             Ub uo 0 0 in um\n\
+             T1 ta 0 tb 0 Z0=50 TD=1n\n\
+             D1 da 0 dm\n\
+             Q1 qc qb 0 qm\n\
+             J1 jg 0 js jm\n\
+             Rg mg 0 1meg\n\
+             M1 md mg ms ms mm W=10u L=1u\n\
+             Rload out 0 1k\n\
+             .op\n\
+             .tran 1u 10u\n\
+             .ac dec 5 1k 100meg\n\
+             .end\n",
+        )
+        .unwrap()
+        .circuit
     }
 }

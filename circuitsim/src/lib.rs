@@ -15,6 +15,7 @@ pub mod model;
 pub mod netlist;
 pub mod params;
 pub mod rawwave;
+pub mod sparse;
 pub mod units;
 
 pub use behavior::{Behavior, BehavioralRuntime, BExpr, MathFn, NoiseKind, ProbeBinding, ProbeSpec};

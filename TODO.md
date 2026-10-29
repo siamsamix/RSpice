@@ -84,7 +84,12 @@ below is written against that state.
 ## 3. Engine & numerical core
 
 - [ ] **[P1] (both)** Sparse MNA solver replacing dense `nalgebra` LU — KLU-class with symbolic
-  Markowitz ordering computed at netlist load; dense LU is infeasible beyond a few thousand nodes.
+  Markowitz ordering computed at netlist load; dense LU is infeasible beyond a few thousand nodes. *(Groundwork
+  slice 1 landed as `sparse.rs` + the `stamp_add`/`stamp_sub` seam: one build records every matrix slot it
+  writes (`MnaSystem.touched`, a superset of the structural non-zeros — zoo-tested against the dense matrix in
+  all three arms), and the record compiles to CSR plus an unsymmetric full-Markowitz order with a no-stranding
+  guard. Dense `nalgebra` LU solves unchanged; the numeric sparse assembly/solve and load-time pattern reuse
+  remain open. See `docs/adr/0002`.)*
 - [ ] **[P1] (both)** LU factorization reuse across NR iterations and timesteps when the matrix changes
   only by values, not topology — today the matrix is rebuilt and cloned per iterate. *(Dense-buffer
   restamp reuse was prototyped against the NR loop and is a measured loss on the dense path: a reused

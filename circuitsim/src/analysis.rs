@@ -2,6 +2,7 @@ use std::collections::HashMap;
 
 use crate::circuit::{Circuit, ElementFamily};
 use crate::error::{Result, SimError};
+use crate::mc;
 use crate::mna::{
     advance_transient_state, build_system, compute_ac_branch_currents, compute_branch_currents,
     compute_branch_currents_at, device_model, node_voltage, seed_transient_state, BranchCurrents,
@@ -263,8 +264,13 @@ fn extract_voltages<T: crate::mna::Field>(
 }
 
 /// Run every analysis once per `.step` combination, or a single pass when
-/// the deck has no `.step` cards.
+/// the deck has no `.step` cards. A `.mc` deck instead runs once per seeded
+/// Monte Carlo run ([`mc::apply_model_draws`] and the re-parse's draw seed do
+/// the worrying — TODO §8).
 pub fn run(netlist: &Netlist) -> Result<SimulationResult> {
+    if netlist.analysis.mc.is_some() {
+        return run_mc(netlist);
+    }
     let mut specs = netlist.analysis.steps.clone();
     if specs.is_empty() {
         // A single `.temp` value simply sets the run temperature; several
@@ -345,6 +351,79 @@ pub fn run(netlist: &Netlist) -> Result<SimulationResult> {
 /// Hard ceiling on the number of `.step` combinations (each is a full
 /// analysis), so a fat-fingered sweep cannot run for days.
 const MAX_STEP_RUNS: usize = 10_000;
+
+/// The Monte Carlo driver: `.mc <runs> …` re-runs the deck `runs` times, once
+/// per run index. Each run re-parses the source with the hidden
+/// [`mc::RUN_KEY`] override (so `random()`/`gauss()` sorts of parameter draws
+/// re-roll the way `.step` runs do), then [`mc::apply_model_draws`] re-binds
+/// every tolerance-bearing model card to per-instance clones and the run is
+/// solved as-is. Runs land in the same `runs` vector `.step` fills, tagged
+/// with their run index (`step_targets: ["mc"]`), so the CLI statistics and
+/// overlays read them like step runs.
+fn run_mc(netlist: &Netlist) -> Result<SimulationResult> {
+    if !netlist.analysis.steps.is_empty() || netlist.analysis.temperatures.len() > 1 {
+        return Err(SimError::Analysis(
+            "RSpice runs .mc on an unstepped deck; .step and .mc are separate run \
+             drivers — comment out the card you are not using"
+                .into(),
+        ));
+    }
+    let mc = netlist
+        .analysis
+        .mc
+        .as_ref()
+        .ok_or_else(|| SimError::Analysis("run_mc without an .mc card".into()))?;
+    if mc.runs > MAX_STEP_RUNS {
+        return Err(SimError::Analysis(format!(
+            ".mc would run {} simulations, over the {MAX_STEP_RUNS}-run ceiling",
+            mc.runs
+        )));
+    }
+    let base_seed = mc.seed.unwrap_or(netlist.mc_seed);
+    let mut runs = Vec::with_capacity(mc.runs);
+    for run in 0..mc.runs {
+        let mut overrides: HashMap<String, f64> = HashMap::new();
+        overrides.insert(mc::RUN_KEY.to_string(), run as f64);
+        let mut inner =
+            crate::netlist::parse_with_overrides(&netlist.source, &netlist.options, &overrides)?;
+        // The inner parse sees the same `.mc` card; running it again would
+        // nest Monte Carlo inside itself.
+        inner.analysis.mc = None;
+        let run_seed = mc::run_mix(base_seed, run);
+        // Re-rolled parameter draws ride the re-parse; the runtime keyed
+        // draws follow `mc_seed`, and the model cards follow the draws.
+        inner.mc_seed = run_seed;
+        mc::apply_model_draws(&mut inner.circuit, run_seed);
+        let single = run_single(&inner)?;
+        runs.push(StepRun {
+            values: vec![run as f64],
+            dc: single.dc,
+            dc_sweep: single.dc_sweep,
+            tran: single.tran,
+            ac: single.ac,
+            tf: single.tf,
+            measurements: single.measurements,
+            four: single.four,
+            noise: single.noise,
+        });
+    }
+    let first = runs
+        .first()
+        .cloned()
+        .ok_or_else(|| SimError::Analysis(".mc produced no runs".into()))?;
+    Ok(SimulationResult {
+        dc: first.dc,
+        dc_sweep: first.dc_sweep,
+        tran: first.tran,
+        ac: first.ac,
+        tf: first.tf,
+        step_targets: vec!["mc".to_string()],
+        runs,
+        measurements: first.measurements,
+        four: first.four,
+        noise: first.noise,
+    })
+}
 
 /// The cartesian product of every `.step` value list, outer spec first.
 fn step_combinations(specs: &[StepSpec]) -> Result<Vec<Vec<f64>>> {

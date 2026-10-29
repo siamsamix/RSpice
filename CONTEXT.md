@@ -41,6 +41,15 @@ deepening that has not landed yet.
 - **AC sweep (`.ac`)** — frequency-domain small-signal analysis about the DC bias; stimulus amplitude comes from the voltage source's `AC` field, not a separate command setting.
 - **Analysis command** — parsed directive config (`.tran`/`.ac` parameters, `AcCommand`, `AcScale`). Lives with the netlist format, not with analyses (cut #3 resolves the current mutual import).
 - **Run config** — `RunConfig`, the ten engine knobs a `.options` card writes (`method`, `reltol`/`abstol`/`vntol`, `gmin`/`gminsteps`/`srcsteps`, `itl1`/`itl4`, and the base `mc_seed`), owned by `AnalysisCommands.config` as one home: one writer (the `.options` walk in `dotcards.rs`), one reader shape — `analysis.config.<knob>` is the only path. Distinct from `ParseOptions` (where the parser finds files) and from `Netlist.mc_seed` (the run's *rolled* seed: that base value mixed with the sweep overrides).
+- **Monte Carlo (`.mc`)** — the PSpice-style run driver: `.mc <runs> [seed=<n>] [hist=<measure> [bins=<n>]] [yield=<measure>{<|>}<limit>]` re-parses and re-solves the deck once per run (the same
+  route as `.step`, so `random()`/`gauss()` re-roll), then `mc::apply_model_draws` re-draws every
+  tolerance-bearing model card — `LOT=` one draw per (run, model) shared by its instances, `DEV=`
+  one per (run, model, element), both percentages in either spelling, combined additively, uniform
+  over ±tolerance — as a per-family `McModel::scaled` clone re-bound under `model::element`, so
+  stamping resolves the run's luck through the ordinary `device_model` lookup and no downstream
+  code knows MC exists. Runs land in the step-run shape (`values = [run index]`,
+  `step_targets = ["mc"]`) and `mc::summarize` aggregates the per-measurement stats, the histogram,
+  and the yield fraction. `.mc` and `.step` are mutually exclusive drivers (loud error together).
 
 ## GUI language
 
@@ -69,7 +78,8 @@ deepening that has not landed yet.
   temperature. Device equations recompute `Vt = kT/q` and the bandgap law per evaluation.
 - **Step run** — one cell of the `.step` cartesian product. `StepRun` carries the swept values
   and that run's analyses; `SimulationResult.runs` holds them all, with the first mirrored into
-  the top-level fields for single-run consumers.
+  the top-level fields for single-run consumers. The `.mc` driver's Monte Carlo runs ride this
+  same shape.
 - **MC draw seed** — the 64-bit `ParamEnv.mc_seed` every keyed draw mixes in: the sweep
   overrides hashed by `seed_from_overrides`, optionally raised by `.options seed=<n>`
   (`mix64(overrides ⊕ literal)`, lifted before element lines expand). 0 stays the constant of

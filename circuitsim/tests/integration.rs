@@ -1,6 +1,6 @@
 use approx::assert_relative_eq;
 use circuitsim::model::{BOLTZMANN, ZERO_CELSIUS_K};
-use circuitsim::{ParseOptions, parse, parse_with_options, run, simulate};
+use circuitsim::{parse, parse_with_options, run, simulate, ParseOptions, SimulationResult};
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
@@ -2505,4 +2505,81 @@ X1 in out amp
 
     // The op-amp lands flattened with its instance path on the card name.
     assert_eq!(n.circuit.opamps[0].name, "X1.U1");
+}
+
+/// `.mc` runs the deck once per seeded run: the divider's `R=` model carries a
+/// ±50% `DEV` slot, so every run draws its own R pair. The ratio
+/// V(out)/Vin = (1+b)/((1+a)+(1+b)) stays inside [0.25, 0.75] for any two
+/// draws, the spread must not collapse, and the same seed re-rolls to the
+/// very same numbers (bit-for-bit), while a different seed rolls elsewhere.
+#[test]
+fn mc_scatters_a_resistor_divider_bit_reproducibly_per_seed() {
+    let deck = |seed: u64| {
+        format!(
+            r#"
+* MC resistor divider
+.model rt RES(R=10k DEV=50%)
+Vin in 0 DC 5
+R1 in out rt
+R2 out 0 rt
+.tran 10u 1m
+.meas tran mid avg V(out)
+.mc 25 seed={seed}
+.end
+"#
+        )
+    };
+    let netlist = parse(&deck(11)).unwrap();
+    let result = run(&netlist).unwrap();
+    assert_eq!(result.runs.len(), 25, "one run per .mc count");
+    assert_eq!(result.step_targets, vec!["mc"]);
+
+    let mid_of = |r: &SimulationResult| -> Vec<f64> {
+        r.runs
+            .iter()
+            .filter_map(|run| run.measurements.first().and_then(|m| m.value))
+            .collect()
+    };
+    let mids = mid_of(&result);
+    assert_eq!(mids.len(), 25, "every run measures");
+    for mid in &mids {
+        assert!(
+            (1.2..=3.8).contains(mid),
+            "mid inside the ±50% unit-ratio span: {mid}"
+        );
+    }
+    let low = mids.iter().copied().fold(f64::INFINITY, f64::min);
+    let high = mids.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    assert!(
+        low < high,
+        "the spread is a spread, not a constant: [{low}, {high}]"
+    );
+
+    // Bit-reproducible per seed, rolled differently under another seed.
+    let again = run(&parse(&deck(11)).unwrap()).unwrap();
+    assert_eq!(mids, mid_of(&again), "same seed, same draws, same numbers");
+    let shifted = run(&parse(&deck(12)).unwrap()).unwrap();
+    let shifted_mids = mid_of(&shifted);
+    assert_ne!(mids, shifted_mids, "another seed rolls another landscape");
+
+    // The card's readouts aggregate over the same runs' measurements.
+    let card = circuitsim::netlist::McCommand {
+        runs: 25,
+        seed: None,
+        hist: Some("mid".to_string()),
+        bins: 5,
+        criterion: Some(("mid".to_string(), circuitsim::netlist::McOp::Below, 3.0)),
+    };
+    let rep = circuitsim::mc::summarize(&result, &card);
+    assert_eq!(rep.stats.len(), 1);
+    assert_eq!(rep.stats[0].name, "mid");
+    assert_eq!(rep.stats[0].n, 25);
+    let counted: usize = rep
+        .histogram
+        .iter()
+        .map(|h| h.counts.iter().sum::<usize>())
+        .sum();
+    assert_eq!(counted, 25, "every sample lands in some bin");
+    let below_three = mids.iter().filter(|m| **m < 3.0).count();
+    assert_eq!(rep.criterion.map(|y| y.passes), Some(below_three));
 }

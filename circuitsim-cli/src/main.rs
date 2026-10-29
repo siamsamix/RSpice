@@ -8,6 +8,7 @@ use circuitsim::{
     SimulationResult,
 };
 use circuitsim::netlist::OpMode;
+use circuitsim::netlist::{McCommand, McOp};
 use circuitsim::circuit::CURRENT_FAMILIES;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -130,6 +131,13 @@ fn run_cli() -> Result<(), CliError> {
     } else {
         print_all(&mut report, &netlist, &result)?;
     }
+    // `.mc` decks are their own run driver: whichever table was printed, the
+    // statistics of the runs the driver produced go on top.
+    if result.step_targets.first().map(String::as_str) == Some("mc") {
+        if let Some(card) = &netlist.analysis.mc {
+            print_mc(&mut report, &result, card);
+        }
+    }
 
     if let Some(path) = &args.waves {
         fs::write(path, waveform_csv(&netlist, &result))?;
@@ -195,6 +203,13 @@ fn print_summary(report: &mut String, netlist: &Netlist) {
             targets.join(", "),
             netlist.analysis.steps.len()
         );
+    }
+    if let Some(mc) = &netlist.analysis.mc {
+        let seed_note = match mc.seed {
+            Some(n) => format!("seed {n}"),
+            None => "deck seed".to_string(),
+        };
+        let _ = writeln!(report, "  .mc: {} runs ({seed_note})", mc.runs);
     }
 }
 
@@ -501,6 +516,62 @@ fn print_measures(report: &mut String, result: &SimulationResult) {
             (None, None) => {
                 let _ = writeln!(report, "  {name} = failed");
             }
+        }
+    }
+}
+
+/// The `.mc` statistics: per-measurement spreads, the optional histogram, and
+/// the optional yield criterion — exactly what the card asked for.
+fn print_mc(report: &mut String, result: &SimulationResult, card: &McCommand) {
+    let rep = circuitsim::mc::summarize(result, card);
+    if rep.stats.is_empty() {
+        return;
+    }
+    let _ = writeln!(report, "\n--- Monte Carlo ---");
+    for stat in &rep.stats {
+        let _ = writeln!(
+            report,
+            "  {:<16} n{:>4}  min={:.6e}  mean={:.6e}  sigma={:.3e}  max={:.6e}",
+            stat.name, stat.n, stat.min, stat.mean, stat.sigma, stat.max
+        );
+    }
+    if let Some(hist) = &rep.histogram {
+        let peak = hist.counts.iter().max().copied().unwrap_or(1).max(1);
+        let samples: usize = hist.counts.iter().sum();
+        let _ = writeln!(
+            report,
+            "  hist {} on [{:.6e}, {:.6e}], {} samples:",
+            hist.name, hist.lo, hist.hi, samples
+        );
+        let width = (hist.hi - hist.lo) / hist.bins.max(1) as f64;
+        for (i, count) in hist.counts.iter().enumerate() {
+            let lo = hist.lo + i as f64 * width;
+            let bar = "#".repeat((*count as f64 / peak as f64 * 32.0).ceil() as usize);
+            let _ = writeln!(
+                report,
+                "   [{:10.4e},{:10.4e}) {:<32} {count}",
+                lo,
+                lo + width,
+                bar
+            );
+        }
+    }
+    if let Some(y) = &rep.criterion {
+        if y.total > 0 {
+            let compare = match y.op {
+                McOp::Below => "<",
+                McOp::Above => ">",
+            };
+            let _ = writeln!(
+                report,
+                "  yield {}{}{}: {}/{} = {:.1}%",
+                y.name,
+                compare,
+                y.limit,
+                y.passes,
+                y.total,
+                100.0 * y.passes as f64 / y.total as f64
+            );
         }
     }
 }

@@ -331,7 +331,10 @@ pub(super) fn parse_model_card(
                 "lser" => model.lser = value(&raw)?,
                 "cpar" => model.cpar = value(&raw)?,
                 "rpar" => model.rpar = value(&raw)?,
-                "dev" | "lot" => {}
+                // Tolerance slots: parsed into the model's reserved MC slot;
+                // the `.mc` driver (TODO §8) is the consumer.
+                "dev" => model.tolerance.dev = Some(parse_tolerance_value(&raw, &value)),
+                "lot" => model.tolerance.lot = Some(parse_tolerance_value(&raw, &value)),
                 other => warnings.push(format!(
                     "line {line_no}: .model '{name}': passive parameter '{other}' is not supported — ignored"
                 )),

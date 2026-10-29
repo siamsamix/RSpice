@@ -1388,3 +1388,40 @@
         // Fused value before '='.
         assert!(parse(".ic V(in)5=2\n.op\n.end\n").is_err());
     }
+
+#[test]
+fn mc_card_round_trips_and_bins_without_hist_warns() {
+    let netlist =
+        parse(".mc 40 seed=7 hist=vout bins=8 yield=vout<2.5\n.tran 10u 1m\n.end\n").unwrap();
+    let mc = netlist.analysis.mc.as_ref().unwrap();
+    assert_eq!(mc.runs, 40);
+    assert_eq!(mc.seed, Some(7));
+    assert_eq!(mc.hist.as_deref(), Some("vout"));
+    assert_eq!(mc.bins, 8);
+    assert_eq!(mc.criterion, Some(("vout".into(), McOp::Below, 2.5)));
+
+    // The card survives the canonical emission, clauses in card order.
+    let text = emit(&netlist);
+    assert!(text.contains(".mc 40 seed=7 hist=vout bins=8 yield=vout<2.5"));
+
+    // The other inequality spelling and a clause-free card.
+    let hi = parse(".mc 10 yield=volt>4.0\n.end\n").unwrap();
+    let mc = hi.analysis.mc.as_ref().unwrap();
+    assert_eq!(mc.runs, 10);
+    assert_eq!(mc.seed, None);
+    assert_eq!(mc.criterion, Some(("volt".into(), McOp::Above, 4.0)));
+    assert!(emit(&hi).contains(".mc 10 yield=volt>4"));
+
+    // `bins=` without `hist=` warns and leaves the default bin count.
+    let stray = parse(".mc 5 bins=10\n.end\n").unwrap();
+    let mc = stray.analysis.mc.as_ref().unwrap();
+    assert_eq!(mc.runs, 5);
+    assert!(mc.hist.is_none());
+    assert_eq!(mc.bins, MC_DEFAULT_BINS);
+    assert_eq!(mc.criterion, None);
+    assert!(
+        stray.warnings.iter().any(|w| w.contains("bins=10")),
+        "{:?}",
+        stray.warnings
+    );
+}

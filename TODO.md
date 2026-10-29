@@ -16,7 +16,9 @@ Source tags: `(both)` present in both reference tools · `(LT)` LTspice-only · 
 
 **Where we stand:** sim core — dense-LU MNA, `.op`, adaptive trapezoidal/Gear `.tran` with
 source-edge breakpoints and `.options method=…`, small-signal `.ac`, one/two-sweep `.dc`,
-`.tf`, `.noise`, `.four`, nested `.step` (parameters or temperature), `.meas`, and multi-run
+`.tf`, `.noise`, `.four`, nested `.step` (parameters or temperature), `.meas`, the PSpice-style
+`.mc` Monte Carlo driver (seeded runs over `LOT`/`DEV` model tolerances, uniform ±tol draws,
+histogram/yield readouts), and multi-run
 results; elements `R C L V I D M E F G H S W K`, the full source-waveform family
 (`PULSE/SIN/EXP/PWL[ FILE, REPEAT]/SFFM/AM`), temperature-dependent diode/MOSFET/passive
 equations; parser with `*`/`;` comments, `+` continuation, `MEG`/`MIL` suffixes,
@@ -62,8 +64,8 @@ below is written against that state.
   per-instance sizing (W/L, area/perimeter AD/AS/PS/PD); tolerance slots for Monte Carlo
   (`LOT`/`DEV` in PSpice's `.model` cards) reserved now — done: diode/MOSFET parameter lists with
   LEVEL validation, per-instance AD/AS/PS/PD + diode AREA carried into elements, DEV/LOT slots parsed
-  into `ModelTolerance` (consumers come with the Monte Carlo work, TODO §8), unknown families kept
-  as `GenericModel` cards.
+  into `ModelTolerance` (their consumers landed with the `.mc` Monte Carlo driver, TODO §8), unknown
+  families kept as `GenericModel` cards.
 - [x] **[P1] (both)** Tolerant import of third-party netlists: case-insensitivity everywhere, tabs/space
   chaos, unknown directives as warnings with best-effort parse instead of hard errors — done: unknown
   directives/element letters/stray `.endl` markers warn with the offending text and the deck still
@@ -269,14 +271,23 @@ below is written against that state.
 
 ## 8. Advanced Analysis & mixed signal (PSpice-centric parity)
 
-- [ ] **[P1] (PS; LT approximates)** Monte Carlo: statistical runs over `LOT`/`DEV` tolerances, seed
+- [x] **[P1] (PS; LT approximates)** Monte Carlo: statistical runs over `LOT`/`DEV` tolerances, seed
   control, multiple runs, histogram/yield readouts. First land the parametric `random()`/`gauss()`
   functions that LTspice uses to fake MC via `.step` `(LT)`. *(The parametric layer is landed:
   `random(x)` ∈ [0,x), `rand(x)` ∈ ±x, `gauss(x)` = x·N(0,1) as deterministic draws keyed off the
   sweep overrides — `.step param …` re-rolls them per run bit-reproducibly. The seed-control
   directive is landed too: `.options seed=<n>` raises the base seed before any element line
   expands (a pre-scan lifts the literal, so deck position is free) and round-trips through emit.
-  Remaining: consumers of the `LOT`/`DEV` model tolerance slots, run histograms/yield.)*
+  Done as well (documented interpretation below the unverifiable reference grammar): the `.mc <runs>
+  [seed=<n>] [hist=<measure> [bins=<n>]] [yield=<measure>{<|>}<limit>]` driver re-runs the deck once
+  per seeded run — every tolerance-bearing model card re-draws per run (LOT shared across the
+  model's instances, DEV per instance, uniform over ±tolerance, LOT+DEV additive; σ-dominant
+  parameters scaled per family: D/Q/M/J/U/IS·KP·VTO·BETA·GAIN, passives the nominal value) as
+  re-bound per-instance model clones, parametric `random()`/`gauss()` re-roll through the same
+  re-parse route `.step` uses, and the runs land in the step-run shape. The CLI reports
+  min/mean/σ/max per measurement, the histogram, and the yield fraction; `random()`-free decks may
+  also pin the seed via `.mc seed=`. `LOT`/`DEV` percentages apply in both spellings (`3` and `3%`,
+  the flag only preserves the card's spelling).)*
 - [ ] **[P2] (PS AA)** Worst-case analysis from component/model tolerances with sensitivity ranking.
 - [ ] **[P2] (PS AA)** Sensitivity analysis: ranked parameter sensitivities of a target measurement.
 - [ ] **[P2] (PS AA)** Optimizer: curve-fitting parameter tuning against measurement goals

@@ -139,6 +139,7 @@ pub(super) fn parse_dot_command(
             }
         }
         ".step" => parse_step(&tokens, analysis, warnings, line_no)?,
+        ".mc" => parse_mc(&tokens, analysis, warnings, line_no)?,
         ".meas" | ".measure" => {
             analysis
                 .measurements
@@ -479,6 +480,92 @@ pub(super) fn parse_options(
 /// `.step param x 0 10 1`, `.step dec param x 1 1k 10`,
 /// `.step oct param x 1 1k 5`, `.step param x list 1 2 3`,
 /// and the `PARAM`-less `.step x …` shorthand.
+/// `.mc <runs> [seed=<n>] [hist=<measure> [bins=<n>]] [yield=<measure>{<|>}<limit>]`.
+/// See [`crate::netlist::McCommand`] for the documented interpretation.
+pub(super) fn parse_mc(
+    tokens: &[&str],
+    analysis: &mut AnalysisCommands,
+    warnings: &mut Vec<String>,
+    line_no: usize,
+) -> Result<()> {
+    if tokens.len() < 2 {
+        warnings.push(format!("line {line_no}: .mc card has no run count"));
+        return Ok(());
+    }
+    let runs = parse_value(tokens[1]).map_err(SimError::Parse)?.max(1.0) as usize;
+    let mut mc = McCommand {
+        runs,
+        ..McCommand::default()
+    };
+    let mut bins: Option<usize> = None;
+    for tok in &tokens[2..] {
+        let Some((key, value)) = tok.split_once('=') else {
+            warnings.push(format!(
+                "line {line_no}: .mc token '{tok}' is not KEY=VALUE — ignored"
+            ));
+            continue;
+        };
+        match key.to_ascii_lowercase().as_str() {
+            "seed" => {
+                let n = parse_value(value).map_err(SimError::Parse)?;
+                if n < 0.0 {
+                    return Err(SimError::Parse(format!(
+                        "line {line_no}: .mc seed={value} must be non-negative"
+                    )));
+                }
+                mc.seed = Some(n as u64);
+            }
+            "hist" => {
+                if value.is_empty() {
+                    return Err(SimError::Parse(format!(
+                        "line {line_no}: .mc hist= needs a measurement name"
+                    )));
+                }
+                mc.hist = Some(value.to_ascii_lowercase());
+            }
+            "bins" => {
+                let n = parse_value(value).map_err(SimError::Parse)?;
+                if n < 2.0 {
+                    return Err(SimError::Parse(format!(
+                        "line {line_no}: .mc bins={value} must be at least 2"
+                    )));
+                }
+                bins = Some(n as usize);
+            }
+            "yield" => mc.criterion = Some(parse_mc_yield(value, line_no)?),
+            other => warnings.push(format!(
+                "line {line_no}: .mc clause '{other}' is not supported — ignored"
+            )),
+        }
+    }
+    if let Some(n) = bins {
+        if mc.hist.is_some() {
+            mc.bins = n;
+        } else {
+            warnings.push(format!(
+                "line {line_no}: .mc bins={n} without hist=<measure> — ignored"
+            ));
+        }
+    }
+    analysis.mc = Some(mc);
+    Ok(())
+}
+
+/// `yield=<measure>{<|>}<limit>`: splits once at the comparison character and
+/// evaluates the rest exactly once.
+fn parse_mc_yield(raw: &str, line_no: usize) -> Result<(String, McOp, f64)> {
+    let split = raw.char_indices().find(|(_, c)| *c == '<' || *c == '>');
+    let Some((idx, c)) = split else {
+        return Err(SimError::Parse(format!(
+            "line {line_no}: .mc yield={raw} must be a measure name, then < or >, then a limit"
+        )));
+    };
+    let name = raw[..idx].trim().to_ascii_lowercase();
+    let op = if c == '<' { McOp::Below } else { McOp::Above };
+    let limit = parse_value(&raw[idx + 1..]).map_err(SimError::Parse)?;
+    Ok((name, op, limit))
+}
+
 pub(super) fn parse_step(
     tokens: &[&str],
     analysis: &mut AnalysisCommands,
@@ -1110,6 +1197,24 @@ pub(super) fn emit_commands(analysis: &AnalysisCommands, out: &mut String) {
     }
     out.push_str(&options);
     out.push('\n');
+    if let Some(mc) = &analysis.mc {
+        let mut line = format!(".mc {}", mc.runs);
+        if let Some(seed) = mc.seed {
+            line.push_str(&format!(" seed={seed}"));
+        }
+        if let Some(hist) = &mc.hist {
+            line.push_str(&format!(" hist={hist} bins={}", mc.bins));
+        }
+        if let Some((name, op, limit)) = &mc.criterion {
+            let compare = match op {
+                McOp::Below => "<",
+                McOp::Above => ">",
+            };
+            line.push_str(&format!(" yield={name}{compare}{limit}"));
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
     if !analysis.temperatures.is_empty() {
         let values: Vec<String> = analysis.temperatures.iter().map(|t| format!("{t}")).collect();
         out.push_str(&format!(".temp {}\n", values.join(" ")));

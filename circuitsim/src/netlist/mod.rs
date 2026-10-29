@@ -122,6 +122,60 @@ pub struct StepSpec {
     pub values: StepValues,
 }
 
+/// Monte-Carlo comparison operators for `.mc … yield=<measure>{<|>}<limit>`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum McOp {
+    /// The run passes when the measured value is strictly below the limit.
+    Below,
+    /// The run passes when the measured value is strictly above the limit.
+    Above,
+}
+
+/// Default histogram bin count when `.mc … hist=…` carries no `bins=`.
+pub const MC_DEFAULT_BINS: usize = 12;
+
+/// One `.mc` card — the PSpice-style Monte Carlo driver (TODO §8). The card
+/// multiplies the deck's analysis into `runs` seeded runs: every model card
+/// carrying `LOT=`/`DEV=` tolerance slots (and every `random()`/`gauss()`
+/// expression draw) re-rolls per run, then the same statistics the `.step`
+/// loop reports are collected per run.
+///
+/// Clauses: `seed=<n>` fixes the draw seed (default: the deck's rolled
+/// `.options seed`); `hist=<measure>` histogram-s that measurement's value
+/// across runs (`bins=<n>` picks the bin count, default
+/// [`MC_DEFAULT_BINS`]); `yield=<measure>{<|>}<limit>` is the pass fraction
+/// of runs whose measurement lands on the desired side (strict inequalities,
+/// PSpice-style). Documented interpretation below the reference grammar:
+/// `LOT`/`DEV` are percentages in both spellings (`3` and `3%` — the flag
+/// preserves the spelling for emit), they combine additively, draws are
+/// uniform over ±tolerance, and the seed is mixed per run for bit-reproducible
+/// spreads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct McCommand {
+    /// Number of seeded runs (1..=`MAX_STEP_RUNS` ceiling).
+    pub runs: usize,
+    /// `seed=<n>` — fixed draw seed; `None` uses the deck's rolled seed.
+    pub seed: Option<u64>,
+    /// `hist=<measure>` — histogram that measurement across runs.
+    pub hist: Option<String>,
+    /// `bins=<n>` — histogram bin count (`MC_DEFAULT_BINS` unset).
+    pub bins: usize,
+    /// `yield=<measure>{<|>}<limit>` — the pass criterion.
+    pub criterion: Option<(String, McOp, f64)>,
+}
+
+impl Default for McCommand {
+    fn default() -> Self {
+        Self {
+            runs: 1,
+            seed: None,
+            hist: None,
+            bins: MC_DEFAULT_BINS,
+            criterion: None,
+        }
+    }
+}
+
 /// Which analysis result a `.meas` card reads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MeasAnalysis {
@@ -311,6 +365,10 @@ pub struct AnalysisCommands {
     pub four: Option<FourCommand>,
     /// `.noise` output/input-referred noise sweep.
     pub noise: Option<NoiseCommand>,
+    /// `.mc` card — the PSpice-style Monte Carlo driver (TODO §8). Runs the
+    /// requested analysis once per seeded run with luck drawn per run; see
+    /// [`McCommand`].
+    pub mc: Option<McCommand>,
     /// `.temp` values in °C. One value sets the run temperature; several act
     /// like `.step temp LIST …` runs.
     pub temperatures: Vec<f64>,
@@ -341,6 +399,7 @@ impl Default for AnalysisCommands {
             measurements: Vec::new(),
             four: None,
             noise: None,
+            mc: None,
             temperatures: Vec::new(),
             ic: Vec::new(),
             nodeset: Vec::new(),

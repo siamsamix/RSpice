@@ -74,6 +74,9 @@ pub struct PassiveModel {
     pub cpar: f64,
     /// Parallel resistance RPAR (Ω) stamped across the terminals.
     pub rpar: f64,
+    /// Reserved Monte-Carlo tolerance slots (TODO §8: the `.mc` driver draws
+    /// on the nominal value per run/instance).
+    pub tolerance: ModelTolerance,
 }
 
 impl PassiveModel {

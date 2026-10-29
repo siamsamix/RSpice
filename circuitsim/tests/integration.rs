@@ -2712,3 +2712,78 @@ Rl b 0 50
         assert_relative_eq!(point.node_voltages[b].norm(), 0.5, epsilon = 1e-9);
     }
 }
+
+// ─── .raw waveform files ────────────────────────────────────────────────────
+// The codec's finer corners (layout disambiguation, FastAccess re-rows,
+// ascii accounting) live in `rawwave`'s own inline tests; these pin the
+// public surface end-to-end: build → write → read → the same physics.
+
+#[test]
+fn raw_binary_round_trip_over_the_public_surface() {
+    let netlist = parse(
+        r#"
+* divider through .raw
+R1 in a 1k
+R2 a 0 1k
+V1 in 0 5
+.op
+.end
+"#,
+    )
+    .unwrap();
+    let result = run(&netlist).unwrap();
+    let raw = circuitsim::rawwave::build("it", &netlist, &result);
+    assert_eq!(raw.datasets.len(), 1);
+    let bytes = circuitsim::rawwave::to_bytes(&raw, circuitsim::RawFlavor::Binary);
+    // Binary flavor headers are UTF-16-LE — the reference spelling.
+    assert_eq!(&bytes[..2], b"T\x00");
+    let back = circuitsim::rawwave::read(&bytes).unwrap();
+    assert_eq!(back.datasets.len(), 1);
+    let op = &back.datasets[0];
+    assert_eq!(op.plotname, "Operating Point");
+    assert_eq!(op.flags, ["real"]);
+    assert_eq!(op.values.len(), 1);
+    let a = op.trace("V(a)").unwrap();
+    assert_relative_eq!(a[0].re, 2.5, epsilon = 1e-12);
+    let drawn = op.trace("I(V1)").unwrap();
+    // The round trip goes through f32 for this cell: 4-bit-mantissa-safe.
+    assert_relative_eq!(drawn[0].re, -2.5e-3, epsilon = 1e-9);
+}
+
+#[test]
+fn raw_stepped_file_carries_a_plot_per_run_with_step_columns() {
+    let netlist = parse(
+        r#"
+.param r=1k
+V1 in 0 DC 1
+R1 in out {r}
+R2 out 0 1k
+.step param r 1k 3k 1k
+.tran 100n 1u
+.end
+"#,
+    )
+    .unwrap();
+    let result = run(&netlist).unwrap();
+    let raw = circuitsim::rawwave::build("it", &netlist, &result);
+    assert_eq!(raw.datasets.len(), 3);
+    let file = circuitsim::rawwave::to_ascii(&raw);
+    let back = circuitsim::rawwave::read(file.as_bytes()).unwrap();
+    for (i, ds) in back.datasets.iter().enumerate() {
+        assert_eq!(ds.plotname, "Transient Analysis");
+        assert_eq!(ds.flags, ["real", "forward", "stepped"]);
+        // Each run re-states the step value as a constant column.
+        let step_column = ds.trace("r").unwrap();
+        assert_relative_eq!(step_column[0].re, 1000.0 * (i + 1) as f64, epsilon = 1e-12);
+        // The constant holds over every point of the run.
+        let target = 1000.0 * (i + 1) as f64;
+        assert!(step_column.iter().all(|v| (v.re - target).abs() < 1e-9));
+        let out = ds.trace("V(out)").unwrap();
+        // V(out) = 1 V across R2: 0.5, 1/3, 1/4.
+        assert_relative_eq!(
+            out[0].re,
+            1_000.0 / (1_000.0 * (i + 1) as f64 + 1_000.0),
+            epsilon = 1e-9
+        );
+    }
+}

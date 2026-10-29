@@ -4,7 +4,7 @@ use std::path::PathBuf;
 
 use clap::{Parser, ValueEnum};
 use circuitsim::{
-    run, Circuit, DcResult, DcSweepPoint, MeasureResult, Netlist, ParseOptions, SimError,
+    run, Circuit, DcResult, DcSweepPoint, MeasureResult, Netlist, ParseOptions, RawFlavor, SimError,
     SimulationResult,
 };
 use circuitsim::netlist::OpMode;
@@ -42,6 +42,19 @@ struct Args {
     /// Export every transient/AC trace as CSV to this file
     #[arg(long)]
     waves: Option<PathBuf>,
+
+    /// Write the simulation's plots as an LTspice-style .raw file
+    #[arg(long, value_name = "FILE")]
+    raw: Option<PathBuf>,
+
+    /// Write the --raw file in the text flavor instead of binary
+    #[arg(long, requires = "raw")]
+    raw_ascii: bool,
+
+    /// Treat the positional file as a .raw file: read it and dump its plots
+    /// instead of simulating
+    #[arg(long)]
+    read_raw: bool,
 
     /// Batch mode: run to completion with only the analysis output
     #[arg(short, long)]
@@ -93,6 +106,14 @@ impl From<std::io::Error> for CliError {
 
 fn run_cli() -> Result<(), CliError> {
     let args = Args::parse();
+    if args.read_raw {
+        let bytes = fs::read(&args.netlist)?;
+        let raw = circuitsim::rawwave::read(&bytes)?;
+        let mut report = String::new();
+        print_raw(&mut report, &raw);
+        print!("{report}");
+        return Ok(());
+    }
     let source = fs::read_to_string(&args.netlist)
         .map_err(|e| SimError::Parse(format!("{}: {e}", args.netlist.display())))?;
 
@@ -137,6 +158,16 @@ fn run_cli() -> Result<(), CliError> {
         if let Some(card) = &netlist.analysis.mc {
             print_mc(&mut report, &result, card);
         }
+    }
+
+    if let Some(path) = &args.raw {
+        let flavor = if args.raw_ascii {
+            RawFlavor::Ascii
+        } else {
+            RawFlavor::Binary
+        };
+        let title = format!("* {}", args.netlist.display());
+        fs::write(path, circuitsim::rawwave::to_bytes(&circuitsim::rawwave::build(&title, &netlist, &result), flavor))?;
     }
 
     if let Some(path) = &args.waves {
@@ -702,4 +733,49 @@ fn waveform_csv(netlist: &Netlist, result: &SimulationResult) -> String {
     }
     out.push_str("# no .tran or .ac result\n");
     out
+}
+
+/// The `--read-raw` dump: one block per plot in file order — the header
+/// words and variables, then every row spelled `axis-cell = value` with the
+/// complex plots carrying magnitude@phase (real plots print the bare value).
+fn print_raw(report: &mut String, raw: &circuitsim::RawFile) {
+    for (pi, ds) in raw.datasets.iter().enumerate() {
+        let _ = writeln!(report, "\n--- .raw plot {}: {} ---", pi, ds.plotname);
+        let _ = writeln!(
+            report,
+            "  {} points over {} variables (flags: {})",
+            ds.values.len(),
+            ds.variables.len(),
+            if ds.flags.is_empty() {
+                "none".to_string()
+            } else {
+                ds.flags.join(" ")
+            }
+        );
+        let _ = writeln!(
+            report,
+            "  variables: {}",
+            ds.variables
+                .iter()
+                .map(|v| format!("{}({})", v.name, v.kind))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+        for row in &ds.values {
+            let cells = ds
+                .variables
+                .iter()
+                .zip(row.iter())
+                .map(|(var, v)| {
+                    if ds.flags.iter().any(|f| f.eq_ignore_ascii_case("complex")) {
+                        format!("{}={:.6e}@{:.4}deg", var.name, v.norm(), v.arg().to_degrees())
+                    } else {
+                        format!("{}={:.6e}", var.name, v.re)
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            let _ = writeln!(report, "  {cells}");
+        }
+    }
 }

@@ -14,6 +14,7 @@ pub mod mna;
 pub mod model;
 pub mod netlist;
 pub mod params;
+pub mod rawwave;
 pub mod units;
 
 pub use behavior::{Behavior, BehavioralRuntime, BExpr, MathFn, NoiseKind, ProbeBinding, ProbeSpec};
@@ -31,6 +32,7 @@ pub use circuit::{AbmForm, AbmMeasure, BehavioralKind, BehavioralSource, Circuit
                   OpAmpModel, Switch, SwitchControl, SwitchModel, Tline, Waveform};
 pub use error::{Result, SimError};
 pub use netlist::{Netlist, parse_with_overrides};
+pub use rawwave::{RawDataset, RawFile, RawFlavor, RawVariable};
 
 /// Parse a netlist string and run all requested analyses.
 ///

@@ -78,6 +78,19 @@ deepening that has not landed yet.
   sources from the *previous* breakpoint), holds the first/last level outside `[t₁, tₙ]`, and
   `REPEAT` blocks re-cycle their span through the same blender (`Pwl::interpolate`, the one
   segment law).
+- **Raw file (`.raw`)** — the LTspice-style waveform file (`rawwave.rs`), TODO §6: plots of
+  `points × variables` complex values with the reference trace kinds (`time`/`frequency`/
+  `voltage`/`device_current`) and flags (`real`/`complex`/`forward`/`stepped`/`FastAccess`/
+  `log`/`linear`). Binary flavor = UTF-16-LE header + point-major payload (an 8-byte double
+  axis with 4-byte values after it; complex plots 16-byte `(re, im)` pairs throughout); the
+  all-double layout is read only when the byte count rules the mixed one out — with 3+
+  variables both fit and mixed wins, matching LTspice. ASCII flavor = plain header bytes +
+  one value per line, a variable-0 line closing the point and opening the next. Stepped
+  decks concatenate self-headered plots; each run rides its step values as constant columns
+  named after the step target (documented interpretation — a self-describing file, no
+  `.log` sidecar), and operating points keep a synthetic `time = 0` axis so real plots stay
+  axis-first (documented interpretation). Bit-for-bit LTspice parity is not the goal —
+  reading its files and writing files its readers accept is.
 - **Temperature system** — `Circuit.temperature` (°C) plus model `TNOM`/`EG`/`XTI`/`TCV`/`BEX`
   and passive `TC1`/`TC2`; `.temp` with several values and `.step temp` produce one run per
   temperature. Device equations recompute `Vt = kT/q` and the bandgap law per evaluation.

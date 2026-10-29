@@ -255,7 +255,24 @@ below is written against that state.
   formatting (Hz/s/V/A/dB/°), multi-pane layouts.
 - [ ] **[P1] (both)** Cross-probing: click a wire/part in the schematic to add/trace `V(net)` and
   `I(device)` in the viewer, and vice versa.
-- [ ] **[P1] (both)** Waveform file I/O: read/write binary and ASCII `.raw` (LTspice) / `.dat` (PSpice)
+- [ ] **[P1] (both)** Waveform file I/O: read/write binary and ASCII `.raw` (LTspice) / `.dat`
+  (PSpice) *(the LTspice `.raw` half landed: `rawwave.rs` — a one-shot `rawwave::build(title,
+  netlist, result)` turns every analysis of every step run into a plot (`RawDataset`:
+  title/plotname/flags/variables/values), the operating point included with its synthetic
+  `time = 0` axis so real plots stay axis-first; the writer emits both flavors — LTspice-style
+  binary (UTF-16-LE headers, point-major payload: f64 axis + f32 values for real plots, f64
+  `(re, im)` pairs for complex) and the ngspice-compatible ASCII `Values:` listing (one value
+  per line, a variable-0 line opens each point, complex `re,im`); stepped runs concatenate
+  self-headered plots and every run carries its step values as constant columns named after
+  the step target (documented interpretation — a self-describing file, no `.log` sidecar
+  invented); the reader takes either flavor either encoding, disambiguates the real layout by
+  byte count (mixed wins even when the all-double count also fits, matching LTspice), re-rows
+  `FastAccess` column-major payloads, and tolerates a truncated tail down to whole rows.
+  Traces: every net as `V(net)` in id order (ground-less decks' node 0 rides like any other
+  net), then one current trace per element family in the report probe order
+  (`I(R1)`/`Ic(Q1)`/`I(T1)`). CLI: `--raw <file>` (binary default) with `--raw-ascii`, plus
+  `--read-raw` to dump any file's plots. `.tf`/`.noise` plots and the PSpice `.dat` format
+  stay open.)*
   including step-run metadata.
 - [ ] **[P1] (spot)** Full export surface: CSV of arbitrary traces (node voltages, element currents,
   measurements — today only `.tran` node voltages are exportable), image export.

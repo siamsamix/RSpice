@@ -1425,3 +1425,81 @@ fn mc_card_round_trips_and_bins_without_hist_warns() {
         stray.warnings
     );
 }
+
+#[test]
+fn t_card_round_trips_and_takes_both_delay_spellings() {
+    let netlist = parse("T1 a b c d Z0=50 TD=1n\n.op\n.end\n").unwrap();
+    assert_eq!(netlist.circuit.tlines.len(), 1);
+    let line = &netlist.circuit.tlines[0];
+    assert_eq!(line.name, "T1");
+    assert_eq!(line.z0, 50.0);
+    assert_eq!(line.delay, 1e-9);
+
+    // The card survives the canonical emission (same spelling the parser
+    // accepts back).
+    let text = emit(&netlist);
+    assert!(text.contains("T1 a b c d Z0=50 TD=0.000000001\n"), "{text}");
+
+    // The F=/NL= alternative: TD = NL/F, NL defaulting to 1.
+    let freq = parse("t2 w x y z Z0=75 F=2e9\n.op\n.end\n").unwrap();
+    assert!(
+        freq.warnings.is_empty(),
+        "nothing to warn about: {:?}",
+        freq.warnings
+    );
+    let line = &freq.circuit.tlines[0];
+    assert_eq!(line.z0, 75.0);
+    assert_relative_eq!(line.delay, 0.5e-9, epsilon = 1e-16);
+    let halved = parse("t2 w x y z Z0=75 F=2e9 NL=0.5\n.op\n.end\n").unwrap();
+    assert_relative_eq!(halved.circuit.tlines[0].delay, 0.25e-9, epsilon = 1e-16);
+
+    // TD= wins over a also-present F=/NL= (and says so).
+    let both = parse("t3 w x y z Z0=75 TD=2n F=2e9 NL=1\n.op\n.end\n").unwrap();
+    assert_eq!(both.circuit.tlines[0].delay, 2e-9);
+    assert!(both.warnings.iter().any(|w| w.contains("TD= wins over")));
+
+    // Malformed cards are loud errors.
+    assert!(parse("T4 a b c d Z0=50\n.op\n.end\n").is_err());
+    assert!(parse("T4 a b c d TD=1n\n.op\n.end\n").is_err());
+    assert!(parse("T4 a b c d Z0=-1 TD=1n\n.op\n.end\n").is_err());
+    assert!(parse("T4 a b c d Z0=50 F=0\n.op\n.end\n").is_err());
+    assert!(parse("T4 a b c d Z0=50 F=2e9 NL=-1\n.op\n.end\n").is_err());
+    // Too few tokens (three node slots only) never reaches the parser.
+    assert!(parse("T4 a b c Z0=50 TD=1n\n.op\n.end\n").is_err());
+}
+
+#[test]
+fn tline_model_cards_are_kept_but_unused() {
+    // `.model … TLINE(…)` is a third-party spelling RSpice does not model
+    // yet: the card imports as a GenericModel and the element takes its
+    // Z0/TD straight from the card line.
+    let netlist =
+        parse(".model tmod TLINE(R=25 L=100n C=10p)\nT1 a b c d Z0=50 TD=1n\n.op\n.end\n").unwrap();
+    assert!(netlist.circuit.generic_models.contains_key("tmod"));
+    assert_eq!(netlist.circuit.tlines.len(), 1);
+    assert_eq!(netlist.circuit.tlines[0].z0, 50.0);
+}
+
+#[test]
+fn pwl_interpolates_between_consecutive_points() {
+    // A 3-point list: flat plateau after the 10 ps launch ramp. The lists'
+    // segments must each interpolate against their own left neighbour.
+    let netlist = parse("V1 in 0 PWL(0 0 10p 5 6n 5)\n.op\n.end\n").unwrap();
+    let src = &netlist.circuit.voltage_sources[0];
+    // Outside the pairs the source holds its first/last values.
+    assert_eq!(src.value_at(-1.0), 0.0);
+    assert_eq!(src.value_at(7e-9), 5.0);
+    // The exact breakpoints read their own pair values.
+    assert_eq!(src.value_at(0.0), 0.0);
+    assert_eq!(src.value_at(10e-12), 5.0);
+    // Inside the plateau: 5 V (a regression against the fan-from-first-point
+    // bug, which returned 5·t/6n past the first breakpoint).
+    assert_relative_eq!(src.value_at(30e-12), 5.0, epsilon = 1e-12);
+    assert_relative_eq!(src.value_at(2e-9), 5.0, epsilon = 1e-12);
+
+    // The inner segment of a descending list blends its own neighbours.
+    let down = parse("I1 a 0 PWL(0 5 1u 0 3u 0)\n.op\n.end\n").unwrap();
+    let src = &down.circuit.current_sources[0];
+    assert_relative_eq!(src.value_at(0.5e-6), 2.5, epsilon = 1e-9);
+    assert_relative_eq!(src.value_at(2e-6), 0.0, epsilon = 1e-12);
+}

@@ -73,6 +73,11 @@ deepening that has not landed yet.
   instants are hard boundaries.
 - **Breakpoint** — an instant where a source waveform changes slope (`PULSE` edges, `EXP`
   corners, `PWL` points including repeats). The stepper clips to every breakpoint.
+- **PWL interpolation** — the list blends each pair of neighbouring points: an interior
+  breakpoint's segment takes its own left edge, never the list's first value (a 3-point ramp
+  sources from the *previous* breakpoint), holds the first/last level outside `[t₁, tₙ]`, and
+  `REPEAT` blocks re-cycle their span through the same blender (`Pwl::interpolate`, the one
+  segment law).
 - **Temperature system** — `Circuit.temperature` (°C) plus model `TNOM`/`EG`/`XTI`/`TCV`/`BEX`
   and passive `TC1`/`TC2`; `.temp` with several values and `.step temp` produce one run per
   temperature. Device equations recompute `Vt = kT/q` and the bandgap law per evaluation.
@@ -135,6 +140,21 @@ deepening that has not landed yet.
   model, stamped as a conductance and hysteresis-fed by the previous state in transient.
 - **Mutual inductance** — `Kname L1 L2 k`; `M = k√(L1L2)`, stamped as cross terms in the two
   inductor branch equations for every integrator.
+- **Lossless transmission line (`T`)** — `Tname n1 n2 n3 n4 Z0=<Ω> TD=<s>`: two ports,
+  port A across `n1`/`n2`, port B across `n3`/`n4`; no branch rows, one `I(T…)` value per line
+  reporting the port-A current. `F=<Hz>` with `NL=<wavelengths>` (default 1) spells TD = NL/F;
+  a present `TD=` wins over them with a warning. Three stamps per mode: DC/op gets the
+  wire-pair interpretation (documented — a steady straight-through connection) where each
+  terminal pair stamps `g = 1/(1e-6·Z0)` between the hot nets (n1↔n3, n2↔n4), leaving a
+  through-drop ≈ I·1e-6·Z0; `.op` rows carry z0/td/v/i. Transient runs the method of
+  characteristics: per-port accepted-sample histories (`TlineHistory` in
+  `TransientState.tline_histories`, seeded from the op point over [−TD, 0], pushed and pruned on
+  accepted steps in `advance_transient_state`) feed each port's delayed incident wave
+  E = v(t−TD) + Z0·i(t−TD), the port solving as a Y = 1/Z0 admittance drawing I = Y·(V − E).
+  AC stamps the exact lossless two-port `Y = 1/(Z0·j·sinθ)·[[cosθ,−1],[−1,cosθ]]` (θ = ω·TD)
+  with `tline_ac_angles` clamping |sinθ| < 1e-12 at 1e-12 — integer half-wavelength resonance is
+  unbounded — and stamp and extraction call that one function, so the clamp cannot drift.
+  `.model …TLINE(…)` imports as a `GenericModel` (kept, unused — the card takes Z0/TD directly).
 - **Passive model card** — `.model … R/C/L` supplying a value and `TC1`/`TC2`; the element
   card may omit its value when the model supplies it. `Circuit::resistance_at` (and the C/L
   siblings) is the one temperature-scaling point.

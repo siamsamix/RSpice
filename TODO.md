@@ -19,7 +19,7 @@ source-edge breakpoints and `.options method=…`, small-signal `.ac`, one/two-s
 `.tf`, `.noise`, `.four`, nested `.step` (parameters or temperature), `.meas`, the PSpice-style
 `.mc` Monte Carlo driver (seeded runs over `LOT`/`DEV` model tolerances, uniform ±tol draws,
 histogram/yield readouts), and multi-run
-results; elements `R C L V I D M E F G H S W K`, the full source-waveform family
+results; elements `R C L V I D M E F G H S W T K`, the full source-waveform family
 (`PULSE/SIN/EXP/PWL[ FILE, REPEAT]/SFFM/AM`), temperature-dependent diode/MOSFET/passive
 equations; parser with `*`/`;` comments, `+` continuation, `MEG`/`MIL` suffixes,
 case-insensitive named nodes, subcircuits/libraries/initial conditions, and the
@@ -211,6 +211,18 @@ below is written against that state.
 - [x] **[P1] (both)** Mutual inductance `K` and ideal transformers; `[P2] (PS)` nonlinear magnetic core
   models (XFRM_NONLINEAR/RM); `[P2] (LT)` behavioral inductor via `flux=` control equation.
 - [ ] **[P1] (both)** Transmission lines: lossless `T` and lossy `O` (LTRA with RLCG parameterization).
+  *(the lossless `T` landed: `T<name> n1 n2 n3 n4 Z0=<Ω> TD=<s>` — `F=<Hz>` with `NL=<wavelengths>`
+  (default 1) spells TD = NL/F and present `TD=` wins over them with a warning, `Z0 > 0`/`TD > 0`
+  validated; no branch rows — one `I(T…)` report value per line, the port-A (`n1↔n2`) current.
+  DC/op runs the wire-pair interpretation: `g = 1/(1e-6·Z0)` between each port's hot nets, a
+  steady through-drop ≈ I·1e-6·Z0, `.op` rows z0/td/v/i; transient runs the method of
+  characteristics off per-port `(t, v, i)` history rings (`TlineHistory`, seeded from the op point
+  over [−TD, 0], pushed/pruned per accepted step) — each port draws Y = 1/Z0 against the far
+  port's delayed incident wave E = v(t−TD) + Z0·i(t−TD); AC stamps the exact lossless two-port
+  Y = 1/(Z0·j·sinθ)·[[cosθ,−1],[−1,cosθ]] with the |sinθ| < 1e-12 resonance clamp shared by stamp
+  and extraction. `.model …TLINE(…)` cards import as silent `GenericModel`s (kept, unused).
+  Integration tests pin the open-end TDR staircase (10/3 → 20/3 → 50/9 → 5 V), a
+  matched-termination flat line, straight-through DC, and the frequency-flat matched AC transfer.)*
 - [x] **[P1] (both)** Passive model cards: `.model R/L/C` with temperature coefficients `TC1/TC2`;
   LTspice-style intrinsic parasitics on every R/L/C (`rser`, `cpar`, `lser`, `rpar`). *(Model cards and
   TC1/TC2 plus the parasitic split were done: nonzero slots materialize into real series/parallel arms

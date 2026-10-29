@@ -300,6 +300,9 @@ fn print_dc(report: &mut String, netlist: &Netlist, result: &SimulationResult) {
     for (cur, j) in dc.branch_currents.jfets.iter().zip(&net.jfets) {
         let _ = writeln!(report, "  Id({}) = {cur:.6e} A", j.name);
     }
+    for (cur, l) in dc.branch_currents.tlines.iter().zip(&net.tlines) {
+        let _ = writeln!(report, "  I({}) = {cur:.6e} A", l.name);
+    }
     for (cur, r) in dc.branch_currents.resistors.iter().zip(&net.resistors) {
         let _ = writeln!(report, "  I({}) = {cur:.6e} A", r.name);
     }

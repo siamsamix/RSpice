@@ -939,6 +939,18 @@ pub fn device_op_points(
             ("id", id),
         ]));
     }
+    for (i, l) in circuit.tlines.iter().enumerate() {
+        let it = currents.tlines.get(i).copied().unwrap_or(0.0);
+        out.push(at(
+            &l.name,
+            vec![
+                ("z0", l.z0),
+                ("td", l.delay),
+                ("v", v(l.n1) - v(l.n2)),
+                ("i", it),
+            ],
+        ));
+    }
     for cs in &circuit.current_sources {
         let is = match &cs.waveform {
             Some(w) => w.value_at(0.0),
@@ -1712,6 +1724,7 @@ fn collapse_ac(b: &BranchCurrents<Complex64>) -> BranchCurrents<f64> {
         jfets: mag(&b.jfets),
         behavioral: mag(&b.behavioral),
         opamps: mag(&b.opamps),
+        tlines: mag(&b.tlines),
     }
 }
 

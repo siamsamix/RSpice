@@ -5,7 +5,7 @@ use crate::circuit::{
     Ac, Am, BehavioralKind, BehavioralSource, Bjt, BjtModel, BjtType, Capacitor, Circuit,
     ControlVar, ControlledSource, CurrentSource, Diode, DiodeModel, Exp, GenericModel, Inductor,
     Jfet, JfetModel, JfetType, Mosfet, MosfetModel, MosfetType, NodeId, OpAmp, Pwl, Pulse,
-    Resistor, Sffm, Sine, Switch, SwitchControl, SwitchModel, VoltageSource, Waveform,
+    Resistor, Sffm, Sine, Switch, SwitchControl, SwitchModel, Tline, VoltageSource, Waveform,
 };
 use crate::error::{Result, SimError};
 use crate::model::ModelTolerance;
@@ -21,7 +21,8 @@ use self::models::parse_model_card;
 use self::elements::{
     parse_behavioral_source, parse_bjt, parse_capacitor, parse_controlled_source,
     parse_current_source, parse_diode, parse_inductor, parse_jfet, parse_mosfet,
-    parse_mutual_inductance, parse_opamp, parse_resistor, parse_switch, parse_voltage_source,
+    parse_mutual_inductance, parse_opamp, parse_resistor, parse_switch, parse_tline,
+    parse_voltage_source,
 };
 use self::imports::splice_libraries;
 use self::nodeplan::{collect_global_nets, element_letter, scan_node_plan};
@@ -615,6 +616,7 @@ fn parse_featured(
             }
             'Q' => parse_bjt(&tokens, &mut circuit, &plan, &mut warnings, line_no)?,
             'J' => parse_jfet(&tokens, &mut circuit, &plan, &mut warnings, line_no)?,
+            'T' => parse_tline(&tokens, &mut circuit, &plan, &mut warnings, line_no)?,
             'S' | 'W' => parse_switch(&tokens, &mut circuit, &plan, line_no)?,
             'K' => parse_mutual_inductance(&tokens, &mut circuit, line_no)?,
             'B' => parse_behavioral_source(&tokens, &mut circuit, &plan, line_no, &env.params)?,

@@ -175,6 +175,23 @@ pub struct Jfet {
     pub area: f64,
 }
 
+/// Lossless transmission line (`T` card): two ports, port A across
+/// `n1`/`n2`, port B across `n3`/`n4`, one wire per port terminal pair
+/// (SPICE convention). `z0` is the characteristic impedance Z0 (Ω) and
+/// `delay` the one-way propagation delay TD (s).
+#[derive(Debug, Clone)]
+pub struct Tline {
+    pub name: String,
+    /// Port A terminals (near end): signal and return.
+    pub n1: NodeId,
+    pub n2: NodeId,
+    /// Port B terminals (far end): signal and return.
+    pub n3: NodeId,
+    pub n4: NodeId,
+    pub z0: f64,
+    pub delay: f64,
+}
+
 // ─── Controlled sources (E/F/G/H) ───────────────────────────────────────────
 
 /// What one term of a controlled source reads: a differential node voltage
@@ -676,14 +693,20 @@ impl Pwl {
         if t <= t0 {
             return v0;
         }
-        for &(t1, v1) in rest {
-            if t <= t1 {
-                if t1 <= t0 {
-                    return v1;
+        // Walk the list carrying the *previous* point as the interpolation's
+        // left bracket (a 3-point list must never blend segment 2 against
+        // the list's first value).
+        let mut left = (t0, v0);
+        for &right in rest {
+            if t <= right.0 {
+                let span = right.0 - left.0;
+                if span <= 0.0 {
+                    return right.1;
                 }
-                let frac = (t - t0) / (t1 - t0);
-                return v0 + (v1 - v0) * frac;
+                let frac = (t - left.0) / span;
+                return left.1 + (right.1 - left.1) * frac;
             }
+            left = right;
         }
         self.points.last().map(|p| p.1).unwrap_or(v0)
     }
@@ -903,7 +926,8 @@ impl CurrentSource {
 /// legend order R C L V D M Q J I B (see `CONTEXT.md`). One variant here
 /// corresponds to one `Vec` in the report structures, and every consumer —
 /// plots, CSV, `.meas` probes — walks the same list instead of re-spelling
-/// the family walk per file.
+/// the family walk per file. Newer families (`T` lines) append where they
+/// landed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ElementFamily {
     Resistors,
@@ -917,12 +941,13 @@ pub enum ElementFamily {
     CurrentSources,
     Behavioral,
     OpAmps,
+    Tlines,
 }
 
 /// Canonical family order: the glossary's R, C, L, V, D, M, I with the
 /// three-terminal, behavioral and op-amp families appended where those
 /// devices landed.
-pub const CURRENT_FAMILIES: [ElementFamily; 11] = [
+pub const CURRENT_FAMILIES: [ElementFamily; 12] = [
     ElementFamily::Resistors,
     ElementFamily::Capacitors,
     ElementFamily::Inductors,
@@ -934,6 +959,7 @@ pub const CURRENT_FAMILIES: [ElementFamily; 11] = [
     ElementFamily::CurrentSources,
     ElementFamily::Behavioral,
     ElementFamily::OpAmps,
+    ElementFamily::Tlines,
 ];
 
 impl ElementFamily {
@@ -951,6 +977,7 @@ impl ElementFamily {
             Self::CurrentSources => "I",
             Self::Behavioral => "B",
             Self::OpAmps => "U",
+            Self::Tlines => "T",
         }
     }
 
@@ -978,6 +1005,7 @@ impl ElementFamily {
             Self::CurrentSources => "current source",
             Self::Behavioral => "behavioral source",
             Self::OpAmps => "op-amp",
+            Self::Tlines => "transmission line",
         }
     }
 }
@@ -1023,6 +1051,9 @@ pub struct Circuit {
     pub bjts: Vec<Bjt>,
     pub(crate) jfet_models: HashMap<String, JfetModel>,
     pub jfets: Vec<Jfet>,
+    /// Lossless transmission lines (`T` cards), no branch rows and no
+    /// `.model` reference in this cut.
+    pub tlines: Vec<Tline>,
     /// Voltage-controlled voltage sources (`E`), one branch row each.
     pub(crate) vcvs: Vec<ControlledSource>,
     /// Voltage-controlled current sources (`G`), no branch row.
@@ -1507,6 +1538,12 @@ impl Circuit {
             collect_used_node(&mut used, j.ng);
             collect_used_node(&mut used, j.ns);
         }
+        for t in &self.tlines {
+            collect_used_node(&mut used, t.n1);
+            collect_used_node(&mut used, t.n2);
+            collect_used_node(&mut used, t.n3);
+            collect_used_node(&mut used, t.n4);
+        }
         for c in self.vcvs.iter().chain(&self.vccs).chain(&self.ccvs).chain(&self.cccs) {
             collect_used_node(&mut used, c.out_p);
             collect_used_node(&mut used, c.out_n);
@@ -1575,6 +1612,12 @@ impl Circuit {
             compact(&mut j.nd);
             compact(&mut j.ng);
             compact(&mut j.ns);
+        }
+        for l in &mut self.tlines {
+            compact(&mut l.n1);
+            compact(&mut l.n2);
+            compact(&mut l.n3);
+            compact(&mut l.n4);
         }
         for c in self
             .vcvs
@@ -1722,6 +1765,7 @@ impl Circuit {
             }
             ElementFamily::Behavioral => self.behavioral.iter().map(|e| e.name.clone()).collect(),
             ElementFamily::OpAmps => self.opamps.iter().map(|e| e.name.clone()).collect(),
+            ElementFamily::Tlines => self.tlines.iter().map(|e| e.name.clone()).collect(),
         }
     }
 
@@ -1992,6 +2036,20 @@ impl Circuit {
             if !self.jfet_models.contains_key(&j.model) {
                 return Err(SimError::Circuit(format!(
                     "JFET {} references unknown model '{}'", j.name, j.model
+                )));
+            }
+        }
+        for t in &self.tlines {
+            if t.z0 <= 0.0 {
+                return Err(SimError::Circuit(format!(
+                    "Tline {} must have Z0 > 0",
+                    t.name
+                )));
+            }
+            if t.delay <= 0.0 {
+                return Err(SimError::Circuit(format!(
+                    "Tline {} must have TD > 0",
+                    t.name
                 )));
             }
         }

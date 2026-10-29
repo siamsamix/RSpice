@@ -109,6 +109,10 @@ pub struct TransientState {
     pub jfet_cap_voltages: Vec<[f64; 2]>,
     pub jfet_cap_voltages_older: Vec<[f64; 2]>,
     pub jfet_cap_currents: Vec<[f64; 2]>,
+    /// Lossless-line method-of-characteristics history, one entry per `T`
+    /// card: the accepted `(t, v, i)` samples of ports A and B
+    /// ([`TlineHistory`]), seeded from the DC operating point.
+    pub tline_histories: Vec<TlineHistory>,
     /// Last settled state of every switch (`S`/`W`), for hysteresis.
     pub switch_states: Vec<Option<bool>>,
     /// Step size of the last accepted step (0 before the first step).
@@ -116,6 +120,96 @@ pub struct TransientState {
     /// Per-source runtime state of the behavioral sources (`B`): `idt`
     /// integrators and `delay` histories, one each, in card order.
     pub behavioral: Vec<BehavioralRuntime>,
+}
+
+/// One method-of-characteristics port sample: the accepted time, the port
+/// voltage (terminal pair difference), and the port current into the element.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TlineSample {
+    pub t: f64,
+    pub v: f64,
+    pub i: f64,
+}
+
+/// Method-of-characteristics history of one lossless line: port A's and
+/// port B's accepted samples, pushed by [`advance_transient_state`] after
+/// every step and queried at `t − TD` by the port stamps.
+#[derive(Debug, Clone, Default)]
+pub struct TlineHistory {
+    /// Port A = the `n1`/`n2` pair.
+    pub a: Vec<TlineSample>,
+    /// Port B = the `n3`/`n4` pair.
+    pub b: Vec<TlineSample>,
+}
+
+/// Linear interpolation of one port's history at `at`, clamping at both
+/// ends (the oldest sample answers queries in the seeded past, the newest
+/// answers queries past the last accepted step — a delay shorter than the
+/// current step).
+fn tline_port_sample(ring: &[TlineSample], at: f64) -> TlineSample {
+    let Some(first) = ring.first().copied() else {
+        return TlineSample {
+            t: at,
+            v: 0.0,
+            i: 0.0,
+        };
+    };
+    let Some(last) = ring.last().copied() else {
+        unreachable!()
+    };
+    if at >= last.t {
+        return last;
+    }
+    if at <= first.t {
+        return first;
+    }
+    let hi = ring.partition_point(|s| s.t < at);
+    let lo = &ring[hi - 1];
+    let span = ring[hi].t - lo.t;
+    if span <= 0.0 {
+        return *lo;
+    }
+    let w = (at - lo.t) / span;
+    TlineSample {
+        t: at,
+        v: lo.v + w * (ring[hi].v - lo.v),
+        i: lo.i + w * (ring[hi].i - lo.i),
+    }
+}
+
+/// Append an accepted port sample and prune samples no future query can
+/// reach: every upcoming query happens at a step's end minus TD, strictly
+/// after `horizon`, so only the last sample at/before `horizon` must stay
+/// on as that query's left interpolation bracket.
+fn push_tline_sample(ring: &mut Vec<TlineSample>, sample: TlineSample, horizon: f64) {
+    ring.push(sample);
+    if sample.t <= horizon {
+        return;
+    }
+    let cut = ring.partition_point(|s| s.t <= horizon);
+    let keep_from = cut.saturating_sub(1);
+    if keep_from > 0 {
+        ring.drain(..keep_from);
+    }
+}
+
+/// The lossless two-port's trigonometric pair `(sinθ, cosθ)` at `θ = ω·TD`
+/// with the resonance clamp applied: `sinθ = 0` (integer half-wavelengths)
+/// makes the exact admittances unbounded, so they bound at |sin| = 1e-12
+/// instead of dividing by zero (a documented interpretation — stamp and
+/// extraction call this one function, so they can never drift apart).
+fn tline_ac_angles(theta: f64) -> (f64, f64) {
+    let s = theta.sin();
+    let s = if s.abs() < 1e-12 {
+        if s < 0.0 {
+            -1e-12
+        } else {
+            1e-12
+        }
+    } else {
+        s
+    };
+    (s, theta.cos())
 }
 
 /// BDF2 coefficients `(a0, a1, a2)` for `v' ≈ a0·v_{n+1} + a1·v_n + a2·v_{n−1}`
@@ -662,6 +756,16 @@ pub fn build_system<T: Field>(circuit: &Circuit, mode: Mode) -> Result<MnaSystem
                 }
             }
 
+            // Lossless lines at DC: the steady state is a straight-through
+            // connection (documented interpretation, see CONTEXT.md). Each
+            // wire pair stamps as a stiff admittance g_wire = 1/(1e-6·Z0),
+            // leaving a through-current drop of ΔV ≈ I·1e-6·Z0.
+            for line in &circuit.tlines {
+                let g_wire = T::lift(1.0 / (1.0e-6 * line.z0));
+                stamp_admittance(&mut sys, line.n1, line.n3, g_wire);
+                stamp_admittance(&mut sys, line.n2, line.n4, g_wire);
+            }
+
             stamp_voltage_sources(circuit, &mut sys, |v| v.voltage * src_scale);
             stamp_current_sources(circuit, &mut sys, |i| i.current * src_scale);
             stamp_behavioral(circuit, &mut sys, guess, true, 0.0, 0.0, &[], 0.0)?;
@@ -701,6 +805,27 @@ pub fn build_system<T: Field>(circuit: &Circuit, mode: Mode) -> Result<MnaSystem
             stamp_jfet_capacitances(circuit, &mut sys, guess, state, dt, method)?;
             stamp_capacitors(circuit, &mut sys, dt, state, method);
             stamp_inductors(circuit, &mut sys, dt, state, method);
+            // Lossless lines (method of characteristics): each port is its
+            // characteristic admittance Y = 1/Z0 in parallel with the
+            // opposite port's delayed incident wave
+            //   E_A(t) = v_B(t−TD) + Z0·i_B(t−TD)   (E_B symmetric),
+            // so port A draws I_A = Y·(V_A − E_A). The wave pushes Y·E out
+            // of the + terminal, which lands on the nodes in the current
+            // helper's second-then-first order.
+            for (i, line) in circuit.tlines.iter().enumerate() {
+                let fallback_rings = TlineHistory::default();
+                let rings = state.tline_histories.get(i).unwrap_or(&fallback_rings);
+                let y = 1.0 / line.z0;
+                let t_query = t - line.delay;
+                let far = tline_port_sample(&rings.b, t_query);
+                let incoming_a = far.v + line.z0 * far.i;
+                let near = tline_port_sample(&rings.a, t_query);
+                let incoming_b = near.v + line.z0 * near.i;
+                stamp_admittance(&mut sys, line.n1, line.n2, T::lift(y));
+                stamp_admittance(&mut sys, line.n3, line.n4, T::lift(y));
+                stamp_current_source(&mut sys, line.n2, line.n1, T::lift(incoming_a * y));
+                stamp_current_source(&mut sys, line.n4, line.n3, T::lift(incoming_b * y));
+            }
             stamp_voltage_sources(circuit, &mut sys, |v| v.value_at(t) * startup_ramp(t, startup));
             stamp_current_sources(circuit, &mut sys, |i| i.value_at(t) * startup_ramp(t, startup));
             stamp_behavioral(circuit, &mut sys, guess, true, t, dt, &state.behavioral, 0.0)?;
@@ -732,6 +857,34 @@ pub fn build_system<T: Field>(circuit: &Circuit, mode: Mode) -> Result<MnaSystem
                 sys.a[(branch, branch)] -= z_l;
             }
             stamp_ac_mutual_inductances(circuit, &mut sys, omega);
+
+            // Lossless lines: the exact lossless two-port. With θ = ω·TD
+            // the port admittance matrix is
+            //   Y = 1/(Z0·j·sinθ) · [[cosθ, −1], [−1, cosθ]]
+            // (the singularity at sinθ = 0 clamps — see `tline_ac_angles`).
+            // The cross terms y12 act on the *opposite* port's voltages,
+            // stamped symmetrically; ground terminals drop their share.
+            for line in &circuit.tlines {
+                let (s, c) = tline_ac_angles(omega * line.delay);
+                // 1/(Z0·j·sinθ) = −j/(Z0·sinθ): y11 = cosθ·(−j/(Z0·s)),
+                // y12 = +j/(Z0·s) — built through `T::imag` so the generic
+                // field needs no division.
+                let y11 = T::lift(c) * T::imag(-1.0 / (line.z0 * s));
+                let y12 = T::imag(1.0 / (line.z0 * s));
+                stamp_admittance(&mut sys, line.n1, line.n2, y11);
+                stamp_admittance(&mut sys, line.n3, line.n4, y11);
+                for (a, b, value) in [
+                    (line.n1, line.n3, y12),
+                    (line.n2, line.n4, y12),
+                    (line.n1, line.n4, -y12),
+                    (line.n2, line.n3, -y12),
+                ] {
+                    if let (Some(ia), Some(ib)) = (node_index(a), node_index(b)) {
+                        sys.a[(ia, ib)] += value;
+                        sys.a[(ib, ia)] += value;
+                    }
+                }
+            }
 
             // Small-signal stamps at the DC bias: linearisation only, no
             // Newton-Raphson companion currents (and no limiter or gmin —
@@ -2055,6 +2208,10 @@ pub struct BranchCurrents<T> {
     /// Output current of each op-amp: the branch unknown, `out+ → out−`
     /// element convention.
     pub opamps: Vec<T>,
+    /// Current into each lossless line at its `n1` terminal: the MoC port-A
+    /// current in transient, the hot-wire through current in DC/op, and the
+    /// y11·V_A + y12·V_B phasor in AC (magnitudes after `collapse_ac`).
+    pub tlines: Vec<T>,
 }
 
 impl<T> BranchCurrents<T> {
@@ -2074,6 +2231,7 @@ impl<T> BranchCurrents<T> {
             ElementFamily::Jfets => Some(&self.jfets),
             ElementFamily::Behavioral => Some(&self.behavioral),
             ElementFamily::OpAmps => Some(&self.opamps),
+            ElementFamily::Tlines => Some(&self.tlines),
         }
     }
 }
@@ -2162,6 +2320,18 @@ pub fn compute_branch_currents(
         jfets.push(model.currents(vgs, vgd, j.area, circuit.temperature).id);
     }
 
+    // Lossless lines at DC/op: the current into the element at n1 is the
+    // hot-wire through current g_wire·(v_hot difference) — the wire-pair
+    // interpretation the DC stamp used (see CONTEXT.md's T entry).
+    let tlines = circuit
+        .tlines
+        .iter()
+        .map(|line| {
+            let g_wire = 1.0 / (1.0e-6 * line.z0);
+            g_wire * (node_voltage(solution, line.n1) - node_voltage(solution, line.n3))
+        })
+        .collect();
+
     // Behavioral sources: voltage-flavour cards read their branch unknown;
     // current-flavour cards re-evaluate `f(x)` at the converged point with no
     // pending step (dt = 0), so an `idt` reports what it has already
@@ -2202,6 +2372,7 @@ pub fn compute_branch_currents(
         jfets,
         behavioral,
         opamps,
+        tlines,
     })
 }
 
@@ -2216,6 +2387,18 @@ pub fn compute_branch_currents_at(
     let mut currents = compute_branch_currents(circuit, solution, None, None, Some(t))?;
     currents.capacitors = state.capacitor_currents.clone();
     currents.inductors = state.inductor_currents.clone();
+    // Lossless lines report the method-of-characteristics port-A current:
+    // I_A = (V_A − E_A(t))/Z0 with port B's accepted history at t − TD —
+    // exactly the wave the step's stamp injected.
+    if currents.tlines.len() == state.tline_histories.len() {
+        for (i, line) in circuit.tlines.iter().enumerate() {
+            let y = 1.0 / line.z0;
+            let far = tline_port_sample(&state.tline_histories[i].b, t - line.delay);
+            let incoming = far.v + line.z0 * far.i;
+            let v_a = node_voltage(solution, line.n1) - node_voltage(solution, line.n2);
+            currents.tlines[i] = y * (v_a - incoming);
+        }
+    }
     if currents.diodes.len() == state.diode_cap_currents.len() {
         for (total, displacement) in currents
             .diodes
@@ -2338,6 +2521,47 @@ pub fn seed_transient_state(
         })
         .collect();
     state.jfet_cap_currents = vec![[0.0; 2]; circuit.jfets.len()];
+    // Lossless lines: the rings seed from the steady operating point over
+    // [−TD, 0] (the transient's time axis starts at t = 0). The wire-pair
+    // DC model: both port voltages track, the through wires carry
+    // g_wire·(v_hot difference) with port B's current the negative of
+    // port A's — the exact steady-state port relation (i_B = −i_A).
+    state.tline_histories = circuit
+        .tlines
+        .iter()
+        .map(|line| {
+            let v_a = node_voltage(solution, line.n1) - node_voltage(solution, line.n2);
+            let v_b = node_voltage(solution, line.n3) - node_voltage(solution, line.n4);
+            let i_a = (node_voltage(solution, line.n1) - node_voltage(solution, line.n3))
+                / (1.0e-6 * line.z0);
+            TlineHistory {
+                a: vec![
+                    TlineSample {
+                        t: -line.delay,
+                        v: v_a,
+                        i: i_a,
+                    },
+                    TlineSample {
+                        t: 0.0,
+                        v: v_a,
+                        i: i_a,
+                    },
+                ],
+                b: vec![
+                    TlineSample {
+                        t: -line.delay,
+                        v: v_b,
+                        i: -i_a,
+                    },
+                    TlineSample {
+                        t: 0.0,
+                        v: v_b,
+                        i: -i_a,
+                    },
+                ],
+            }
+        })
+        .collect();
     state.switch_states = switch_states_after(circuit, solution, &[]);
 
     // Behavioral sources: the runtime module seeds its own history from the
@@ -2623,6 +2847,42 @@ pub fn advance_transient_state(
         })
         .collect();
 
+    // Lossless lines: push the accepted end-of-step port samples — the
+    // port current from the MoC relation with the same delayed wave the
+    // step's stamp used — then prune what no future query can reach.
+    let mut tline_histories = if previous.tline_histories.len() == circuit.tlines.len() {
+        previous.tline_histories.clone()
+    } else {
+        vec![TlineHistory::default(); circuit.tlines.len()]
+    };
+    for (i, line) in circuit.tlines.iter().enumerate() {
+        let y = 1.0 / line.z0;
+        let far = tline_port_sample(&tline_histories[i].b, t_end - line.delay);
+        let incoming_a = far.v + line.z0 * far.i;
+        let near = tline_port_sample(&tline_histories[i].a, t_end - line.delay);
+        let incoming_b = near.v + line.z0 * near.i;
+        let v_a = node_voltage(solution, line.n1) - node_voltage(solution, line.n2);
+        let v_b = node_voltage(solution, line.n3) - node_voltage(solution, line.n4);
+        push_tline_sample(
+            &mut tline_histories[i].a,
+            TlineSample {
+                t: t_end,
+                v: v_a,
+                i: y * (v_a - incoming_a),
+            },
+            t_end - line.delay,
+        );
+        push_tline_sample(
+            &mut tline_histories[i].b,
+            TlineSample {
+                t: t_end,
+                v: v_b,
+                i: y * (v_b - incoming_b),
+            },
+            t_end - line.delay,
+        );
+    }
+
     TransientState {
         capacitor_voltages,
         capacitor_currents,
@@ -2644,6 +2904,7 @@ pub fn advance_transient_state(
         jfet_cap_voltages: jfet_cap_voltages_new,
         jfet_cap_voltages_older: previous.jfet_cap_voltages.clone(),
         jfet_cap_currents: jfet_cap_currents_new,
+        tline_histories,
         switch_states: switch_states_after(circuit, solution, &previous.switch_states),
         last_dt: dt,
         behavioral,
@@ -2798,6 +3059,22 @@ pub fn compute_ac_branch_currents(
         );
     }
 
+    // ── Lossless lines: exact small-signal two-port ─────────────────────
+    // I_A = y11·V_A + y12·V_B with y = 1/(Z0·j·sinθ)·[[cosθ,−1],[−1,cosθ]]
+    // — the same clamped coefficients the AC arm stamped.
+    let tlines = circuit
+        .tlines
+        .iter()
+        .map(|line| {
+            let (s, c) = tline_ac_angles(omega * line.delay);
+            let y11 = c * Complex64::new(0.0, -1.0 / (line.z0 * s));
+            let y12 = Complex64::new(0.0, 1.0 / (line.z0 * s));
+            let v_a = node_voltage(solution, line.n1) - node_voltage(solution, line.n2);
+            let v_b = node_voltage(solution, line.n3) - node_voltage(solution, line.n4);
+            y11 * v_a + y12 * v_b
+        })
+        .collect();
+
     let mut bjts = Vec::with_capacity(circuit.bjts.len());
     for q in &circuit.bjts {
         let model = device_model(&circuit.bjt_models, "BJT", &q.name, &q.model)?;
@@ -2878,6 +3155,7 @@ pub fn compute_ac_branch_currents(
         jfets,
         behavioral,
         opamps,
+        tlines,
     })
 }
 

@@ -1138,6 +1138,95 @@ pub(super) fn parse_jfet(
     Ok(())
 }
 
+/// Parse a lossless transmission line:
+/// `T<name> n1 n2 n3 n4 Z0=<Ω> TD=<s>` — or `F=<Hz>` with `NL=<wavelengths>`
+/// instead of `TD=` (SPICE's alternative spelling, `TD = NL/F`).
+///
+/// Both ports lead through directly: port A is `n1`/`n2`, port B is
+/// `n3`/`n4`. There is no `model=` in this cut — the line takes Z0/TD on the
+/// card; `.model TLINE` cards stay `GenericModel` entries.
+pub(super) fn parse_tline(
+    tokens: &[&str],
+    circuit: &mut Circuit,
+    plan: &HashMap<String, usize>,
+    warnings: &mut Vec<String>,
+    line_no: usize,
+) -> Result<()> {
+    if tokens.len() < 7 {
+        return Err(SimError::Parse(format!(
+            "line {line_no}: T requires: Tname n1 n2 n3 n4 Z0=<Ω> TD=<s> (or F=<Hz> [NL=<len>])"
+        )));
+    }
+    let n1 = parse_node(tokens[1], circuit, plan)?;
+    let n2 = parse_node(tokens[2], circuit, plan)?;
+    let n3 = parse_node(tokens[3], circuit, plan)?;
+    let n4 = parse_node(tokens[4], circuit, plan)?;
+    let (mut z0, mut td, mut freq, mut nl) = (None, None, None, None);
+    for tok in &tokens[5..] {
+        let Some((key, value)) = tok.split_once('=') else {
+            warnings.push(format!(
+                "line {line_no}: T '{}': token '{tok}' is not KEY=value — ignored",
+                tokens[0]
+            ));
+            continue;
+        };
+        match key.to_ascii_lowercase().as_str() {
+            "z0" => z0 = Some(parse_value(value).map_err(SimError::Parse)?),
+            "td" => td = Some(parse_value(value).map_err(SimError::Parse)?),
+            "f" => freq = Some(parse_value(value).map_err(SimError::Parse)?),
+            "nl" => nl = Some(parse_value(value).map_err(SimError::Parse)?),
+            _ => warnings.push(format!(
+                "line {line_no}: T '{}': token '{tok}' is not supported — ignored",
+                tokens[0]
+            )),
+        }
+    }
+    let z0 = z0.ok_or_else(|| {
+        SimError::Parse(format!("line {line_no}: T '{}' is missing Z0=", tokens[0]))
+    })?;
+    let delay = match (td, freq) {
+        (Some(td), _) => td,
+        (None, Some(f)) => {
+            if f <= 0.0 {
+                return Err(SimError::Parse(format!(
+                    "line {line_no}: T '{}': F= must be positive to set TD = NL/F",
+                    tokens[0]
+                )));
+            }
+            let nl = nl.unwrap_or(1.0);
+            if nl <= 0.0 {
+                return Err(SimError::Parse(format!(
+                    "line {line_no}: T '{}': NL= must be positive",
+                    tokens[0]
+                )));
+            }
+            nl / f
+        }
+        (None, None) => {
+            return Err(SimError::Parse(format!(
+                "line {line_no}: T '{}' is missing TD= (or F=/NL=)",
+                tokens[0]
+            )));
+        }
+    };
+    if td.is_some() && (freq.is_some() || nl.is_some()) {
+        warnings.push(format!(
+            "line {line_no}: T '{}': TD= wins over F=/NL= (all given)",
+            tokens[0]
+        ));
+    }
+    circuit.tlines.push(Tline {
+        name: tokens[0].to_string(),
+        n1,
+        n2,
+        n3,
+        n4,
+        z0,
+        delay,
+    });
+    Ok(())
+}
+
 /// Parse a voltage-controlled (`S`) or current-controlled (`W`) switch.
 ///
 /// `Sname n+ n- ctrl+ ctrl- model [ON|OFF]`
@@ -1615,6 +1704,18 @@ pub(super) fn emit_elements(circuit: &Circuit, out: &mut String) {
             name_of(j.ns),
             j.model,
             area
+        ));
+    }
+    for t in &circuit.tlines {
+        out.push_str(&format!(
+            "{} {} {} {} {} Z0={} TD={}\n",
+            t.name,
+            name_of(t.n1),
+            name_of(t.n2),
+            name_of(t.n3),
+            name_of(t.n4),
+            t.z0,
+            t.delay
         ));
     }
     for v in &circuit.voltage_sources {

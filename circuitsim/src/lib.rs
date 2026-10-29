@@ -28,7 +28,7 @@ pub use netlist::{AcCommand, AcScale, DcCommand, DcSweepSpec, DcSweepValues, Mea
 pub use circuit::{AbmForm, AbmMeasure, BehavioralKind, BehavioralSource, Circuit, ControlVar,
                   ControlledSource, CurrentSource, Diode, DiodeModel, GenericModel, Jfet,
                   JfetModel, ModelTolerance, Mosfet, MosfetModel, MutualInductance, OpAmp,
-                  OpAmpModel, Switch, SwitchControl, SwitchModel, Waveform};
+                  OpAmpModel, Switch, SwitchControl, SwitchModel, Tline, Waveform};
 pub use error::{Result, SimError};
 pub use netlist::{Netlist, parse_with_overrides};
 

@@ -2583,3 +2583,132 @@ R2 out 0 rt
     let below_three = mids.iter().filter(|m| **m < 3.0).count();
     assert_eq!(rep.criterion.map(|y| y.passes), Some(below_three));
 }
+
+/// TDR staircase: a 25 Ω source launches 5 V into Z0 = 50, TD = 1 ns, far
+/// end open. Textbook levels — launch 5·50/75 = 10/3, the open end doubles
+/// it to 20/3 at exactly TD, the reflection returns (source Γ = −1/3) to
+/// lift the near end to 50/9 at 2·TD — and the ladder converges to 5 V.
+#[test]
+fn tline_open_end_tdr_shows_the_reflection_staircase() {
+    let netlist = parse(
+        r#"
+* open-end TDR launch
+V1 in 0 PWL(0 0 10p 5 6n 5)
+Rs in a 25
+T1 a 0 b 0 Z0=50 TD=1n
+.tran 100p 6n
+.end
+"#,
+    )
+    .unwrap();
+    let result = run(&netlist).unwrap();
+    let tran = result.tran.expect("transient runs");
+    let a = node_index(&netlist.circuit.node_names, "a");
+    let b = node_index(&netlist.circuit.node_names, "b");
+    let peak = |node: usize, lo: f64, hi: f64| -> f64 {
+        tran.points
+            .iter()
+            .filter(|p| p.time > lo && p.time < hi)
+            .map(|p| p.node_voltages[node])
+            .fold(f64::NEG_INFINITY, f64::max)
+    };
+    // The launch wave and the open-end double jump at the far end.
+    assert_relative_eq!(peak(a, 0.2e-9, 0.9e-9), 10.0 / 3.0, epsilon = 0.2);
+    assert_relative_eq!(peak(b, 1.2e-9, 2.6e-9), 20.0 / 3.0, epsilon = 0.2);
+    // The reflection returns at 2·TD and lifts the near end.
+    assert_relative_eq!(peak(a, 2.2e-9, 3.4e-9), 50.0 / 9.0, epsilon = 0.2);
+    // The staircase walks toward the DC value 5 V.
+    assert!(
+        peak(a, 5.0e-9, 5.9e-9) > 4.5,
+        "the ladder must approach 5 V, saw {}",
+        peak(a, 5.0e-9, 5.9e-9)
+    );
+}
+
+/// An exactly matched load (R = Z0) absorbs the launch wave: both ports sit
+/// at 5·50/75 = 10/3 from TD on with no reflection to fold back.
+#[test]
+fn tline_matched_termination_carries_no_reflection() {
+    let netlist = parse(
+        r#"
+* matched line launch
+V1 in 0 PWL(0 0 10p 5 6n 5)
+Rs in a 25
+T1 a 0 b 0 Z0=50 TD=1n
+Rl b 0 50
+.tran 100p 6n
+.end
+"#,
+    )
+    .unwrap();
+    let result = run(&netlist).unwrap();
+    let tran = result.tran.expect("transient runs");
+    let a = node_index(&netlist.circuit.node_names, "a");
+    let b = node_index(&netlist.circuit.node_names, "b");
+    let band = |node: usize, lo: f64, hi: f64| -> (f64, f64) {
+        tran.points
+            .iter()
+            .filter(|p| p.time > lo && p.time < hi)
+            .map(|p| p.node_voltages[node])
+            .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
+                (lo.min(v), hi.max(v))
+            })
+    };
+    // Near end before and after TD: the same flat launch level.
+    assert_relative_eq!(band(a, 0.3e-9, 0.9e-9).1, 10.0 / 3.0, epsilon = 0.05);
+    assert_relative_eq!(band(a, 2.2e-9, 3.8e-9).0, 10.0 / 3.0, epsilon = 0.05);
+    assert_relative_eq!(band(a, 2.2e-9, 3.8e-9).1, 10.0 / 3.0, epsilon = 0.05);
+    // Far end likewise, from the first arrival on.
+    assert_relative_eq!(band(b, 1.5e-9, 2.5e-9).0, 10.0 / 3.0, epsilon = 0.05);
+    assert_relative_eq!(band(b, 1.5e-9, 2.5e-9).1, 10.0 / 3.0, epsilon = 0.05);
+}
+
+/// DC steady state: the wire-pair interpretation makes the line a
+/// straight-through connection; the reported through current is the real
+/// divider current and the residual drop is the documented I·1e-6·Z0.
+#[test]
+fn tline_dc_op_point_runs_straight_through() {
+    let netlist = parse(
+        r#"
+* DC through a line
+V1 in 0 DC 10
+R1 in a 1k
+T1 a 0 b 0 Z0=100 TD=1n
+Rl b 0 1k
+.op
+.end
+"#,
+    )
+    .unwrap();
+    let dc = run(&netlist).unwrap().dc.unwrap();
+    let b = node_index(&netlist.circuit.node_names, "b");
+    assert_relative_eq!(dc.node_voltages[b], 5.0, epsilon = 1e-4);
+    assert_relative_eq!(dc.branch_currents.tlines[0], 5e-3, max_relative = 2e-3);
+}
+
+/// Small-signal: an exactly matched line is frequency-flat — both ports at
+/// half the source at every computed frequency (the delay only shifts the
+/// far-end phase).
+#[test]
+fn tline_ac_matched_transfer_is_frequency_flat() {
+    let netlist = parse(
+        r#"
+* matched line small-signal response
+V1 in 0 DC 0 AC 1
+R1 in a 50
+T1 a 0 b 0 Z0=50 TD=1n
+Rl b 0 50
+.ac dec 20 1k 10g
+.end
+"#,
+    )
+    .unwrap();
+    let ac = run(&netlist).unwrap().ac.expect("ac runs");
+    let a = node_index(&netlist.circuit.node_names, "a");
+    let b = node_index(&netlist.circuit.node_names, "b");
+    assert!(ac.points.len() >= 20);
+    for point in &ac.points {
+        assert_relative_eq!(point.node_voltages[a].norm(), 0.5, epsilon = 1e-9);
+        assert_relative_eq!(point.node_voltages[b].norm(), 0.5, epsilon = 1e-9);
+    }
+}

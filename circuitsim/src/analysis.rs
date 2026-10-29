@@ -610,10 +610,10 @@ pub struct DcConvergence {
 impl DcConvergence {
     fn from_analysis(analysis: &crate::netlist::AnalysisCommands) -> Self {
         Self {
-            gmin: analysis.gmin,
-            gminsteps: analysis.gminsteps,
-            srcsteps: analysis.srcsteps,
-            itl1: analysis.itl1,
+            gmin: analysis.config.gmin,
+            gminsteps: analysis.config.gminsteps,
+            srcsteps: analysis.config.srcsteps,
+            itl1: analysis.config.itl1,
         }
     }
 }
@@ -1180,7 +1180,7 @@ fn run_transient(
         return Err(SimError::Analysis("tstop must be >= tstart".into()));
     }
 
-    let method = analysis.method;
+    let method = analysis.config.method;
     let max_step = analysis.tran_maxstep.unwrap_or(dt_out).min(t_stop.max(dt_out));
     let min_step = (t_stop * 1e-12).max(1e-18);
 
@@ -1213,7 +1213,7 @@ fn run_transient(
     const MAX_STEPS: usize = 10_000_000;
     // The transient path's iteration budget: `.options itl4=` (per time
     // point; the defaults keep the pre-options 100).
-    let max_iters = analysis.itl4;
+    let max_iters = analysis.config.itl4;
 
     while t < t_stop - eps {
         if iterations > MAX_STEPS {
@@ -1342,7 +1342,7 @@ fn transient_error(
     for i in 0..n_nodes.min(full.len()).min(half.len()) {
         let a = full[i];
         let b = half[i];
-        let tol = analysis.reltol * a.abs().max(b.abs()) + analysis.vntol;
+        let tol = analysis.config.reltol * a.abs().max(b.abs()) + analysis.config.vntol;
         let e = (a - b).abs() / tol.max(1e-30);
         worst = worst.max(e);
     }

@@ -40,6 +40,7 @@ deepening that has not landed yet.
 - **Initial conditions (`.ic` / `.nodeset`)** — `NodesetEntry` lists (`V(net)=…`, split spellings accepted, `I()` entries warn), names resolved case-insensitively against real nets — an unknown or ground entry is a loud error, never a silent seed. Inside a subckt body the entries are scope-mangled (`V(mid)=3` → `V(X1.mid)=3`). Distribution of roles: `.nodeset` only moves the DC Newton starting iterate (converges to the true operating point either way); `.ic` pins the UIC t=0 state.
 - **AC sweep (`.ac`)** — frequency-domain small-signal analysis about the DC bias; stimulus amplitude comes from the voltage source's `AC` field, not a separate command setting.
 - **Analysis command** — parsed directive config (`.tran`/`.ac` parameters, `AcCommand`, `AcScale`). Lives with the netlist format, not with analyses (cut #3 resolves the current mutual import).
+- **Run config** — `RunConfig`, the ten engine knobs a `.options` card writes (`method`, `reltol`/`abstol`/`vntol`, `gmin`/`gminsteps`/`srcsteps`, `itl1`/`itl4`, and the base `mc_seed`), owned by `AnalysisCommands.config` as one home: one writer (the `.options` walk in `dotcards.rs`), one reader shape — `analysis.config.<knob>` is the only path. Distinct from `ParseOptions` (where the parser finds files) and from `Netlist.mc_seed` (the run's *rolled* seed: that base value mixed with the sweep overrides).
 
 ## GUI language
 

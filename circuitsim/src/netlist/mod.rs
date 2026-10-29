@@ -220,24 +220,14 @@ pub enum MeasKind {
     },
 }
 
+/// The knobs a run is configured by: every `.options KEY=` the engine
+/// consumes plus the deck's base Monte-Carlo seed. One home next to the
+/// command cards they configure — one writer (the `.options` walk), one
+/// reader shape for the engine, the deck emitter, and the tests:
+/// `analysis.config.<knob>`. ([`Netlist::mc_seed`] separately owns the
+/// run's *rolled* seed: this base value mixed with the sweep overrides.)
 #[derive(Debug, Clone)]
-pub struct AnalysisCommands {
-    pub dc_op: bool,
-    /// `.op pon|all` — the operating-point print detail (PSpice variants).
-    pub op_mode: OpMode,
-    pub dc: Option<DcCommand>,
-    pub tran_step: Option<f64>,
-    pub tran_stop: Option<f64>,
-    pub tran_start: f64,
-    /// `.tran … UIC`: the operating point is skipped and the transient
-    /// starts from the `.ic` values (everything else at 0).
-    pub tran_uic: bool,
-    /// `.tran … STARTUP`: the DC operating point is solved and run with every
-    /// source suppressed (zero) and the sources ramp to their card values
-    /// over the first 10 µs of the transient (the LTspice startup ramp).
-    pub tran_startup: bool,
-    /// Optional `.tran … tmax` cap on the internal timestep.
-    pub tran_maxstep: Option<f64>,
+pub struct RunConfig {
     /// `.options method=` integration method (trapezoidal default).
     pub method: crate::circuit::IntegrationMethod,
     /// Relative Newton/LTE tolerance (`reltol`, default 1e-3).
@@ -266,8 +256,50 @@ pub struct AnalysisCommands {
     /// `.options seed=` — the deck's base Monte-Carlo seed (TODO §8). It is
     /// known before any element line expands (the pre-scan lifts it), so both
     /// the expansion-time draws and the runtime keyed draws run off it.
-    /// 0 = unseeded; the effective seed mixes this with the sweep overrides.
+    /// 0 = unseeded; the effective seed is rolled onto [`Netlist::mc_seed`].
     pub mc_seed: u64,
+}
+
+impl Default for RunConfig {
+    fn default() -> Self {
+        Self {
+            method: crate::circuit::IntegrationMethod::Trapezoidal,
+            reltol: 1e-3,
+            abstol: 1e-12,
+            vntol: 1e-6,
+            gmin: 1e-12,
+            gminsteps: 10,
+            srcsteps: 10,
+            itl1: 100,
+            itl4: 100,
+            mc_seed: 0,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct AnalysisCommands {
+    pub dc_op: bool,
+    /// `.op pon|all` — the operating-point print detail (PSpice variants).
+    pub op_mode: OpMode,
+    pub dc: Option<DcCommand>,
+    pub tran_step: Option<f64>,
+    pub tran_stop: Option<f64>,
+    pub tran_start: f64,
+    /// `.tran … UIC`: the operating point is skipped and the transient
+    /// starts from the `.ic` values (everything else at 0).
+    pub tran_uic: bool,
+    /// `.tran … STARTUP`: the DC operating point is solved and run with every
+    /// source suppressed (zero) and the sources ramp to their card values
+    /// over the first 10 µs of the transient (the LTspice startup ramp).
+    pub tran_startup: bool,
+    /// Optional `.tran … tmax` cap on the internal timestep.
+    pub tran_maxstep: Option<f64>,
+    /// The engine knobs this deck's `.options` card configured — tolerance
+    /// floors, the integration method, retry ladders, iteration budgets, and
+    /// the base draw seed. One writer (the `.options` walk), one home; see
+    /// [`RunConfig`].
+    pub config: RunConfig,
     pub ac: Option<AcCommand>,
     /// `.tf <output> <input>` — DC transfer function.
     pub tf: Option<TfCommand>,
@@ -302,16 +334,7 @@ impl Default for AnalysisCommands {
             tran_uic: false,
             tran_startup: false,
             tran_maxstep: None,
-            method: crate::circuit::IntegrationMethod::Trapezoidal,
-            reltol: 1e-3,
-            abstol: 1e-12,
-            vntol: 1e-6,
-            gmin: 1e-12,
-            gminsteps: 10,
-            srcsteps: 10,
-            itl1: 100,
-            itl4: 100,
-            mc_seed: 0,
+            config: RunConfig::default(),
             ac: None,
             tf: None,
             steps: Vec::new(),
@@ -566,12 +589,12 @@ fn parse_featured(
     // A seed the walk recorded but the pre-scan could not lift is a
     // parameterized value (only `{}`-expansion can read it): honor-able by
     // the walk, not by the expansion-time draws. Warn, don't half-apply.
-    if analysis.mc_seed != 0 && analysis.mc_seed != option_seed {
+    if analysis.config.mc_seed != 0 && analysis.config.mc_seed != option_seed {
         warnings.push(format!(
             ".options seed={} is parameterized — the draw seed must be a plain \
              number to raise the base seed; keyed draws follow the sweep \
              overrides instead",
-            analysis.mc_seed
+            analysis.config.mc_seed
         ));
     }
     Ok(Netlist {

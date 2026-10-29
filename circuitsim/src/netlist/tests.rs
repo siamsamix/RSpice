@@ -128,22 +128,28 @@
              .end\n",
         )
         .unwrap();
-        assert_eq!(netlist.analysis.gmin, 1e-10);
-        assert_eq!(netlist.analysis.gminsteps, 12);
-        assert_eq!(netlist.analysis.srcsteps, 3);
-        assert_eq!(netlist.analysis.itl1, 200);
-        assert_eq!(netlist.analysis.itl4, 5);
+        assert_eq!(netlist.analysis.config.gmin, 1e-10);
+        assert_eq!(netlist.analysis.config.gminsteps, 12);
+        assert_eq!(netlist.analysis.config.srcsteps, 3);
+        assert_eq!(netlist.analysis.config.itl1, 200);
+        assert_eq!(netlist.analysis.config.itl4, 5);
 
         let text = emit(&netlist);
         for knob in ["gmin=", "gminsteps=", "srcsteps=", "itl1=", "itl4="] {
             assert!(text.contains(knob), "emit lost {knob}: {text}");
         }
         let reparsed = parse(&text).unwrap();
-        assert_eq!(reparsed.analysis.gmin, netlist.analysis.gmin);
-        assert_eq!(reparsed.analysis.gminsteps, netlist.analysis.gminsteps);
-        assert_eq!(reparsed.analysis.srcsteps, netlist.analysis.srcsteps);
-        assert_eq!(reparsed.analysis.itl1, netlist.analysis.itl1);
-        assert_eq!(reparsed.analysis.itl4, netlist.analysis.itl4);
+        assert_eq!(reparsed.analysis.config.gmin, netlist.analysis.config.gmin);
+        assert_eq!(
+            reparsed.analysis.config.gminsteps,
+            netlist.analysis.config.gminsteps
+        );
+        assert_eq!(
+            reparsed.analysis.config.srcsteps,
+            netlist.analysis.config.srcsteps
+        );
+        assert_eq!(reparsed.analysis.config.itl1, netlist.analysis.config.itl1);
+        assert_eq!(reparsed.analysis.config.itl4, netlist.analysis.config.itl4);
 
         // Default knobs stay silent in the emitted options line.
         let plain = parse("* plain deck\n.op\n.end\n").unwrap();
@@ -170,7 +176,7 @@
             )
         };
         let seeded = parse(&deck("42")).unwrap();
-        assert_eq!(seeded.analysis.mc_seed, 42, "the walk records the value");
+        assert_eq!(seeded.analysis.config.mc_seed, 42, "the walk records the value");
         assert_ne!(seeded.mc_seed, 0, "the env seed left zero");
         let draw = seeded.circuit.voltage_sources[0].voltage;
         assert!((-1.0..=1.0).contains(&draw), "rand(1) inside ±1: {draw}");
@@ -221,7 +227,7 @@
             "* deck\n.op\nV1 1 0 {rand(1)}\nR1 1 0 1k\n.option seed=42\n.end\n",
         )
         .unwrap();
-        assert_eq!(singular.analysis.mc_seed, 42, "the walk records the value");
+        assert_eq!(singular.analysis.config.mc_seed, 42, "the walk records the value");
         assert_eq!(singular.mc_seed, plural.mc_seed, "same env seed as the plural form");
         assert_eq!(
             singular.circuit.voltage_sources[0].voltage.to_bits(),

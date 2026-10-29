@@ -408,7 +408,7 @@ pub(super) fn parse_options(
         let key = key.to_ascii_lowercase();
         match key.as_str() {
             "method" => {
-                analysis.method = match value.to_ascii_lowercase().as_str() {
+                analysis.config.method = match value.to_ascii_lowercase().as_str() {
                     "trap" | "trapezoidal" => crate::circuit::IntegrationMethod::Trapezoidal,
                     "gear" | "gear2" => crate::circuit::IntegrationMethod::Gear2,
                     "gear1" | "be" | "euler" => crate::circuit::IntegrationMethod::Gear1,
@@ -419,9 +419,9 @@ pub(super) fn parse_options(
                     }
                 };
             }
-            "reltol" => analysis.reltol = parse_value(value).map_err(SimError::Parse)?,
-            "abstol" => analysis.abstol = parse_value(value).map_err(SimError::Parse)?,
-            "vntol" => analysis.vntol = parse_value(value).map_err(SimError::Parse)?,
+            "reltol" => analysis.config.reltol = parse_value(value).map_err(SimError::Parse)?,
+            "abstol" => analysis.config.abstol = parse_value(value).map_err(SimError::Parse)?,
+            "vntol" => analysis.config.vntol = parse_value(value).map_err(SimError::Parse)?,
             "maxstep" | "tmax" => {
                 analysis.tran_maxstep = Some(parse_value(value).map_err(SimError::Parse)?)
             }
@@ -429,17 +429,23 @@ pub(super) fn parse_options(
             // point (gmin floor, the gmin/source-stepping ladder depths) and
             // the Newton iteration budgets at DC (`itl1`) and per transient
             // point (`itl4`).
-            "gmin" => analysis.gmin = parse_value(value).map_err(SimError::Parse)?,
+            "gmin" => analysis.config.gmin = parse_value(value).map_err(SimError::Parse)?,
             "gminsteps" => {
-                analysis.gminsteps =
+                analysis.config.gminsteps =
                     parse_value(value).map_err(SimError::Parse)?.max(0.0) as usize
             }
             "srcsteps" => {
-                analysis.srcsteps =
+                analysis.config.srcsteps =
                     parse_value(value).map_err(SimError::Parse)?.max(0.0) as usize
             }
-            "itl1" => analysis.itl1 = parse_value(value).map_err(SimError::Parse)?.max(1.0) as usize,
-            "itl4" => analysis.itl4 = parse_value(value).map_err(SimError::Parse)?.max(1.0) as usize,
+            "itl1" => {
+                analysis.config.itl1 =
+                    parse_value(value).map_err(SimError::Parse)?.max(1.0) as usize
+            }
+            "itl4" => {
+                analysis.config.itl4 =
+                    parse_value(value).map_err(SimError::Parse)?.max(1.0) as usize
+            }
             // TODO §8: `.options seed=` — the deck's base Monte-Carlo seed.
             // Element lines expand (and draw) before dot commands execute,
             // so the seed is ALSO lifted from the raw logical lines in
@@ -448,7 +454,8 @@ pub(super) fn parse_options(
             // read (e.g. parameterized) warn there instead of silently
             // changing the expansion-time draws.
             "seed" => {
-                analysis.mc_seed = parse_value(value).map_err(SimError::Parse)?.max(0.0) as u64;
+                analysis.config.mc_seed =
+                    parse_value(value).map_err(SimError::Parse)?.max(0.0) as u64;
             }
             // Parsed but not applied yet; keep them as warnings instead of
             // pretending the engine honours them.
@@ -1071,35 +1078,35 @@ pub(super) fn emit_commands(analysis: &AnalysisCommands, out: &mut String) {
     }
     let mut options = format!(
         ".options method={} reltol={} abstol={} vntol={}",
-        match analysis.method {
+        match analysis.config.method {
             crate::circuit::IntegrationMethod::Trapezoidal => "trap",
             crate::circuit::IntegrationMethod::Gear1 => "gear1",
             crate::circuit::IntegrationMethod::Gear2 => "gear2",
         },
-        analysis.reltol,
-        analysis.abstol,
-        analysis.vntol
+        analysis.config.reltol,
+        analysis.config.abstol,
+        analysis.config.vntol
     );
     // Convergence knobs re-print only when they differ from the engine
     // defaults, so an uncustomized deck's emitted options line is unchanged.
-    if analysis.gmin != 1e-12 {
-        options.push_str(&format!(" gmin={}", analysis.gmin));
+    if analysis.config.gmin != 1e-12 {
+        options.push_str(&format!(" gmin={}", analysis.config.gmin));
     }
-    if analysis.gminsteps != 10 {
-        options.push_str(&format!(" gminsteps={}", analysis.gminsteps));
+    if analysis.config.gminsteps != 10 {
+        options.push_str(&format!(" gminsteps={}", analysis.config.gminsteps));
     }
-    if analysis.srcsteps != 10 {
-        options.push_str(&format!(" srcsteps={}", analysis.srcsteps));
+    if analysis.config.srcsteps != 10 {
+        options.push_str(&format!(" srcsteps={}", analysis.config.srcsteps));
     }
-    if analysis.itl1 != 100 {
-        options.push_str(&format!(" itl1={}", analysis.itl1));
+    if analysis.config.itl1 != 100 {
+        options.push_str(&format!(" itl1={}", analysis.config.itl1));
     }
-    if analysis.itl4 != 100 {
-        options.push_str(&format!(" itl4={}", analysis.itl4));
+    if analysis.config.itl4 != 100 {
+        options.push_str(&format!(" itl4={}", analysis.config.itl4));
     }
-    if analysis.mc_seed != 0 {
+    if analysis.config.mc_seed != 0 {
         // TODO §8: the base Monte-Carlo seed round-trips like the knobs.
-        options.push_str(&format!(" seed={}", analysis.mc_seed));
+        options.push_str(&format!(" seed={}", analysis.config.mc_seed));
     }
     out.push_str(&options);
     out.push('\n');

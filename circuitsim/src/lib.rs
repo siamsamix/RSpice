@@ -11,6 +11,7 @@ pub mod circuit;
 pub mod currents;
 pub mod error;
 pub mod export;
+pub mod fft;
 pub mod mc;
 pub mod mna;
 pub mod model;

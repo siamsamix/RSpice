@@ -2,13 +2,14 @@ use std::fmt::Write as _;
 use std::fs;
 use std::path::PathBuf;
 
-use clap::{Parser, ValueEnum};
-use circuitsim::{
-    run, Circuit, DcResult, DcSweepPoint, MeasureResult, Netlist, ParseOptions, RawFlavor, SimError,
-    SimulationResult,
-};
+use circuitsim::fft::Window;
 use circuitsim::netlist::OpMode;
 use circuitsim::netlist::{McCommand, McOp};
+use circuitsim::{
+    run, Circuit, DcResult, DcSweepPoint, MeasureResult, Netlist, ParseOptions, RawFlavor,
+    SimError, SimulationResult,
+};
+use clap::{Parser, ValueEnum};
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum AnalysisKind {
@@ -19,6 +20,45 @@ enum AnalysisKind {
     Tf,
     Noise,
     Four,
+}
+
+/// `--window` choices: LTspice's FFT-view parameter-free windows (clap's
+/// kebab-case spellings match the library's `Window::from_label`).
+#[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
+enum WindowKind {
+    Bartlett,
+    BartlettHann,
+    Blackman,
+    BlackmanHarris,
+    BlackmanNuttal,
+    Bohman,
+    Cosine,
+    FlatTop,
+    Hamming,
+    Hann,
+    Lanczos,
+    Parzen,
+    Welch,
+}
+
+impl From<WindowKind> for Window {
+    fn from(kind: WindowKind) -> Window {
+        match kind {
+            WindowKind::Bartlett => Window::Bartlett,
+            WindowKind::BartlettHann => Window::BartlettHann,
+            WindowKind::Blackman => Window::Blackman,
+            WindowKind::BlackmanHarris => Window::BlackmanHarris,
+            WindowKind::BlackmanNuttal => Window::BlackmanNuttal,
+            WindowKind::Bohman => Window::Bohman,
+            WindowKind::Cosine => Window::Cosine,
+            WindowKind::FlatTop => Window::FlatTop,
+            WindowKind::Hamming => Window::Hamming,
+            WindowKind::Hann => Window::Hann,
+            WindowKind::Lanczos => Window::Lanczos,
+            WindowKind::Parzen => Window::Parzen,
+            WindowKind::Welch => Window::Welch,
+        }
+    }
 }
 
 #[derive(Parser)]
@@ -48,11 +88,21 @@ struct Args {
     #[arg(long)]
     image: Option<PathBuf>,
 
-    /// Comma list of trace names for --waves/--image (case-insensitive
+    /// Comma list of trace names for --waves/--image/--fft (case-insensitive
     /// full-column names); unmatched names are silent, the axis and the
     /// step columns always stay
     #[arg(long, value_name = "TRACES")]
     traces: Option<String>,
+
+    /// Render the FFT spectrum of every matched transient trace as an SVG
+    /// image to this file (one panel per trace, drawn top to bottom)
+    #[arg(long)]
+    fft: Option<PathBuf>,
+
+    /// FFT window function, one of LTspice's FFT-view windows (each taper
+    /// normalized to unit mean, so a DC level reads its true amplitude)
+    #[arg(long, requires = "fft", value_enum, default_value_t = WindowKind::BlackmanHarris)]
+    window: WindowKind,
 
     /// Write the simulation's plots as an LTspice-style .raw file
     #[arg(long, value_name = "FILE")]
@@ -178,7 +228,13 @@ fn run_cli() -> Result<(), CliError> {
             RawFlavor::Binary
         };
         let title = format!("* {}", args.netlist.display());
-        fs::write(path, circuitsim::rawwave::to_bytes(&circuitsim::rawwave::build(&title, &netlist, &result), flavor))?;
+        fs::write(
+            path,
+            circuitsim::rawwave::to_bytes(
+                &circuitsim::rawwave::build(&title, &netlist, &result),
+                flavor,
+            ),
+        )?;
     }
 
     if let Some(path) = &args.waves {
@@ -197,6 +253,17 @@ fn run_cli() -> Result<(), CliError> {
         let raw = circuitsim::rawwave::build(&title, &netlist, &result);
         let svg = circuitsim::export::svg_document(&raw, &trace_specs(args.traces.as_deref()));
         fs::write(path, svg)?;
+    }
+
+    if let Some(path) = &args.fft {
+        let title = format!("* {}", args.netlist.display());
+        let raw = circuitsim::rawwave::build(&title, &netlist, &result);
+        let spectra = circuitsim::fft::spectra(
+            &raw,
+            &trace_specs(args.traces.as_deref()),
+            args.window.into(),
+        );
+        fs::write(path, circuitsim::export::svg_document(&spectra, &[]))?;
     }
 
     let body = if args.csv {
@@ -341,7 +408,12 @@ fn print_dc(report: &mut String, netlist: &Netlist, result: &SimulationResult) {
     for (cur, mft) in dc.branch_currents.mosfets.iter().zip(&net.mosfets) {
         let _ = writeln!(report, "  I({}) = {cur:.6e} A", mft.name);
     }
-    for (cur, cs) in dc.branch_currents.current_sources.iter().zip(&net.current_sources) {
+    for (cur, cs) in dc
+        .branch_currents
+        .current_sources
+        .iter()
+        .zip(&net.current_sources)
+    {
         let _ = writeln!(report, "  I({}) = {cur:.6e} A", cs.name);
     }
     for (cur, b) in dc.branch_currents.behavioral.iter().zip(&net.behavioral) {
@@ -393,7 +465,9 @@ fn print_device_op_points(report: &mut String, net: &Circuit, dc: &DcResult) {
 }
 
 fn print_dc_sweep(report: &mut String, netlist: &Netlist, result: &SimulationResult) {
-    let Some(sweep) = &result.dc_sweep else { return };
+    let Some(sweep) = &result.dc_sweep else {
+        return;
+    };
     let net = &netlist.circuit;
     let _ = writeln!(report, "\n--- DC Sweep ---");
     let _ = writeln!(
@@ -493,7 +567,11 @@ fn print_tf(report: &mut String, result: &SimulationResult) {
     let _ = writeln!(report, "  {} / {}", tf.output, tf.input);
     let _ = writeln!(report, "  transfer = {:.6e}", tf.transfer);
     if tf.input_impedance.is_finite() {
-        let _ = writeln!(report, "  input impedance  = {:.6e} Ohm", tf.input_impedance);
+        let _ = writeln!(
+            report,
+            "  input impedance  = {:.6e} Ohm",
+            tf.input_impedance
+        );
     } else {
         let _ = writeln!(report, "  input impedance  = infinite");
     }
@@ -512,7 +590,11 @@ fn print_noise(report: &mut String, result: &SimulationResult) {
     let Some(noise) = &result.noise else { return };
     let _ = writeln!(report, "\n--- Noise Analysis ---");
     let _ = writeln!(report, "  output {}, input {}", noise.output, noise.input);
-    let _ = writeln!(report, "  {:>14} {:>16} {:>16}", "freq", "output V/√Hz", "input V/√Hz");
+    let _ = writeln!(
+        report,
+        "  {:>14} {:>16} {:>16}",
+        "freq", "output V/√Hz", "input V/√Hz"
+    );
     for p in &noise.points {
         let _ = writeln!(
             report,
@@ -535,11 +617,7 @@ fn print_four(report: &mut String, result: &SimulationResult) {
         four.fundamental
     );
     for out in &four.outputs {
-        let _ = writeln!(
-            report,
-            "  {}: dc = {:.6e}",
-            out.name, out.dc
-        );
+        let _ = writeln!(report, "  {}: dc = {:.6e}", out.name, out.dc);
         let _ = writeln!(
             report,
             "  {:>4} {:>14} {:>14} {:>10} {:>10}",
@@ -549,11 +627,7 @@ fn print_four(report: &mut String, result: &SimulationResult) {
             let _ = writeln!(
                 report,
                 "  {:>4} {:>14.4e} {:>14.6e} {:>10.4} {:>10.2}",
-                h.number,
-                h.frequency,
-                h.magnitude,
-                h.normalized_magnitude,
-                h.phase_deg
+                h.number, h.frequency, h.magnitude, h.normalized_magnitude, h.phase_deg
             );
         }
     }
@@ -644,7 +718,10 @@ fn print_runs(report: &mut String, netlist: &Netlist, result: &SimulationResult)
         "#",
         result.step_targets.join(", "),
         if result.runs.first().is_some_and(|r| r.dc.is_some()) {
-            format!("V({})", node_label(&netlist.circuit, netlist.circuit.nodes.saturating_sub(1)))
+            format!(
+                "V({})",
+                node_label(&netlist.circuit, netlist.circuit.nodes.saturating_sub(1))
+            )
         } else {
             String::new()
         }
@@ -753,7 +830,12 @@ fn print_raw(report: &mut String, raw: &circuitsim::RawFile) {
                 .zip(row.iter())
                 .map(|(var, v)| {
                     if ds.flags.iter().any(|f| f.eq_ignore_ascii_case("complex")) {
-                        format!("{}={:.6e}@{:.4}deg", var.name, v.norm(), v.arg().to_degrees())
+                        format!(
+                            "{}={:.6e}@{:.4}deg",
+                            var.name,
+                            v.norm(),
+                            v.arg().to_degrees()
+                        )
                     } else {
                         format!("{}={:.6e}", var.name, v.re)
                     }

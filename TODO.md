@@ -275,8 +275,11 @@ below is written against that state.
   (LTspice dual cursors; PSpice cursor measurements).
 - [ ] **[P1] (LT)** Waveform arithmetic: add arbitrary expression traces (`V(out)*I(V1)` power, scaled,
   offset, combined) — the viewer plots only raw `V(n)`, `I(el)`, `V(a)-V(b)` today.
-- [ ] **[P1] (both)** FFT of transient traces with configurable windowing (LTspice Blackman-Harris et
-  al.; PSpice Probe FFT).
+- [x] **[P1] (both)** FFT of transient traces with configurable windowing (LTspice Blackman-Harris et
+  al.; PSpice Probe FFT). *(done: core `fft.rs` (13 windows incl. `--window`/aliases, unit-mean
+  taper, next-power-of-two resample, bin = 1/span, `{trace} (FFT)` plots) + CLI `--fft` SVG;
+  parameterized windows (Dolph-Chebyshev, Kaiser-Bessel, Gaussian, …) deferred; GUI viewing is a
+  later §7 item)*
 - [ ] **[P1] (both)** Stepped/parametric overlays: all `.step`/parametric runs on one plot with per-run
   identification; PSpice performance-analysis curves of a measurement vs swept parameter belong here.
 - [ ] **[P1] (both)** Axis completeness: linear/log on both axes, physical unit auto-detection and

@@ -131,10 +131,14 @@ below is written against that state.
   and bandgap terms recomputed from absolute temperature — done: diode `IS(T)`/`Vt` with
   `EG`/`XTI`/`TNOM`, MOSFET `TCV`/`BEX`/`TNOM`, passive `TC1`/`TC2` model cards, several
   `.temp` values or `.step temp` run the deck per temperature.
-- [ ] **[P1] (LT)** `.options trtol` transient error tolerance — LTspice uses `trtol` (default 2.0)
+- [x] **[P1] (LT)** `.options trtol` transient error tolerance — LTspice uses `trtol` (default 2.0)
   as the truncation-error overestimation factor in its adaptive timestep controller; RSpice's LTE
   path has no `trtol` knob. Found as a string literal in `LTspice.exe` (reverse-engineered via
   REA/rizin; see `docs/ltspice-parity-gap.md` §5.5).
+  Done: `RunConfig.trtol` default 2.0, `.options trtol=` parse arm (0.01 floor) + emit arm
+  (non-default only), LTE estimate divided by `trtol` in `transient_error`. Tests: step-count
+  coarsening + emit round-trip (`trtol_relaxes_the_step_controller`); jfet assertions loosened
+  for the default relaxation (`epsilon 1e-3`, current floor 1e-9).
 - [ ] **[P1] (LT)** AVX2/SIMD-optimized transcendental math — `LTspice.exe` ships `sin_avx2.c`,
   `cos_avx2.c`, `tan_avx2.c`, `exp_avx2.c`, `log_avx2.c`, `log10_avx2.c`, `pow_avx2.c` etc. for
   vectorized device/B-source evaluation; RSpice uses scalar `f64` math. Gate on

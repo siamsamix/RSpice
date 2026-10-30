@@ -1202,7 +1202,10 @@ fn transient_error(
         let e = (a - b).abs() / tol.max(1e-30);
         worst = worst.max(e);
     }
-    worst
+    // `.options trtol=` is the truncation-error overestimation factor: the
+    // estimate deliberately over-tightens, so the shipped LTspice default
+    // 2.0 (and the knob) relaxes the accept/reject threshold that uses it.
+    worst / analysis.config.trtol.max(1e-9)
 }
 
 fn growth_factor(err: f64, order: f64) -> f64 {

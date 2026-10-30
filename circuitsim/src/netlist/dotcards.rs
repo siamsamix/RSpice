@@ -447,6 +447,12 @@ pub(super) fn parse_options(
                 analysis.config.itl4 =
                     parse_value(value).map_err(SimError::Parse)?.max(1.0) as usize
             }
+            // LTspice's truncated-error overestimation factor in the
+            // adaptive stepper (TODO §3): the LTE estimate rides ~trtol
+            // bigger steps.
+            "trtol" => {
+                analysis.config.trtol = parse_value(value).map_err(SimError::Parse)?.max(0.01)
+            }
             // TODO §8: `.options seed=` — the deck's base Monte-Carlo seed.
             // Element lines expand (and draw) before dot commands execute,
             // so the seed is ALSO lifted from the raw logical lines in
@@ -1190,6 +1196,9 @@ pub(super) fn emit_commands(analysis: &AnalysisCommands, out: &mut String) {
     }
     if analysis.config.itl4 != 100 {
         options.push_str(&format!(" itl4={}", analysis.config.itl4));
+    }
+    if analysis.config.trtol != 2.0 {
+        options.push_str(&format!(" trtol={}", analysis.config.trtol));
     }
     if analysis.config.mc_seed != 0 {
         // TODO §8: the base Monte-Carlo seed round-trips like the knobs.

@@ -308,6 +308,11 @@ pub struct RunConfig {
     /// point. Default 100 (kept from the pre-options engine; the SPICE
     /// classic default of 10 starved the damped-Newton line search).
     pub itl4: usize,
+    /// `.options trtol=` — the transient truncation-error overestimation
+    /// factor (TODO §3). The LTE estimate is divided by it before the
+    /// accept/reject comparison, so the shipped LTspice default of 2.0
+    /// halves the sensitivity of the step controller.
+    pub trtol: f64,
     /// `.options seed=` — the deck's base Monte-Carlo seed (TODO §8). It is
     /// known before any element line expands (the pre-scan lifts it), so both
     /// the expansion-time draws and the runtime keyed draws run off it.
@@ -327,6 +332,7 @@ impl Default for RunConfig {
             srcsteps: 10,
             itl1: 100,
             itl4: 100,
+            trtol: 2.0,
             mc_seed: 0,
         }
     }

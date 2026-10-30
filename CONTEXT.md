@@ -74,6 +74,8 @@ deepening that has not landed yet.
 
 ## GUI language
 
+- **Design reference** — the GUI mirrors LTspice; for the reference install and
+  RE-tooling notes see `docs/agents/ltspice.md`.
 - **Schematic** — the grid-drawn circuit in the egui app. `schematic.rs` owns the editor's state machine — `SchematicState` with its mutations (place by tool, rotate with wire re-attach, drag with wire stretch, wire open/close, select, cancel, deletes) and both deck conversions: `build_netlist` (schematic → `Netlist` through the shared value grammar) and `from_netlist` (deck → schematic through the one `parse`, drawing `R C L V` and counting the rest instead of dropping them). The canvas computes pointer geometry and asks the module to mutate. Node numbering comes from a union-find over grid connectivity — one implementation, shared by the writer and the painter.
 - **Element kind / CompKind** — the GUI enum paralleling element letters; import draws `R C L V` and counts the rest (`D`/`M`/`I` have no symbol yet) instead of dropping silently.
 - **Plot series / PlotState** — the tab plotting adapter: typed bounds state replacing the stringly scale fields, one `apply_bounds`, one element→series interface used by all tabs. Every result tab draws through `plot_frame` (axis labels, legend, gestures, the one-time bounds apply), and the four AC panels share `ac_plot_frame` with the frequency-cursor plumbing — log grid and 10ˣ→Hz hover labels in dB mode, plain ticks in linear mode; `AcMagScale` (default `Db`) and `AcCursor` live beside it. dB/phase math is GUI-internal, computed once, not re-derived per tab.

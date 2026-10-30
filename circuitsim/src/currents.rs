@@ -471,7 +471,13 @@ pub fn compute_ac_branch_currents(
                     if dk == 0.0 {
                         continue;
                     }
-                    let dv = node_voltage_complex(probe, solution, &branch);
+                    let dv = crate::behavior::resolve_probe(
+                        probe,
+                        |p, m| node_voltage(solution, p) - node_voltage(solution, m),
+                        |i| solution[branch.src_branch(i)],
+                        |i| solution[branch.ind_branch(i)],
+                    )
+                    .unwrap_or_else(|| Complex64::new(0.0, 0.0));
                     phasor += Complex64::new(dk, 0.0) * dv;
                 }
                 behavioral.push(phasor);
@@ -499,23 +505,6 @@ pub fn compute_ac_branch_currents(
         opamps,
         tlines,
     })
-}
-
-/// The complex small-signal value of one bound probe (a node-pair phasor or a
-/// branch-unknown phasor).
-fn node_voltage_complex(
-    probe: &crate::behavior::ProbeBinding,
-    solution: &DVector<Complex64>,
-    branch: &BranchLayout,
-) -> Complex64 {
-    match probe {
-        crate::behavior::ProbeBinding::Voltage(p, m) => {
-            node_voltage(solution, *p) - node_voltage(solution, *m)
-        }
-        crate::behavior::ProbeBinding::SourceCurrent(i) => solution[branch.src_branch(*i)],
-        crate::behavior::ProbeBinding::InductorCurrent(i) => solution[branch.ind_branch(*i)],
-        crate::behavior::ProbeBinding::Unresolved(_) => Complex64::new(0.0, 0.0),
-    }
 }
 
 // ─── Operating-point seed ────────────────────────────────────────────────────

@@ -776,18 +776,14 @@ pub fn device_op_points(
             .behavior
             .probes
             .iter()
-            .map(|probe| match probe {
-                crate::behavior::ProbeBinding::Voltage(p, m) => v(*p) - v(*m),
-                crate::behavior::ProbeBinding::SourceCurrent(i) => source_currents
-                    .get(*i)
-                    .copied()
-                    .unwrap_or(0.0),
-                crate::behavior::ProbeBinding::InductorCurrent(i) => {
-                    currents.inductors.get(*i).copied().unwrap_or(0.0)
-                }
-                crate::behavior::ProbeBinding::Unresolved(_) => {
-                    unreachable!("probes bind before any report runs")
-                }
+            .map(|probe| {
+                crate::behavior::resolve_probe(
+                    probe,
+                    |p, m| v(p) - v(m),
+                    |i| source_currents.get(i).copied().unwrap_or(0.0),
+                    |i| currents.inductors.get(i).copied().unwrap_or(0.0),
+                )
+                .unwrap_or_else(|| unreachable!("probes bind before any report runs"))
             })
             .collect();
         let value = b.behavior.evaluate(&probe_values, 0.0, 0.0, &BehavioralRuntime::default())

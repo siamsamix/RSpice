@@ -264,6 +264,25 @@ impl ProbeBinding {
     }
 }
 
+/// Read one bound probe through the caller's accessors. The read sites of
+/// this type (DC iterate snapshots, report maps, AC phasors) differ only in
+/// how they read a node pair and the two branch kinds, not in the binding's
+/// shape: this owns that shape once and returns `None` while the binding
+/// still carries only its parse-time name.
+pub(crate) fn resolve_probe<T>(
+    probe: &ProbeBinding,
+    node_pair: impl Fn(NodeId, NodeId) -> T,
+    src_branch: impl Fn(usize) -> T,
+    ind_branch: impl Fn(usize) -> T,
+) -> Option<T> {
+    match probe {
+        ProbeBinding::Voltage(p, m) => Some(node_pair(*p, *m)),
+        ProbeBinding::SourceCurrent(i) => Some(src_branch(*i)),
+        ProbeBinding::InductorCurrent(i) => Some(ind_branch(*i)),
+        ProbeBinding::Unresolved(_) => None,
+    }
+}
+
 /// Per-source runtime state for history-dependent terms (`idt`, `delay`).
 #[derive(Debug, Clone, Default)]
 pub struct BehavioralRuntime {

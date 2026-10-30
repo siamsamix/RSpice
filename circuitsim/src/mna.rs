@@ -1174,24 +1174,20 @@ pub(crate) fn behavioral_probe_snapshot(
         .probes
         .iter()
         .map(|probe| {
-            let v = match probe {
-                crate::behavior::ProbeBinding::Voltage(p, m) => {
-                    node_voltage(values, *p) - node_voltage(values, *m)
-                }
-                crate::behavior::ProbeBinding::SourceCurrent(i) => {
-                    values[branch.src_branch(*i)]
-                }
-                crate::behavior::ProbeBinding::InductorCurrent(i) => {
-                    values[branch.ind_branch(*i)]
-                }
-                crate::behavior::ProbeBinding::Unresolved(spec) => {
-                    return Err(SimError::Analysis(format!(
-                        "behavioral source '{}': probe {spec:?} was never bound — the parse \
-                         pipeline must run resolve_behavioral() before stamping",
-                        source.name
-                    )));
-                }
-            };
+            if let crate::behavior::ProbeBinding::Unresolved(spec) = probe {
+                return Err(SimError::Analysis(format!(
+                    "behavioral source '{}': probe {spec:?} was never bound — the parse \
+                     pipeline must run resolve_behavioral() before stamping",
+                    source.name
+                )));
+            }
+            let v = crate::behavior::resolve_probe(
+                probe,
+                |p, m| node_voltage(values, p) - node_voltage(values, m),
+                |i| values[branch.src_branch(i)],
+                |i| values[branch.ind_branch(i)],
+            )
+            .unwrap_or_else(|| unreachable!("probes are bound before stamping"));
             if !v.is_finite() {
                 return Err(SimError::Analysis(format!(
                     "behavioral source '{}': probe value is not finite",
@@ -1201,6 +1197,55 @@ pub(crate) fn behavioral_probe_snapshot(
             Ok(v)
         })
         .collect()
+}
+
+/// Stamp one row of a current-flavoured behavioral source's Jacobian with all
+/// of its probe couplings: the plus node of a `V(p,m)` probe reads `sign·g`,
+/// the minus node reads `−(sign·g)`, and a branch reading (`I(src)`/`I(L)`)
+/// reads the branch unknown at `sign·g`, with `g` lifted from the linearized
+/// coefficient `dk`.
+fn stamp_probe_couplings<'a, T: Field>(
+    sys: &mut MnaSystem<T>,
+    row: usize,
+    sign: f64,
+    dk_factor: &impl Fn(f64) -> T,
+    probe_couplings: impl Iterator<Item = (&'a crate::behavior::ProbeBinding, &'a f64)>,
+) {
+    let at_p: fn(&mut MnaSystem<T>, usize, usize, T) = if sign < 0.0 {
+        MnaSystem::<T>::stamp_sub
+    } else {
+        MnaSystem::<T>::stamp_add
+    };
+    let at_m: fn(&mut MnaSystem<T>, usize, usize, T) = if sign < 0.0 {
+        MnaSystem::<T>::stamp_add
+    } else {
+        MnaSystem::<T>::stamp_sub
+    };
+    for (probe, &dk) in probe_couplings {
+        if dk == 0.0 {
+            continue;
+        }
+        let g = dk_factor(dk);
+        match probe {
+            crate::behavior::ProbeBinding::Voltage(p, m) => {
+                if let Some(col) = node_index(*p) {
+                    at_p(sys, row, col, g);
+                }
+                if let Some(col) = node_index(*m) {
+                    at_m(sys, row, col, g);
+                }
+            }
+            crate::behavior::ProbeBinding::SourceCurrent(idx) => {
+                at_p(sys, row, sys.branch.src_branch(*idx), g);
+            }
+            crate::behavior::ProbeBinding::InductorCurrent(idx) => {
+                at_p(sys, row, sys.branch.ind_branch(*idx), g);
+            }
+            crate::behavior::ProbeBinding::Unresolved(_) => {
+                unreachable!("probes are bound before stamping (resolve_behavioral)")
+            }
+        }
+    }
 }
 
 /// Stamp every behavioral source at the given iterate.
@@ -1311,58 +1356,22 @@ pub(crate) fn stamp_behavioral<T: Field>(
                 // card. The linear terms ride the node rows; the companion
                 // goes into `z` exactly once.
                 if let Some(row) = node_index(b.out_p) {
-                    for (probe, &dk) in b.behavior.probes.iter().zip(&lin.dk) {
-                        if dk == 0.0 {
-                            continue;
-                        }
-                        let g = dk_factor(dk);
-                        match probe {
-                            crate::behavior::ProbeBinding::Voltage(p, m) => {
-                                if let Some(col) = node_index(*p) {
-                                    sys.stamp_add(row, col, g);
-                                }
-                                if let Some(col) = node_index(*m) {
-                                    sys.stamp_sub(row, col, g);
-                                }
-                            }
-                            crate::behavior::ProbeBinding::SourceCurrent(idx) => {
-                                sys.stamp_add(row, branch.src_branch(*idx), g);
-                            }
-                            crate::behavior::ProbeBinding::InductorCurrent(idx) => {
-                                sys.stamp_add(row, branch.ind_branch(*idx), g);
-                            }
-                            crate::behavior::ProbeBinding::Unresolved(_) => unreachable!(
-                                "probes are bound before stamping (resolve_behavioral)"
-                            ),
-                        }
-                    }
+                    stamp_probe_couplings(
+                        sys,
+                        row,
+                        1.0,
+                        &dk_factor,
+                        b.behavior.probes.iter().zip(&lin.dk),
+                    );
                 }
                 if let Some(row) = node_index(b.out_n) {
-                    for (probe, &dk) in b.behavior.probes.iter().zip(&lin.dk) {
-                        if dk == 0.0 {
-                            continue;
-                        }
-                        let g = dk_factor(dk);
-                        match probe {
-                            crate::behavior::ProbeBinding::Voltage(p, m) => {
-                                if let Some(col) = node_index(*p) {
-                                    sys.stamp_sub(row, col, g);
-                                }
-                                if let Some(col) = node_index(*m) {
-                                    sys.stamp_add(row, col, g);
-                                }
-                            }
-                            crate::behavior::ProbeBinding::SourceCurrent(idx) => {
-                                sys.stamp_sub(row, branch.src_branch(*idx), g);
-                            }
-                            crate::behavior::ProbeBinding::InductorCurrent(idx) => {
-                                sys.stamp_sub(row, branch.ind_branch(*idx), g);
-                            }
-                            crate::behavior::ProbeBinding::Unresolved(_) => unreachable!(
-                                "probes are bound before stamping (resolve_behavioral)"
-                            ),
-                        }
-                    }
+                    stamp_probe_couplings(
+                        sys,
+                        row,
+                        -1.0,
+                        &dk_factor,
+                        b.behavior.probes.iter().zip(&lin.dk),
+                    );
                 }
                 if with_companion {
                     stamp_current_source(sys, b.out_p, b.out_n, T::lift(constant));

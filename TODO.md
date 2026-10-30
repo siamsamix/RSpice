@@ -271,8 +271,11 @@ below is written against that state.
 
 ## 6. Waveform viewer & plotting
 
-- [ ] **[P1] (LT/PS)** Cursor infrastructure: crosshair cursors with readouts and measured deltas
-  (LTspice dual cursors; PSpice cursor measurements).
+- [x] **[P1] (LT/PS)** Cursor infrastructure: crosshair cursors with readouts and measured deltas
+  (LTspice dual cursors; PSpice cursor measurements). *(done: core `svg_document_with_cursors` +
+  CLI `--cursor` (repeatable, SPICE-suffixed, max 2/pane, snaps to first kept trace, coordinate/
+  delta readouts, `f = 1/Δt` on time axes); interactive dragging/ruler-to-cursor wiring is the
+  later §7 GUI item)*
 - [ ] **[P1] (LT)** Waveform arithmetic: add arbitrary expression traces (`V(out)*I(V1)` power, scaled,
   offset, combined) — the viewer plots only raw `V(n)`, `I(el)`, `V(a)-V(b)` today.
 - [x] **[P1] (both)** FFT of transient traces with configurable windowing (LTspice Blackman-Harris et

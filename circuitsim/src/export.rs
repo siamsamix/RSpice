@@ -147,9 +147,19 @@ const TRACE_COLORS: [&str; 8] = [
 /// columns always stay). Complex columns draw their magnitude — the
 /// mag/phase pairing is CSV material; the measurements stay tabular there
 /// too and are not drawn. Axes are linear, the y scale anchored at zero,
-/// both padded 5%; anything fancier (log axes, cursors) is per-plot work
-/// with its own TODO entries.
+/// both padded 5%; anything fancier (log axes) is per-plot work with its
+/// own TODO entries.
 pub fn svg_document(raw: &RawFile, traces: &[String]) -> String {
+    svg_document_with_cursors(raw, traces, &[])
+}
+
+/// [`svg_document`] with attached cursors: each request within a panel's
+/// x span (up to two, like LTspice) snaps to the nearest finite sample of
+/// the panel's first kept trace and draws as a crosshair with a dot on
+/// that trace plus a coordinate readout, and two accepted cursors also
+/// read out their deltas (a time Δ additionally as the frequency 1/Δt).
+/// Quiet on cursorless, traceless, and off-range requests.
+pub fn svg_document_with_cursors(raw: &RawFile, traces: &[String], cursors: &[f64]) -> String {
     let panels = raw.datasets.len() as u32;
     let height = panels * PANEL_H + panels.saturating_sub(1) * PANEL_GAP;
     let mut out = String::new();
@@ -162,7 +172,7 @@ pub fn svg_document(raw: &RawFile, traces: &[String]) -> String {
         }
         let top = i as u32 * (PANEL_H + PANEL_GAP);
         let keep = selected_variables(ds, traces);
-        svg_panel(&mut out, ds, top, &keep, is_complex(ds));
+        svg_panel(&mut out, ds, top, &keep, is_complex(ds), cursors);
     }
     out.push_str("</svg>\n");
     out
@@ -172,8 +182,16 @@ pub fn svg_document(raw: &RawFile, traces: &[String]) -> String {
 /// the legend chips, a rectangular frame, gray gridlines, and one polyline
 /// per selected trace. Single-row plots (`.op`, `.tf`, `.noise` synthetic
 /// axes) draw their sample as a small circle, since a one-point polyline
-/// would render nothing.
-fn svg_panel(out: &mut String, ds: &RawDataset, top: u32, keep: &[usize], complex: bool) {
+/// would render nothing. Attached cursors in-range snap to the first kept
+/// trace and crosshair it.
+fn svg_panel(
+    out: &mut String,
+    ds: &RawDataset,
+    top: u32,
+    keep: &[usize],
+    complex: bool,
+    cursors: &[f64],
+) {
     out.push_str(&format!("<g transform=\"translate(0,{top})\">\n"));
     out.push_str(&format!(
         "<text x=\"{MARGIN_L}\" y=\"20\" font-size=\"13\">{}</text>\n",
@@ -307,7 +325,87 @@ fn svg_panel(out: &mut String, ds: &RawDataset, top: u32, keep: &[usize], comple
             ));
         }
     }
+
+    // Attached cursors (LTspice): up to two requests inside the padded x
+    // span snap to the nearest finite sample of the first kept trace and
+    // crosshair it in magenta with a dot at the snapped point; the
+    // readouts list each cursor's coordinates, and with two accepted
+    // cursors also the deltas (a time Δ additionally as 1/Δt in Hz).
+    if keep.len() > 1 && !cursors.is_empty() {
+        let first = keep[1];
+        let first_pairs: Vec<(f64, f64)> = axis
+            .iter()
+            .zip(ds.values.iter())
+            .filter_map(|(x, row)| {
+                let cell = row[first];
+                let y = if complex { cell.norm() } else { cell.re };
+                (x.is_finite() && y.is_finite()).then_some((*x, y))
+            })
+            .collect();
+        if !first_pairs.is_empty() {
+            let snaps: Vec<(f64, f64)> = cursors
+                .iter()
+                .filter(|x| (min_x..=max_x).contains(x))
+                .filter_map(|&x| nearest_sample(&first_pairs, x))
+                .take(2)
+                .collect();
+            for (sx, sy) in &snaps {
+                let (cx, cy) = (x_at(*sx), y_at(*sy));
+                out.push_str(&format!(
+                    "<line x1=\"{cx:.2}\" y1=\"{MARGIN_T}\" x2=\"{cx:.2}\" y2=\"{bottom:.2}\" stroke=\"#aa00aa\"/>\n"
+                ));
+                out.push_str(&format!(
+                    "<circle cx=\"{cx:.2}\" cy=\"{cy:.2}\" r=\"3\" fill=\"#aa00aa\"/>\n"
+                ));
+            }
+            let axis_name = &ds.variables[0].name;
+            let trace_name = &ds.variables[first].name;
+            let mut ry = MARGIN_T as f64 + 16.0;
+            for (n, (sx, sy)) in snaps.iter().enumerate() {
+                out.push_str(&format!(
+                    "<text x=\"{:.2}\" y=\"{ry:.2}\" font-size=\"11\" fill=\"#aa00aa\">{}: {}={}, {}={}</text>\n",
+                    left + 8.0,
+                    n + 1,
+                    xml_escape(axis_name),
+                    tick_label(*sx),
+                    xml_escape(trace_name),
+                    tick_label(*sy)
+                ));
+                ry += 14.0;
+            }
+            if let [sa, sb] = snaps[..] {
+                let (dx, dy) = (sb.0 - sa.0, sb.1 - sa.1);
+                out.push_str(&format!(
+                    "<text x=\"{:.2}\" y=\"{ry:.2}\" font-size=\"11\" fill=\"#aa00aa\">Δ{}={}, Δ{}={}</text>\n",
+                    left + 8.0,
+                    xml_escape(axis_name),
+                    tick_label(dx),
+                    xml_escape(trace_name),
+                    tick_label(dy)
+                ));
+                ry += 14.0;
+                if axis_name.eq_ignore_ascii_case("time") && dx != 0.0 {
+                    out.push_str(&format!(
+                        "<text x=\"{:.2}\" y=\"{ry:.2}\" font-size=\"11\" fill=\"#aa00aa\">f = 1/Δ{} = {}</text>\n",
+                        left + 8.0,
+                        xml_escape(axis_name),
+                        tick_label((1.0 / dx).abs())
+                    ));
+                }
+            }
+        }
+    }
     out.push_str("</g>\n");
+}
+
+/// The nearest finite `(axis, value)` pair to `x` by axis distance: the
+/// snap point an attached cursor rides on.
+fn nearest_sample(pairs: &[(f64, f64)], x: f64) -> Option<(f64, f64)> {
+    pairs.iter().copied().min_by(|(a, _), (b, _)| {
+        let da = (a - x).abs();
+        let db = (b - x).abs();
+        da.total_cmp(&db)
+    })
 }
 
 /// A terse tick spelling: plain decimals where they read well, two-digit
@@ -340,7 +438,7 @@ mod tests {
     use super::*;
 
     use crate::netlist::parse;
-    use crate::rawwave::build;
+    use crate::rawwave::{build, RawVariable};
     use crate::runs::run;
     use approx::assert_relative_eq;
 
@@ -577,5 +675,117 @@ R2 out 0 3k
     fn svg_text_is_xml_escaped() {
         assert_eq!(xml_escape("a&b<c>d"), "a&amp;b&lt;c&gt;d");
         assert_eq!(xml_escape("plain"), "plain");
+    }
+
+    /// A tiny real transient plot: time 0..3 s with V(out) at 1, 2, 5, 10
+    /// — enough structure for cursor snaps and delta readouts.
+    fn ramp_raw() -> RawFile {
+        let variable = |name: &str| RawVariable {
+            name: name.to_owned(),
+            kind: String::new(),
+        };
+        let row = |(t, v)| vec![Complex64::new(t, 0.0), Complex64::new(v, 0.0)];
+        RawFile {
+            datasets: vec![RawDataset {
+                title: "test".to_owned(),
+                plotname: "Transient Analysis".to_owned(),
+                flags: vec!["real".to_owned()],
+                variables: vec![variable("time"), variable("V(out)")],
+                values: vec![
+                    row((0.0, 1.0)),
+                    row((1.0, 2.0)),
+                    row((2.0, 5.0)),
+                    row((3.0, 10.0)),
+                ],
+                steps: Vec::new(),
+            }],
+        }
+    }
+
+    /// A tiny complex (AC) plot: freq 1k/2k against complex V(out).
+    fn complex_raw() -> RawFile {
+        let variable = |name: &str| RawVariable {
+            name: name.to_owned(),
+            kind: String::new(),
+        };
+        RawFile {
+            datasets: vec![RawDataset {
+                title: "test".to_owned(),
+                plotname: "AC Analysis".to_owned(),
+                flags: vec![
+                    "real".to_owned(),
+                    "forward".to_owned(),
+                    "complex".to_owned(),
+                ],
+                variables: vec![variable("freq"), variable("V(out)")],
+                values: vec![
+                    vec![Complex64::new(1000.0, 0.0), Complex64::new(3.0, 4.0)],
+                    vec![Complex64::new(2000.0, 0.0), Complex64::new(0.0, 6.0)],
+                ],
+                steps: Vec::new(),
+            }],
+        }
+    }
+
+    /// A single in-range cursor snaps to the nearest sample of the first
+    /// kept trace, crosshairs it, and reads out the snapped coordinates.
+    #[test]
+    fn cursor_snaps_and_reads_out_coordinates() {
+        let doc = svg_document_with_cursors(&ramp_raw(), &tr(&["V(out)"]), &[0.6]);
+        assert_eq!(doc.matches("stroke=\"#aa00aa\"").count(), 1, "{doc}");
+        assert_eq!(doc.matches("r=\"3\" fill=\"#aa00aa\"").count(), 1, "{doc}");
+        assert!(doc.contains(">1: time=1, V(out)=2</text>"), "{doc}");
+    }
+
+    /// Two cursors read out their deltas; on a time axis the Δt also
+    /// reads out as the frequency 1/Δt.
+    #[test]
+    fn two_cursors_read_out_deltas_and_frequency() {
+        let doc = svg_document_with_cursors(&ramp_raw(), &tr(&["V(out)"]), &[0.6, 2.4]);
+        assert!(doc.contains(">1: time=1, V(out)=2</text>"), "{doc}");
+        assert!(doc.contains(">2: time=2, V(out)=5</text>"), "{doc}");
+        assert!(doc.contains(">Δtime=1, ΔV(out)=3</text>"), "{doc}");
+        assert!(doc.contains(">f = 1/Δtime = 1</text>"), "{doc}");
+    }
+
+    /// Three requests still crosshair two per panel (LTspice's limit),
+    /// snapped in input order, with the two-cursor delta readout intact.
+    #[test]
+    fn cursors_cap_at_two_per_panel() {
+        let doc = svg_document_with_cursors(&ramp_raw(), &[], &[0.6, 2.4, 2.9]);
+        assert_eq!(doc.matches("r=\"3\" fill=\"#aa00aa\"").count(), 2, "{doc}");
+        assert!(doc.contains(">Δtime=1, ΔV(out)=3</text>"), "{doc}");
+    }
+
+    /// Requests outside the x span, cursorless calls, and a panel with no
+    /// kept trace all stay silent: no crosshair color appears.
+    #[test]
+    fn off_range_and_traceless_calls_stay_silent() {
+        let raw = ramp_raw();
+        assert!(!svg_document_with_cursors(&raw, &[], &[10.0]).contains("#aa00aa"));
+        assert!(!svg_document_with_cursors(&raw, &tr(&["I(V1)"]), &[0.6]).contains("#aa00aa"));
+        assert!(!svg_document_with_cursors(&raw, &[], &[0.6, 10.0]).contains('Δ'));
+    }
+
+    /// An empty cursor list is exactly the plain [`svg_document`].
+    #[test]
+    fn empty_cursors_equal_the_plain_document() {
+        let raw = ramp_raw();
+        assert_eq!(
+            svg_document(&raw, &[]),
+            svg_document_with_cursors(&raw, &[], &[])
+        );
+    }
+
+    /// Complex panels snap like real ones and read out the magnitude the
+    /// polyline drew; a non-time axis carries no 1/Δt line even with two
+    /// cursors.
+    #[test]
+    fn complex_panel_cursor_reads_the_magnitude() {
+        let doc = svg_document_with_cursors(&complex_raw(), &tr(&["V(out)"]), &[1200.0, 1800.0]);
+        assert!(doc.contains(">1: freq=1000, V(out)=5</text>"), "{doc}");
+        assert!(doc.contains(">2: freq=2000, V(out)=6</text>"), "{doc}");
+        assert!(doc.contains(">Δfreq=1000, ΔV(out)=1</text>"), "{doc}");
+        assert!(!doc.contains("f = 1/Δ"), "{doc}");
     }
 }

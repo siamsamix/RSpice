@@ -94,6 +94,15 @@ struct Args {
     #[arg(long, value_name = "TRACES")]
     traces: Option<String>,
 
+    /// Attach a crosshair cursor per --image panel (up to two per panel,
+    /// like LTspice): requests within the x span snap to the nearest
+    /// sample of the panel's first kept trace and read out the snapped
+    /// coordinates, two cursors also read out their deltas, and a time
+    /// delta additionally reads out as the frequency 1/Δt; SPICE suffix
+    /// scales parse (`1.2us`, `4.7Meg`)
+    #[arg(long, requires = "image", value_name = "X")]
+    cursor: Vec<String>,
+
     /// Render the FFT spectrum of every matched transient trace as an SVG
     /// image to this file (one panel per trace, drawn top to bottom)
     #[arg(long)]
@@ -202,6 +211,15 @@ fn run_cli() -> Result<(), CliError> {
         }
     }
 
+    // The cursor requests ride as SPICE-scaled initials; the clap
+    // `requires` already pinned --image when any was asked.
+    let mut cursor_xs = Vec::new();
+    for token in &args.cursor {
+        let value = circuitsim::units::parse_value(token)
+            .map_err(|e| SimError::Parse(format!("--cursor {token}: {e}")))?;
+        cursor_xs.push(value);
+    }
+
     let result = run(&netlist)?;
 
     let mut report = String::new();
@@ -251,7 +269,11 @@ fn run_cli() -> Result<(), CliError> {
     if let Some(path) = &args.image {
         let title = format!("* {}", args.netlist.display());
         let raw = circuitsim::rawwave::build(&title, &netlist, &result);
-        let svg = circuitsim::export::svg_document(&raw, &trace_specs(args.traces.as_deref()));
+        let svg = circuitsim::export::svg_document_with_cursors(
+            &raw,
+            &trace_specs(args.traces.as_deref()),
+            &cursor_xs,
+        );
         fs::write(path, svg)?;
     }
 

@@ -16,7 +16,8 @@
 //! also understands the all-double real layout ngspice-family writers emit,
 //! taken when the byte count rules the mixed one out (when both divisibilities
 //! hold the mixed reading wins, matching LTspice). The writer follows the
-//! reference layout throughout. `.tf`/`.noise` plots are TODO §6 work.
+//! reference layout throughout; `.tf` and `.noise` plot names and trace
+//! spellings are taken byte-exactly from the reference binary.
 //!
 //! Two writer choices are RSpice interpretations because no public reader
 //! pins them: step values travel as extra constant variables named after
@@ -26,7 +27,9 @@
 //! layout. Bit-for-bit LTspice parity is not the goal — reading its files and
 //! writing files its readers accept is.
 
-use crate::analysis::{AcResult, DcResult, DcSweepResult, SimulationResult, TranResult};
+use crate::analysis::{
+    AcResult, DcResult, DcSweepResult, NoiseResult, SimulationResult, TfResult, TranResult,
+};
 use crate::circuit::{Circuit, CURRENT_FAMILIES};
 use crate::error::{Result, SimError};
 use crate::mna::BranchCurrents;
@@ -125,6 +128,8 @@ pub fn build(title: &str, netlist: &Netlist, result: &SimulationResult) -> RawFi
                     dc_sweep: run.dc_sweep.as_ref(),
                     tran: run.tran.as_ref(),
                     ac: run.ac.as_ref(),
+                    tf: run.tf.as_ref(),
+                    noise: run.noise.as_ref(),
                 },
             )
         })
@@ -137,6 +142,8 @@ pub fn build(title: &str, netlist: &Netlist, result: &SimulationResult) -> RawFi
                 dc_sweep: result.dc_sweep.as_ref(),
                 tran: result.tran.as_ref(),
                 ac: result.ac.as_ref(),
+                tf: result.tf.as_ref(),
+                noise: result.noise.as_ref(),
             },
         ));
     }
@@ -154,6 +161,12 @@ pub fn build(title: &str, netlist: &Netlist, result: &SimulationResult) -> RawFi
         if let Some(ac) = view.ac {
             datasets.push(ac_dataset(title, net, ac, ac_log, step_values));
         }
+        if let Some(tf) = view.tf {
+            datasets.push(tf_dataset(title, tf, step_values));
+        }
+        if let Some(noise) = view.noise {
+            datasets.push(noise_dataset(title, net, noise, step_values));
+        }
     }
     RawFile { datasets }
 }
@@ -165,6 +178,8 @@ struct View<'a> {
     dc_sweep: Option<&'a DcSweepResult>,
     tran: Option<&'a TranResult>,
     ac: Option<&'a AcResult>,
+    tf: Option<&'a TfResult>,
+    noise: Option<&'a NoiseResult>,
 }
 
 /// Serialise a raw file in the given flavor, ready for `fs::write`.
@@ -412,6 +427,109 @@ fn ac_dataset(
     }
     flags.push(if ac_log { "log" } else { "linear" });
     dataset_from(title, "AC Analysis", &flags, variables, rows, step_values)
+}
+
+/// LTspice's canned `.noise` plot name, taken byte-exactly from the
+/// reference binary: the densities ride V/√Hz (voltages) or A/√Hz
+/// (currents), spelled with the superscript half.
+const NOISE_PLOTNAME: &str = "Noise Spectral Density - (V/Hz\u{00bd} or A/Hz\u{00bd})";
+
+/// A `.tf` result: one real row over the synthetic `freq = 0` axis, tracing
+/// the deck-spelled output operand plus the driving-point impedance and the
+/// output impedance spelled like the reference (`input_impedance`,
+/// `output_impedance_at_<source>`).
+fn tf_dataset(title: &str, tf: &TfResult, step_values: &[(String, f64)]) -> RawDataset {
+    let mut variables = vec![RawVariable {
+        name: "freq".into(),
+        kind: "frequency".into(),
+    }];
+    let output_kind = if tf.output.starts_with('V') {
+        "voltage"
+    } else {
+        "device_current"
+    };
+    variables.push(RawVariable {
+        name: tf.output.clone(),
+        kind: output_kind.into(),
+    });
+    variables.push(RawVariable {
+        name: "input_impedance".into(),
+        kind: "impedance".into(),
+    });
+    variables.push(RawVariable {
+        name: format!("output_impedance_at_{}", tf.input),
+        kind: "impedance".into(),
+    });
+    let row = vec![
+        Complex64::new(0.0, 0.0),
+        Complex64::new(tf.transfer, 0.0),
+        Complex64::new(tf.input_impedance, 0.0),
+        Complex64::new(tf.output_impedance, 0.0),
+    ];
+    dataset_from(
+        title,
+        "Transfer Function",
+        &["real"],
+        variables,
+        vec![row],
+        step_values,
+    )
+}
+
+/// A `.noise` run: real densities over `freq` with the reference plot name
+/// and trace spellings — `V(onoise)` at the output, and the input-referred
+/// density as `V(inoise)` for a voltage-source input, `i(inoise)` for a
+/// current one. The current-input branch only shapes the spelling for a
+/// future engine that accepts it; the analysis stage rejects `.noise` with
+/// a current-source input today, so `V(inoise)` is what appears.
+fn noise_dataset(
+    title: &str,
+    net: &Circuit,
+    noise: &NoiseResult,
+    step_values: &[(String, f64)],
+) -> RawDataset {
+    let voltage_input = net
+        .voltage_sources
+        .iter()
+        .any(|source| source.name == noise.input);
+    let input_name = if voltage_input {
+        "V(inoise)"
+    } else {
+        "i(inoise)"
+    };
+    let input_kind = if voltage_input {
+        "voltage"
+    } else {
+        "device_current"
+    };
+    let mut variables = vec![RawVariable {
+        name: "freq".into(),
+        kind: "frequency".into(),
+    }];
+    variables.push(RawVariable {
+        name: "V(onoise)".into(),
+        kind: "voltage".into(),
+    });
+    variables.push(RawVariable {
+        name: input_name.into(),
+        kind: input_kind.into(),
+    });
+    let rows = noise
+        .points
+        .iter()
+        .map(|point| {
+            vec![
+                Complex64::new(point.freq, 0.0),
+                Complex64::new(point.output_density, 0.0),
+                Complex64::new(point.input_density, 0.0),
+            ]
+        })
+        .collect();
+    let mut flags = vec!["real"];
+    if noise.points.len() > 1 {
+        flags.push("forward");
+    }
+    dataset_from(title, NOISE_PLOTNAME, &flags, variables, rows, step_values)
 }
 
 /// Real voltages/sweep values into the row.
@@ -1042,6 +1160,72 @@ mod tests {
         assert_eq!(a, b, "complex values must round-trip bit-exact");
         // The frequency axis is real-valued in the complex encoding.
         assert_eq!(back.axis(), ds.axis());
+    }
+
+    /// The `.tf` plot: one real `freq = 0` point carrying the deck-spelled
+    /// transfer plus the two LTspice-named impedance columns, and the
+    /// current-operand flavor rides a per-verb trace kind with the NaN
+    /// output impedance preserved.
+    #[test]
+    fn tf_plot_shapes() {
+        let raw = sim("V1 in 0 5\nR1 in a 1k\nR2 a 0 2k\n.tf V(a) V1\n.end\n");
+        let ds = raw.datasets.last().unwrap();
+        assert_eq!(ds.plotname, "Transfer Function");
+        assert_eq!(ds.flags, ["real"]);
+        assert_eq!(ds.variables[0].name, "freq");
+        assert_eq!(ds.variables[0].kind, "frequency");
+        assert_eq!(ds.variables[1].name, "V(a)");
+        assert_eq!(ds.variables[1].kind, "voltage");
+        assert_eq!(ds.variables[2].name, "input_impedance");
+        assert_eq!(ds.variables[3].name, "output_impedance_at_V1");
+        assert_eq!(ds.axis().len(), 1);
+        let axis = ds.axis();
+        assert_relative_eq!(axis[0], 0.0);
+
+        let bytes = to_bytes(&raw, RawFlavor::Binary);
+        let back = read(&bytes).unwrap().datasets.pop().unwrap();
+        assert_eq!(back.plotname, "Transfer Function");
+        let transfer = back.trace("V(a)").unwrap()[0].re;
+        // The 1k/2k divider: 0.5/5 V per volt out of 3 kΩ driving point.
+        assert_relative_eq!(transfer, 2.0 / 3.0, epsilon = 1e-6);
+        let rin = back.trace("input_impedance").unwrap()[0].re;
+        assert_relative_eq!(rin, 3000.0, epsilon = 1e-3);
+        let rout = back.trace("output_impedance_at_V1").unwrap()[0].re;
+        // With the input source zeroed the divider is R1 || R2 seen at `a`.
+        assert_relative_eq!(rout, 2000.0 / 3.0, epsilon = 1e-3);
+    }
+
+    /// The `.noise` plot carries the binary's byte-exact plot name and the
+    /// `V(onoise)`/`V(inoise)` spelling for a voltage input, while a
+    /// current-source input rides the lowercase `i(inoise)` trace.
+    #[test]
+    fn noise_plot_names_and_traces() {
+        let raw =
+            sim("V1 in 0 5\nR1 in out 1k\nR2 out 0 2k\n.noise V(out) V1 dec 2 1k 100k\n.end\n");
+        let ds = raw.datasets.last().unwrap();
+        assert_eq!(
+            ds.plotname,
+            "Noise Spectral Density - (V/Hz\u{00bd} or A/Hz\u{00bd})"
+        );
+        assert_eq!(ds.flags, ["real", "forward"]);
+        assert_eq!(ds.variables[0].name, "freq");
+        assert_eq!(ds.variables[1].name, "V(onoise)");
+        assert_eq!(ds.variables[2].name, "V(inoise)");
+        assert_eq!(ds.variables[1].kind, "voltage");
+        assert_eq!(ds.variables[2].kind, "voltage");
+        let ono = ds.trace("V(onoise)").unwrap();
+        // dec 2 over 1k→100k: 1k, √10·1k, 10k, √10·10k, 100k.
+        assert_eq!(ono.len(), 5);
+        // Thermal noise of the divider: strictly positive density.
+        assert!(ono.iter().all(|v| v.re > 0.0), "density lost: {ono:?}");
+
+        // The utf-8 ascii flavor carries the ½ plot name through too.
+        let asc = read(&to_bytes(&raw, RawFlavor::Ascii))
+            .unwrap()
+            .datasets
+            .pop()
+            .unwrap();
+        assert_eq!(asc.plotname, ds.plotname);
     }
 
     /// Plotname spellings and flag sets for the single-point analyses.

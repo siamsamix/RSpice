@@ -298,10 +298,14 @@ below is written against that state.
   `FastAccess` column-major payloads, and tolerates a truncated tail down to whole rows.
   Traces: every net as `V(net)` in id order (ground-less decks' node 0 rides like any other
   net), then one current trace per element family in the report probe order
-  (`I(R1)`/`Ic(Q1)`/`I(T1)`). CLI: `--raw <file>` (binary default) with `--raw-ascii`, plus
-  `--read-raw` to dump any file's plots. `.tf`/`.noise` plots and the PSpice `.dat` format
-  stay open.)*
-  including step-run metadata.
+  (`I(R1)`/`Ic(Q1)`/`I(T1)`), plus the `.tf`/`.noise` plots with byte-exact reference
+  spellings: `Transfer Function` over a synthetic `freq = 0` row tracing the deck-spelled
+  output plus `input_impedance`/`output_impedance_at_<src>`, and the noise plot
+  `Noise Spectral Density - (V/Hz½ or A/Hz½)` with `V(onoise)` and the input-referred
+  `V(inoise)` — the `i(inoise)` spelling for a current-source input is wired, but the
+  analysis stage rejects a current `.noise` input today. CLI: `--raw <file>` (binary
+  default) with `--raw-ascii`, plus `--read-raw` to dump any file's plots; the PSpice
+  `.dat` format stays open.)*
 - [ ] **[P1] (spot)** Full export surface: CSV of arbitrary traces (node voltages, element currents,
   measurements — today only `.tran` node voltages are exportable), image export.
 - [ ] **[P2] (both)** Waveform data compression/decimation options (`.options plotwinsize` in LTspice,

@@ -15,13 +15,14 @@ pub mod model;
 pub mod netlist;
 pub mod params;
 pub mod rawwave;
+pub mod runs;
 pub mod sparse;
 pub mod units;
 
 pub use behavior::{Behavior, BehavioralRuntime, BExpr, MathFn, NoiseKind, ProbeBinding, ProbeSpec};
 
-pub use analysis::{AcResult, run, DcResult, DcSweepPoint, DcSweepResult, FourOutput, FourResult,
-                   Harmonic, MeasureResult, NoisePoint, NoiseResult, OpPoint, SimulationResult, StepRun,
+pub use analysis::{AcResult, DcResult, DcSweepPoint, DcSweepResult, FourOutput, FourResult,
+                   Harmonic, MeasureResult, NoisePoint, NoiseResult, OpPoint, SimulationResult,
                    TfResult, TranPoint, TranResult};
 pub use netlist::{AcCommand, AcScale, DcCommand, DcSweepSpec, DcSweepValues, MeasAnalysis,
                   FourCommand, NoiseCommand, MeasEdge, MeasFunc, MeasKind, Measurement, NodesetEntry,
@@ -34,6 +35,7 @@ pub use circuit::{AbmForm, AbmMeasure, BehavioralKind, BehavioralSource, Circuit
 pub use error::{Result, SimError};
 pub use netlist::{Netlist, parse_with_overrides};
 pub use rawwave::{RawDataset, RawFile, RawFlavor, RawVariable};
+pub use runs::{run, StepRun};
 
 /// Parse a netlist string and run all requested analyses.
 ///
@@ -41,5 +43,5 @@ pub use rawwave::{RawDataset, RawFile, RawFlavor, RawVariable};
 /// point, so the source text travels with the parsed netlist.
 pub fn simulate(source: &str) -> Result<SimulationResult> {
     let netlist = parse(source)?;
-    analysis::run(&netlist)
+    runs::run(&netlist)
 }

@@ -962,8 +962,8 @@ fn parse_ascii_value(text: &str, complex: bool) -> Result<Complex64> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis::run;
     use crate::netlist::parse;
+    use crate::runs::run;
     use approx::assert_relative_eq;
 
     fn sim(deck: &str) -> RawFile {

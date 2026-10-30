@@ -486,8 +486,8 @@ fn hist_of(samples: &[f64], name: String, bins: usize) -> McHistogram {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::analysis::StepRun;
     use crate::circuit::NodeId;
+    use crate::runs::StepRun;
 
     fn diode_deck(seed: u64, lot: Option<(f64, bool)>, dev: Option<(f64, bool)>) -> Circuit {
         let mut circuit = Circuit::new("mc");

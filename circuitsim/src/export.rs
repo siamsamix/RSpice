@@ -8,6 +8,9 @@
 //! `<name>_phase` degrees) like the AC-\[`--waves`\] CSV did; the axis
 //! column prints its real part. Numeric cells spill `{:.9e}`; text cells
 //! (measurement names and errors) take RFC 4180 quoting.
+//!
+//! The SVG surface draws the same plots as one panel per `.raw` plot,
+//! stacked in file order, so one builder also feeds the image exporter.
 
 use crate::analysis::MeasureResult;
 use crate::rawwave::{RawDataset, RawFile};
@@ -125,6 +128,213 @@ fn csv_cell(text: &str) -> String {
     }
 }
 
+const PANEL_W: u32 = 760;
+const PANEL_H: u32 = 420;
+const MARGIN_L: u32 = 78;
+const MARGIN_R: u32 = 18;
+const MARGIN_T: u32 = 34;
+const MARGIN_B: u32 = 46;
+const PANEL_GAP: u32 = 26;
+const DIVISIONS: u32 = 5;
+
+const TRACE_COLORS: [&str; 8] = [
+    "#008000", "#0000d0", "#d00000", "#0090d0", "#d000d0", "#808000", "#206060", "#000000",
+];
+
+/// The SVG document for one built [`RawFile`]: one panel per `.raw` plot in
+/// file order, stacked vertically, driven by the same trace selection as
+/// [`csv_document`] (empty list = every column, the axis and the step
+/// columns always stay). Complex columns draw their magnitude — the
+/// mag/phase pairing is CSV material; the measurements stay tabular there
+/// too and are not drawn. Axes are linear, the y scale anchored at zero,
+/// both padded 5%; anything fancier (log axes, cursors) is per-plot work
+/// with its own TODO entries.
+pub fn svg_document(raw: &RawFile, traces: &[String]) -> String {
+    let panels = raw.datasets.len() as u32;
+    let height = panels * PANEL_H + panels.saturating_sub(1) * PANEL_GAP;
+    let mut out = String::new();
+    out.push_str(&format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{PANEL_W}\" height=\"{height}\" viewBox=\"0 0 {PANEL_W} {height}\" font-family=\"sans-serif\">\n"
+    ));
+    for (i, ds) in raw.datasets.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let top = i as u32 * (PANEL_H + PANEL_GAP);
+        let keep = selected_variables(ds, traces);
+        svg_panel(&mut out, ds, top, &keep, is_complex(ds));
+    }
+    out.push_str("</svg>\n");
+    out
+}
+
+/// One panel: a `<g>` translated to its stack slot, holding the plotname,
+/// the legend chips, a rectangular frame, gray gridlines, and one polyline
+/// per selected trace. Single-row plots (`.op`, `.tf`, `.noise` synthetic
+/// axes) draw their sample as a small circle, since a one-point polyline
+/// would render nothing.
+fn svg_panel(out: &mut String, ds: &RawDataset, top: u32, keep: &[usize], complex: bool) {
+    out.push_str(&format!("<g transform=\"translate(0,{top})\">\n"));
+    out.push_str(&format!(
+        "<text x=\"{MARGIN_L}\" y=\"20\" font-size=\"13\">{}</text>\n",
+        xml_escape(&ds.plotname)
+    ));
+    let pw = PANEL_W - MARGIN_L - MARGIN_R;
+    let ph = PANEL_H - MARGIN_T - MARGIN_B;
+    let plot_w = pw as f64;
+    let plot_h = ph as f64;
+    let left = MARGIN_L as f64;
+    let right = (MARGIN_L + pw) as f64;
+    let bottom = (MARGIN_T + ph) as f64;
+
+    // The y scale: zero anchors it, both ends pad 5% (flat data widens ±1
+    // first); the x scale spans the axis samples over at least [0, 1] so
+    // synthetic axes stay degenerate-safe.
+    let columns: Vec<Vec<f64>> = keep
+        .iter()
+        .skip(1)
+        .map(|&i| {
+            ds.values
+                .iter()
+                .filter_map(|row| {
+                    let cell = row[i];
+                    let value = if complex { cell.norm() } else { cell.re };
+                    if value.is_finite() {
+                        Some(value)
+                    } else {
+                        None
+                    }
+                })
+                .collect()
+        })
+        .collect();
+    let (min_y, max_y) = columns
+        .iter()
+        .flatten()
+        .copied()
+        .chain([0.0])
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
+            (lo.min(v), hi.max(v))
+        });
+    let (min_y, max_y) = if min_y == max_y {
+        (min_y - 1.0, max_y + 1.0)
+    } else {
+        let pad = 0.05 * (max_y - min_y);
+        (min_y - pad, max_y + pad)
+    };
+    let axis: Vec<f64> = ds.values.iter().map(|row| row[0].re).collect();
+    let (min_x, max_x) = axis
+        .iter()
+        .copied()
+        .filter(|x| x.is_finite())
+        .chain([0.0, 1.0])
+        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
+            (lo.min(v), hi.max(v))
+        });
+    let (min_x, max_x) = if min_x == max_x {
+        (min_x, max_x + 1.0)
+    } else {
+        let pad = 0.05 * (max_x - min_x);
+        (min_x - pad, max_x + pad)
+    };
+    let x_at = |value: f64| left + (value - min_x) / (max_x - min_x) * plot_w;
+    let y_at = |value: f64| bottom - (value - min_y) / (max_y - min_y) * plot_h;
+
+    for i in 1..DIVISIONS {
+        let x = left + i as f64 / DIVISIONS as f64 * plot_w;
+        let y = MARGIN_T as f64 + i as f64 / DIVISIONS as f64 * plot_h;
+        out.push_str(&format!(
+            "<line x1=\"{x:.2}\" y1=\"{}\" x2=\"{x:.2}\" y2=\"{bottom:.2}\" stroke=\"#999999\"/>\n",
+            MARGIN_T
+        ));
+        out.push_str(&format!(
+            "<line x1=\"{left:.2}\" y1=\"{y:.2}\" x2=\"{right:.2}\" y2=\"{y:.2}\" stroke=\"#999999\"/>\n"
+        ));
+    }
+    out.push_str(&format!(
+        "<rect x=\"{MARGIN_L}\" y=\"{MARGIN_T}\" width=\"{pw}\" height=\"{ph}\" fill=\"none\" stroke=\"#000000\"/>\n"
+    ));
+    for i in 0..=DIVISIONS {
+        let x = x_at(min_x + (max_x - min_x) * i as f64 / DIVISIONS as f64);
+        let y = bottom - i as f64 / DIVISIONS as f64 * plot_h;
+        out.push_str(&format!(
+            "<line x1=\"{x:.2}\" y1=\"{bottom:.2}\" x2=\"{x:.2}\" y2=\"{:.2}\"/>\n",
+            bottom + 4.0
+        ));
+        out.push_str(&format!(
+            "<text x=\"{x:.2}\" y=\"{:.2}\" text-anchor=\"middle\" font-size=\"11\">{}</text>\n",
+            bottom + 18.0,
+            tick_label(min_x + (max_x - min_x) * i as f64 / DIVISIONS as f64)
+        ));
+        out.push_str(&format!(
+            "<line x1=\"{:.2}\" y1=\"{y:.2}\" x2=\"{left:.2}\" y2=\"{y:.2}\"/>\n",
+            left - 4.0
+        ));
+        out.push_str(&format!(
+            "<text x=\"{:.2}\" y=\"{:.2}\" text-anchor=\"end\" font-size=\"11\">{}</text>\n",
+            left - 8.0,
+            y + 4.0,
+            tick_label(min_y + (max_y - min_y) * i as f64 / DIVISIONS as f64)
+        ));
+    }
+
+    for (slot, (&i, column)) in keep.iter().skip(1).zip(&columns).enumerate() {
+        let name = &ds.variables[i].name;
+        let color = TRACE_COLORS[slot % TRACE_COLORS.len()];
+        out.push_str(&format!(
+            "<text x=\"{right:.2}\" y=\"{}\" text-anchor=\"end\" fill=\"{color}\">{}</text>\n",
+            14.0 + 14.0 * slot as f64,
+            xml_escape(name)
+        ));
+        let pairs: Vec<(f64, f64)> = axis
+            .iter()
+            .zip(column)
+            .filter(|(x, y)| x.is_finite() && y.is_finite())
+            .map(|(x, y)| (x_at(*x), y_at(*y)))
+            .collect();
+        let points = pairs
+            .iter()
+            .map(|(px, py)| format!("{px:.2},{py:.2}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        out.push_str(&format!(
+            "<polyline points=\"{points}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"2\"/>\n"
+        ));
+        if pairs.len() == 1 {
+            out.push_str(&format!(
+                "<circle cx=\"{:.2}\" cy=\"{:.2}\" r=\"3\" fill=\"{color}\"/>\n",
+                pairs[0].0, pairs[0].1
+            ));
+        }
+    }
+    out.push_str("</g>\n");
+}
+
+/// A terse tick spelling: plain decimals where they read well, two-digit
+/// scientific beyond them (`1.00e-6`).
+fn tick_label(value: f64) -> String {
+    if value == 0.0 {
+        return "0".to_owned();
+    }
+    let magnitude = value.abs();
+    if !(1e-3..1e4).contains(&magnitude) {
+        return format!("{value:.2e}");
+    }
+    let spelled = format!("{value:.4}");
+    spelled
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_owned()
+}
+
+/// SVG text nodes escape the XML specials; the markup this module builds
+/// never interpolates text into an attribute value.
+fn xml_escape(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -156,6 +366,16 @@ R2 out 0 3k
 .meas tran vavg avg V(out)
 .end
 ";
+
+    const AC_DECK: &str = "V1 in 0 ac 1\nR1 in out 1k\nC1 out 0 1u\n\
+         .ac dec 2 1k 10k\n.end\n";
+
+    const STEPPED: &str = ".param r=1k\n\
+         V1 in 0 5\n\
+         R1 in out 1k\n\
+         R2 out 0 {r}\n\
+         .step param r 1k 2k 1k\n\
+         .op\n.end\n";
 
     /// The transient plot exports as one section, and the `.meas` table
     /// appends after a blank line. Numeric cells spill at full precision;
@@ -194,12 +414,6 @@ R2 out 0 3k
     /// the named waveforms were asked for; matches are case-insensitive.
     #[test]
     fn trace_filter_keeps_axis_and_step_columns() {
-        const STEPPED: &str = ".param r=1k\n\
-             V1 in 0 5\n\
-             R1 in out 1k\n\
-             R2 out 0 {r}\n\
-             .step param r 1k 2k 1k\n\
-             .op\n.end\n";
         let (raw, measurements) = sim(STEPPED);
         let doc = csv_document(&raw, &measurements, &tr(&["v(out)", "I(R1)"]));
         assert_eq!(doc.matches("# Operating Point").count(), 2);
@@ -238,8 +452,6 @@ R2 out 0 3k
     /// axis column keeps printing its real part.
     #[test]
     fn ac_complex_traces_pair_mag_and_phase() {
-        const AC_DECK: &str = "V1 in 0 ac 1\nR1 in out 1k\nC1 out 0 1u\n\
-             .ac dec 2 1k 10k\n.end\n";
         let (raw, measurements) = sim(AC_DECK);
         let doc = csv_document(&raw, &measurements, &tr(&["V(out)"]));
         let rows: Vec<&str> = doc.lines().filter(|l| !l.is_empty()).collect();
@@ -293,5 +505,77 @@ R2 out 0 3k
         assert_eq!(lines.next(), Some("\"a,b\"\"c\",3.141592654e0,"));
         assert_eq!(lines.next(), Some("say,,\"no \"\"cross\"\" yet\""));
         assert_eq!(lines.next(), None);
+    }
+
+    /// One panel per plot: the head names the canvas, the panel names the
+    /// plot, and every selected column draws a polyline; the flat ground
+    /// trace is horizontal while the measurements stay CSV material.
+    #[test]
+    fn svg_document_renders_panels_per_plot() {
+        let (raw, _) = sim(TRAN_DECK);
+        let doc = svg_document(&raw, &[]);
+        assert!(
+            doc.starts_with("<svg xmlns=\"http://www.w3.org/2000/svg\""),
+            "opening tag: {doc}"
+        );
+        assert!(doc.ends_with("</svg>\n"));
+        assert!(doc.contains(r#"width="760" height="420""#));
+        assert_eq!(doc.matches("<polyline").count(), 6);
+        assert!(doc.contains(">Transient Analysis</text>"));
+        assert!(doc.contains(">V(in)</text>"));
+        let first = doc.split_once("<polyline points=\"").expect("polyline").1;
+        let points = &first[..first.find('"').expect("points attribute length")];
+        let ys: std::collections::HashSet<&str> = points
+            .split(' ')
+            .map(|pair| pair.split_once(',').expect("x,y pair").1)
+            .collect();
+        assert_eq!(ys.len(), 1, "flat ground is horizontal: {points}");
+        assert!(!doc.contains("vmax"));
+    }
+
+    /// Stepped runs stack one panel per run; the stack height adds the gap,
+    /// the second panel rides at the correct offset, and the step column
+    /// rides along in the legend.
+    #[test]
+    fn svg_document_stacks_stepped_panels() {
+        let (raw, _) = sim(STEPPED);
+        let doc = svg_document(&raw, &tr(&["V(out)"]));
+        assert!(doc.contains(r#"width="760" height="866""#));
+        assert_eq!(doc.matches("translate(0,").count(), 2);
+        assert!(doc.contains("translate(0,446)"));
+        assert_eq!(doc.matches("<polyline").count(), 4);
+        assert_eq!(doc.matches("<circle").count(), 4, "one-point traces");
+        assert!(doc.contains(">V(out)</text>"));
+        assert!(doc.contains(">r</text>"));
+    }
+
+    /// Complex (AC) panels draw magnitudes only, labeled by the bare column
+    /// name — the mag/phase pairing is CSV material.
+    #[test]
+    fn svg_complex_columns_draw_magnitude() {
+        let (raw, _) = sim(AC_DECK);
+        let doc = svg_document(&raw, &tr(&["V(out)"]));
+        assert_eq!(doc.matches("<polyline").count(), 1);
+        assert!(doc.contains(">V(out)</text>"));
+        assert!(!doc.contains("_mag"));
+    }
+
+    /// The tick spelling keeps plain decimals terse and goes two-digit
+    /// scientific beyond the readable band.
+    #[test]
+    fn tick_labels_are_terse() {
+        assert_eq!(tick_label(0.0), "0");
+        assert_eq!(tick_label(2.5), "2.5");
+        assert_eq!(tick_label(-0.003), "-0.003");
+        assert_eq!(tick_label(1250.0), "1250");
+        assert_eq!(tick_label(1e-6), "1.00e-6");
+        assert_eq!(tick_label(5e4), "5.00e4");
+    }
+
+    /// Text nodes escape the XML specials; plain text passes through.
+    #[test]
+    fn svg_text_is_xml_escaped() {
+        assert_eq!(xml_escape("a&b<c>d"), "a&amp;b&lt;c&gt;d");
+        assert_eq!(xml_escape("plain"), "plain");
     }
 }

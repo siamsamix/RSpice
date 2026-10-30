@@ -43,10 +43,15 @@ struct Args {
     #[arg(long)]
     waves: Option<PathBuf>,
 
-    /// Comma list of trace names for --waves (case-insensitive full-column
-    /// names); unmatched names are silent, the axis and the step columns
-    /// always stay
-    #[arg(long, value_name = "TRACES", requires = "waves")]
+    /// Render every analysis's plot as a stacked SVG image to this file
+    /// (one panel per raw plot, drawn top to bottom)
+    #[arg(long)]
+    image: Option<PathBuf>,
+
+    /// Comma list of trace names for --waves/--image (case-insensitive
+    /// full-column names); unmatched names are silent, the axis and the
+    /// step columns always stay
+    #[arg(long, value_name = "TRACES")]
     traces: Option<String>,
 
     /// Write the simulation's plots as an LTspice-style .raw file
@@ -185,6 +190,13 @@ fn run_cli() -> Result<(), CliError> {
             &trace_specs(args.traces.as_deref()),
         );
         fs::write(path, csv)?;
+    }
+
+    if let Some(path) = &args.image {
+        let title = format!("* {}", args.netlist.display());
+        let raw = circuitsim::rawwave::build(&title, &netlist, &result);
+        let svg = circuitsim::export::svg_document(&raw, &trace_specs(args.traces.as_deref()));
+        fs::write(path, svg)?;
     }
 
     let body = if args.csv {

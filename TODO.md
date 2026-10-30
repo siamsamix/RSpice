@@ -306,8 +306,18 @@ below is written against that state.
   analysis stage rejects a current `.noise` input today. CLI: `--raw <file>` (binary
   default) with `--raw-ascii`, plus `--read-raw` to dump any file's plots; the PSpice
   `.dat` format stays open.)*
-- [ ] **[P1] (spot)** Full export surface: CSV of arbitrary traces (node voltages, element currents,
+- [x] **[P1] (spot)** Full export surface: CSV of arbitrary traces (node voltages, element currents,
   measurements — today only `.tran` node voltages are exportable), image export.
+  *(Landed in `circuitsim::export`: `csv_document` renders every raw plot as a `# <Plotname>`
+  section at `{:.9e}` with the `.meas` table in RFC 4180 quoting, complex (AC) columns as
+  `<name>_mag`/`<name>_phase` degrees and the axis as the real part; `svg_document` draws the
+  same plots as one stacked SVG panel per plot — linear axes, zero-anchored 5%-padded y scale,
+  gridlines, legend chips, one-point traces as circles, XML-escaped text. Trace selection is
+  shared: an empty list keeps every column, a comma list matches column names
+  case-insensitively while the axis and the step columns always ride; the step columns carry
+  each row's run provenance so stepped plots and CSVs stay self-describing. CLI: `--waves
+  <file>` (CSV), `--image <file>` (SVG), optional `--traces a,b`. Logged axes, cursors, and
+  real-time plotting remain per-item work elsewhere in this list.)*
 - [ ] **[P2] (both)** Waveform data compression/decimation options (`.options plotwinsize` in LTspice,
   Probe compression in PSpice).
 - [ ] **[P2] (both)** Persist and reuse plot configurations (trace sets, scales, window layouts).

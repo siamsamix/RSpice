@@ -59,6 +59,10 @@ pub struct RawDataset {
     pub flags: Vec<String>,
     pub variables: Vec<RawVariable>,
     pub values: Vec<Vec<Complex64>>,
+    /// The appended step columns, in order (`r`, `V1`, …) — build() knows
+    /// them from the deck; a read file carries the values only, so readers
+    /// cannot recover them and fill none.
+    pub steps: Vec<String>,
 }
 
 impl RawDataset {
@@ -279,6 +283,10 @@ fn dataset_from(
         plotname: plotname.to_string(),
         flags,
         variables,
+        steps: step_values
+            .iter()
+            .map(|(target, _)| target.clone())
+            .collect(),
         values: rows,
     }
 }
@@ -849,6 +857,7 @@ fn parse_block(block: &[u8]) -> Result<RawDataset> {
         flags,
         variables,
         values,
+        steps: Vec::new(),
     })
 }
 

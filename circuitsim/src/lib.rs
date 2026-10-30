@@ -10,6 +10,7 @@ pub mod behavior;
 pub mod circuit;
 pub mod currents;
 pub mod error;
+pub mod export;
 pub mod mc;
 pub mod mna;
 pub mod model;

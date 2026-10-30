@@ -9,7 +9,6 @@ use circuitsim::{
 };
 use circuitsim::netlist::OpMode;
 use circuitsim::netlist::{McCommand, McOp};
-use circuitsim::circuit::CURRENT_FAMILIES;
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 enum AnalysisKind {
@@ -39,9 +38,16 @@ struct Args {
     #[arg(short, long)]
     output: Option<PathBuf>,
 
-    /// Export every transient/AC trace as CSV to this file
+    /// Export every analysis's plot as a sectioned CSV to this file (one
+    /// `# <Plotname>` section per raw plot, plus the `.meas` table)
     #[arg(long)]
     waves: Option<PathBuf>,
+
+    /// Comma list of trace names for --waves (case-insensitive full-column
+    /// names); unmatched names are silent, the axis and the step columns
+    /// always stay
+    #[arg(long, value_name = "TRACES", requires = "waves")]
+    traces: Option<String>,
 
     /// Write the simulation's plots as an LTspice-style .raw file
     #[arg(long, value_name = "FILE")]
@@ -171,7 +177,14 @@ fn run_cli() -> Result<(), CliError> {
     }
 
     if let Some(path) = &args.waves {
-        fs::write(path, waveform_csv(&netlist, &result))?;
+        let title = format!("* {}", args.netlist.display());
+        let raw = circuitsim::rawwave::build(&title, &netlist, &result);
+        let csv = circuitsim::export::csv_document(
+            &raw,
+            &result.measurements,
+            &trace_specs(args.traces.as_deref()),
+        );
+        fs::write(path, csv)?;
     }
 
     let body = if args.csv {
@@ -641,6 +654,16 @@ fn print_runs(report: &mut String, netlist: &Netlist, result: &SimulationResult)
     }
 }
 
+/// The `--traces` argument: comma names, trimmed; blank items (adjacent
+/// commas, a trailing comma) drop out so they never match anything.
+fn trace_specs(spec: Option<&str>) -> Vec<String> {
+    spec.unwrap_or_default()
+        .split(',')
+        .map(|name| name.trim().to_string())
+        .filter(|name| !name.is_empty())
+        .collect()
+}
+
 /// CSV for `--csv`: transient takes precedence, then the DC sweep.
 fn csv_body(netlist: &Netlist, result: &SimulationResult) -> String {
     let mut out = String::new();
@@ -682,56 +705,6 @@ fn csv_body(netlist: &Netlist, result: &SimulationResult) -> String {
     }
     // No waveform result: fall back to a comment so the file is still valid.
     out.push_str("# no .tran or .dc sweep result\n");
-    out
-}
-
-/// Full export surface: every node voltage and element current, with AC
-/// magnitude/phase when that is the only result. The element walk follows the
-/// simulator's canonical family order, labelled from the deck.
-fn waveform_csv(netlist: &Netlist, result: &SimulationResult) -> String {
-    let net = &netlist.circuit;
-    let mut out = String::new();
-    if let Some(tran) = &result.tran {
-        out.push_str("time");
-        for i in 0..net.nodes {
-            let _ = write!(out, ",V({})", node_label(net, i));
-        }
-        for family in CURRENT_FAMILIES {
-            for name in net.element_names(family) {
-                let _ = write!(out, ",{}({})", family.probe_prefix(), name);
-            }
-        }
-        out.push('\n');
-        for pt in &tran.points {
-            let _ = write!(out, "{:.9e}", pt.time);
-            for v in &pt.node_voltages {
-                let _ = write!(out, ",{v:.9e}");
-            }
-            for family in CURRENT_FAMILIES {
-                for v in pt.branch_currents.slice(family).unwrap_or(&[]) {
-                    let _ = write!(out, ",{v:.9e}");
-                }
-            }
-            out.push('\n');
-        }
-        return out;
-    }
-    if let Some(ac) = &result.ac {
-        out.push_str("freq");
-        for i in 0..net.nodes {
-            let _ = write!(out, ",V({})_mag,V({})_phase", node_label(net, i), node_label(net, i));
-        }
-        out.push('\n');
-        for pt in &ac.points {
-            let _ = write!(out, "{:.9e}", pt.freq);
-            for v in &pt.node_voltages {
-                let _ = write!(out, ",{:.9e},{:.9e}", v.norm(), v.arg().to_degrees());
-            }
-            out.push('\n');
-        }
-        return out;
-    }
-    out.push_str("# no .tran or .ac result\n");
     out
 }
 

@@ -135,6 +135,10 @@ deepening that has not landed yet.
   input-referred by dividing by |gain|², integrated over the sweep for RMS totals.
 - **Behavioral source** — `Bname n+ n− V=<expr>|I=<expr>`, parsed into `behavior.rs` as a
   `BExpr` AST plus a probe table (bound once node ids are final; probes never create nodes).
+  Reading a bound probe is one routine — `behavior::resolve_probe` owns the binding's shape
+  (`V` is a pair difference, `I(src)`/`I(L)` a branch read, `Unresolved` reads `None`), and
+  every read site (DC snapshots, report maps, AC phasors) resolves through it; the current
+  flavour's Jacobian couplings land once through `stamp_probe_couplings` at the row's sign.
   History terms (`idt`/`sdt`, `delay`) advance only on accepted steps via `BehavioralRuntime`
   (`seeded`/`advance`), and keyed noise rolls live beside them (`noise_seed`, `noise_rolls`).
   The emitted card carries the original expression text verbatim.

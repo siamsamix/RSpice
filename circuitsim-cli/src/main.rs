@@ -108,6 +108,12 @@ struct Args {
     #[arg(long)]
     fft: Option<PathBuf>,
 
+    /// Write the PSpice performance analysis as an SVG to this file: one
+    /// panel per `.meas` name, the measurement value against the swept
+    /// parameter across the `.step` runs
+    #[arg(long)]
+    perf: Option<PathBuf>,
+
     /// FFT window function, one of LTspice's FFT-view windows (each taper
     /// normalized to unit mean, so a DC level reads its true amplitude)
     #[arg(long, requires = "fft", value_enum, default_value_t = WindowKind::BlackmanHarris)]
@@ -274,6 +280,11 @@ fn run_cli() -> Result<(), CliError> {
             &trace_specs(args.traces.as_deref()),
             &cursor_xs,
         );
+        fs::write(path, svg)?;
+    }
+
+    if let Some(path) = &args.perf {
+        let svg = circuitsim::export::svg_performance(&result)?;
         fs::write(path, svg)?;
     }
 

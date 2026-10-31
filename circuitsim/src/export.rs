@@ -14,7 +14,8 @@
 //! builder also feeds the image exporter — a stepped deck's same-shape
 //! runs overlay onto one panel with per-run identification.
 
-use crate::analysis::MeasureResult;
+use crate::analysis::{MeasureResult, SimulationResult};
+use crate::error::{Result, SimError};
 use crate::rawwave::{RawDataset, RawFile};
 use num_complex::Complex64;
 
@@ -183,6 +184,174 @@ pub fn svg_document_with_cursors(raw: &RawFile, traces: &[String], cursors: &[f6
     }
     out.push_str("</svg>\n");
     out
+}
+
+/// The PSpice performance-analysis SVG: one panel per distinct `.meas`
+/// name (first run's order), plotting the measurement's value against
+/// the swept parameter across the `.step` runs. A failed measurement
+/// (no crossing found, …) leaves its run out of the panel; a panel
+/// whose points all failed draws only the frame.
+pub fn svg_performance(result: &SimulationResult) -> Result<String> {
+    if result.step_targets.len() > 1 {
+        return Err(SimError::Analysis(
+            "performance analysis sweeps one parameter".into(),
+        ));
+    }
+    if result.step_targets == ["mc"] {
+        return Err(SimError::Analysis(
+            "performance analysis does not cover .mc runs (no swept parameter)".into(),
+        ));
+    }
+    if result.step_targets.is_empty() || result.runs.is_empty() {
+        return Err(SimError::Analysis(
+            "performance analysis needs a .step sweep".into(),
+        ));
+    }
+    let target = &result.step_targets[0];
+    let mut names: Vec<String> = Vec::new();
+    for measurement in &result.runs[0].measurements {
+        if !names.contains(&measurement.name) {
+            names.push(measurement.name.clone());
+        }
+    }
+    if names.is_empty() {
+        return Err(SimError::Analysis(
+            "performance analysis needs .meas measurements".into(),
+        ));
+    }
+    let panels = names.len() as u32;
+    let height = panels * PANEL_H + panels.saturating_sub(1) * PANEL_GAP;
+    let mut out = String::new();
+    out.push_str(&format!(
+        "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{PANEL_W}\" height=\"{height}\" viewBox=\"0 0 {PANEL_W} {height}\" font-family=\"sans-serif\">\n"
+    ));
+    for (i, name) in names.iter().enumerate() {
+        if i > 0 {
+            out.push('\n');
+        }
+        let top = i as u32 * (PANEL_H + PANEL_GAP);
+        let mut points: Vec<(f64, f64)> = result
+            .runs
+            .iter()
+            .filter_map(|run| {
+                let x = run.values.first().copied()?;
+                let value = run.measurements.iter().find(|m| m.name == *name)?.value?;
+                if x.is_finite() && value.is_finite() {
+                    Some((x, value))
+                } else {
+                    None
+                }
+            })
+            .collect();
+        points.sort_by(|(ax, _), (bx, _)| ax.total_cmp(bx));
+        perf_panel(&mut out, name, target, &points, top);
+    }
+    out.push_str("</svg>\n");
+    Ok(out)
+}
+
+/// One measurement-vs-parameter panel: the swept value against the
+/// measurement value, points sorted by the sweep. The scale spans the
+/// plotted points with no zero anchor and pads both ends 5% (a degenerate
+/// span widens to [a, a+1], the empty-panel case included); frame,
+/// gridlines, and ticks mirror `svg_panel`, a single point draws as a
+/// circle.
+fn perf_panel(out: &mut String, name: &str, target: &str, points: &[(f64, f64)], top: u32) {
+    out.push_str(&format!("<g transform=\"translate(0,{top})\">\n"));
+    out.push_str(&format!(
+        "<text x=\"{MARGIN_L}\" y=\"20\" font-size=\"13\">{}</text>\n",
+        xml_escape(&format!("{name} vs {target}"))
+    ));
+    let pw = PANEL_W - MARGIN_L - MARGIN_R;
+    let ph = PANEL_H - MARGIN_T - MARGIN_B;
+    let plot_w = pw as f64;
+    let plot_h = ph as f64;
+    let left = MARGIN_L as f64;
+    let right = (MARGIN_L + pw) as f64;
+    let bottom = (MARGIN_T + ph) as f64;
+    let (min_x, max_x) = perf_axis(points.iter().map(|&(x, _)| x));
+    let (min_y, max_y) = perf_axis(points.iter().map(|&(_, y)| y));
+    let x_at = |value: f64| left + (value - min_x) / (max_x - min_x) * plot_w;
+    let y_at = |value: f64| bottom - (value - min_y) / (max_y - min_y) * plot_h;
+
+    for i in 1..DIVISIONS {
+        let x = left + i as f64 / DIVISIONS as f64 * plot_w;
+        let y = MARGIN_T as f64 + i as f64 / DIVISIONS as f64 * plot_h;
+        out.push_str(&format!(
+            "<line x1=\"{x:.2}\" y1=\"{}\" x2=\"{x:.2}\" y2=\"{bottom:.2}\" stroke=\"#999999\"/>\n",
+            MARGIN_T
+        ));
+        out.push_str(&format!(
+            "<line x1=\"{left:.2}\" y1=\"{y:.2}\" x2=\"{right:.2}\" y2=\"{y:.2}\" stroke=\"#999999\"/>\n"
+        ));
+    }
+    out.push_str(&format!(
+        "<rect x=\"{MARGIN_L}\" y=\"{MARGIN_T}\" width=\"{pw}\" height=\"{ph}\" fill=\"none\" stroke=\"#000000\"/>\n"
+    ));
+    for i in 0..=DIVISIONS {
+        let x = x_at(min_x + (max_x - min_x) * i as f64 / DIVISIONS as f64);
+        let y = bottom - i as f64 / DIVISIONS as f64 * plot_h;
+        out.push_str(&format!(
+            "<line x1=\"{x:.2}\" y1=\"{bottom:.2}\" x2=\"{x:.2}\" y2=\"{:.2}\"/>\n",
+            bottom + 4.0
+        ));
+        out.push_str(&format!(
+            "<text x=\"{x:.2}\" y=\"{:.2}\" text-anchor=\"middle\" font-size=\"11\">{}</text>\n",
+            bottom + 18.0,
+            tick_label(min_x + (max_x - min_x) * i as f64 / DIVISIONS as f64)
+        ));
+        out.push_str(&format!(
+            "<line x1=\"{:.2}\" y1=\"{y:.2}\" x2=\"{left:.2}\" y2=\"{y:.2}\"/>\n",
+            left - 4.0
+        ));
+        out.push_str(&format!(
+            "<text x=\"{:.2}\" y=\"{:.2}\" text-anchor=\"end\" font-size=\"11\">{}</text>\n",
+            left - 8.0,
+            y + 4.0,
+            tick_label(min_y + (max_y - min_y) * i as f64 / DIVISIONS as f64)
+        ));
+    }
+
+    if !points.is_empty() {
+        let color = TRACE_COLORS[0];
+        let pairs: Vec<(f64, f64)> = points.iter().map(|&(x, y)| (x_at(x), y_at(y))).collect();
+        let text = pairs
+            .iter()
+            .map(|(px, py)| format!("{px:.2},{py:.2}"))
+            .collect::<Vec<_>>()
+            .join(" ");
+        out.push_str(&format!(
+            "<polyline points=\"{text}\" fill=\"none\" stroke=\"{color}\" stroke-width=\"2\"/>\n"
+        ));
+        if pairs.len() == 1 {
+            out.push_str(&format!(
+                "<circle cx=\"{:.2}\" cy=\"{:.2}\" r=\"3\" fill=\"{color}\"/>\n",
+                pairs[0].0, pairs[0].1
+            ));
+        }
+    }
+    out.push_str("</g>\n");
+}
+
+/// The padded scale for one performance-panel axis: min/max of the
+/// plotted values, 5% pad at both ends, no zero anchor — the sweep value
+/// and the measurement own the range. An empty range (every measurement
+/// failed) falls back to 0 and a degenerate one (min == max, including a
+/// sole point) widens to [a, a+1] so the frame keeps a scale.
+fn perf_axis(values: impl Iterator<Item = f64>) -> (f64, f64) {
+    let (mut low, mut high) = (f64::INFINITY, f64::NEG_INFINITY);
+    for value in values {
+        low = low.min(value);
+        high = high.max(value);
+    }
+    if low > high {
+        (low, high) = (0.0, 0.0);
+    }
+    if low == high {
+        return (low, high + 1.0);
+    }
+    let pad = 0.05 * (high - low);
+    (low - pad, high + pad)
 }
 
 /// Partition a file's datasets into overlay groups in first-occurrence
@@ -530,7 +699,7 @@ mod tests {
 
     use crate::netlist::parse;
     use crate::rawwave::{build, RawVariable};
-    use crate::runs::run;
+    use crate::runs::{run, StepRun};
     use approx::assert_relative_eq;
 
     fn sim(deck: &str) -> (RawFile, Vec<MeasureResult>) {
@@ -1038,5 +1207,154 @@ R2 out 0 3k
         assert_eq!(doc.matches("<polyline").count(), 1, "{doc}");
         assert!(doc.contains(">1: time=1, V(out)=2</text>"), "{doc}");
         assert!(!doc.contains("1000"), "{doc}");
+    }
+
+    /// The perf fixtures: hand-built results parametrized on the step
+    /// targets and the runs (every analysis field `None` — performance
+    /// analysis reads only targets, runs, and measurements).
+    fn step_run(values: &[f64], name: &str, value: Option<f64>) -> StepRun {
+        StepRun {
+            values: values.to_vec(),
+            dc: None,
+            dc_sweep: None,
+            tran: None,
+            ac: None,
+            tf: None,
+            measurements: match value {
+                Some(v) => vec![MeasureResult {
+                    name: name.to_owned(),
+                    value: Some(v),
+                    error: None,
+                }],
+                None => vec![],
+            },
+            four: None,
+            noise: None,
+        }
+    }
+
+    fn sim_result(targets: &[&str], runs: Vec<StepRun>) -> SimulationResult {
+        SimulationResult {
+            dc: None,
+            dc_sweep: None,
+            tran: None,
+            ac: None,
+            tf: None,
+            step_targets: targets.iter().map(|t| (*t).to_owned()).collect(),
+            runs,
+            measurements: vec![],
+            four: None,
+            noise: None,
+        }
+    }
+
+    /// One panel per `.meas` name, in card order, against the swept
+    /// parameter on the x axis.
+    #[test]
+    fn performance_panels_are_one_per_meas() {
+        let deck = "\
+.param r=1k
+V1 in 0 DC 1
+R1 in out {r}
+R2 out 0 1k
+.op
+.step param r 1k 2k 1k
+.meas op vout max V(out)
+.meas op isrc max I(R1)
+.end
+";
+        let netlist = parse(deck).expect("deck parses");
+        let result = run(&netlist).expect("deck runs");
+        let doc = svg_performance(&result).expect("performance svg");
+        assert_eq!(doc.matches("<g transform").count(), 2, "{doc}");
+        assert_eq!(doc.matches("<polyline").count(), 2, "{doc}");
+        assert!(doc.contains(">vout vs r</text>"), "{doc}");
+        assert!(doc.contains(">isrc vs r</text>"), "{doc}");
+        // Panel titles only: performance curves carry no legend chips.
+        assert!(!doc.contains("text-anchor=\"end\" fill="), "{doc}");
+    }
+
+    /// A measurement that cannot be evaluated (no crossing here) leaves
+    /// its run out; with every run failed the panel keeps just the frame.
+    #[test]
+    fn performance_skips_failed_measurements() {
+        let deck = "\
+.param r=1k
+V1 in 0 DC 0 PULSE(0 1 0 100n 100n 10u 20u)
+R1 in out {r}
+R2 out 0 1k
+.tran 1u 20u
+.step param r 1k 2k 1k
+.meas tran never cross V(out) val=1.5
+.meas tran seen avg V(out)
+.end
+";
+        let netlist = parse(deck).expect("deck parses");
+        let result = run(&netlist).expect("deck runs");
+        let doc = svg_performance(&result).expect("performance svg");
+        assert_eq!(doc.matches("<g transform").count(), 2, "{doc}");
+        assert_eq!(doc.matches("<polyline").count(), 1, "{doc}");
+        assert!(!doc.contains("<circle"), "{doc}");
+        assert!(doc.contains(">never vs r</text>"), "{doc}");
+        assert!(doc.contains(">seen vs r</text>"), "{doc}");
+    }
+
+    /// A measurement evaluated in exactly one run draws its point as a
+    /// circle over the one-point polyline.
+    #[test]
+    fn performance_single_point_draws_a_circle() {
+        let doc = svg_performance(&sim_result(
+            &["r"],
+            vec![step_run(&[1000.0], "vout", Some(0.5))],
+        ))
+        .expect("performance svg");
+        assert_eq!(doc.matches("<polyline").count(), 1, "{doc}");
+        assert!(doc.contains("<circle cx="), "{doc}");
+    }
+
+    /// Unstepped (or runless) results, more than one step target, and
+    /// `.mc` runs are each rejected with their own explanation.
+    #[test]
+    fn performance_rejects_unstepped_and_multi_target() {
+        let netlist = parse("V1 in 0 DC 1\nR1 in out 1k\n.op\n.end").unwrap();
+        let result = run(&netlist).unwrap();
+        assert!(svg_performance(&result)
+            .unwrap_err()
+            .to_string()
+            .contains("performance analysis needs a .step sweep"));
+
+        let err = svg_performance(&sim_result(
+            &["a", "b"],
+            vec![step_run(&[0.0], "x", Some(1.0))],
+        ))
+        .unwrap_err()
+        .to_string();
+        assert!(
+            err.contains("performance analysis sweeps one parameter"),
+            "{err}"
+        );
+
+        let err = svg_performance(&sim_result(&["mc"], vec![step_run(&[0.0], "x", Some(1.0))]))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("performance analysis does not cover .mc runs"),
+            "{err}"
+        );
+    }
+
+    /// A stepped deck without `.meas` cards has nothing a performance
+    /// panel could plot.
+    #[test]
+    fn performance_rejects_measless_sweeps() {
+        let netlist = parse(
+            ".param r=1k\nV1 in 0 DC 1\nR1 in out {r}\nR2 out 0 1k\n.step param r 1k 2k 1k\n.op\n.end",
+        )
+        .unwrap();
+        let result = run(&netlist).unwrap();
+        assert!(svg_performance(&result)
+            .unwrap_err()
+            .to_string()
+            .contains("performance analysis needs .meas measurements"));
     }
 }

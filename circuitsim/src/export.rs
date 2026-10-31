@@ -9,8 +9,10 @@
 //! column prints its real part. Numeric cells spill `{:.9e}`; text cells
 //! (measurement names and errors) take RFC 4180 quoting.
 //!
-//! The SVG surface draws the same plots as one panel per `.raw` plot,
-//! stacked in file order, so one builder also feeds the image exporter.
+//! The SVG surface draws the same plots as one panel per `.raw` plot
+//! shape ([`panel_groups`]), stacked in first-occurrence order, so one
+//! builder also feeds the image exporter — a stepped deck's same-shape
+//! runs overlay onto one panel with per-run identification.
 
 use crate::analysis::MeasureResult;
 use crate::rawwave::{RawDataset, RawFile};
@@ -141,61 +143,98 @@ const TRACE_COLORS: [&str; 8] = [
     "#008000", "#0000d0", "#d00000", "#0090d0", "#d000d0", "#808000", "#206060", "#000000",
 ];
 
-/// The SVG document for one built [`RawFile`]: one panel per `.raw` plot in
-/// file order, stacked vertically, driven by the same trace selection as
-/// [`csv_document`] (empty list = every column, the axis and the step
-/// columns always stay). Complex columns draw their magnitude — the
-/// mag/phase pairing is CSV material; the measurements stay tabular there
-/// too and are not drawn. Axes are linear, the y scale anchored at zero,
-/// both padded 5%; anything fancier (log axes) is per-plot work with its
-/// own TODO entries.
+/// The SVG document for one built [`RawFile`]: one panel per `.raw` plot
+/// shape in first-occurrence order ([`panel_groups`]), stacked vertically,
+/// driven by the same trace selection as [`csv_document`] (empty list =
+/// every column, the axis and the step columns always stay). Same-shape
+/// plots overlay: a stepped deck draws one curve per run on shared scales,
+/// each chip naming the run's steps; single-run groups keep exactly the
+/// per-trace output. Complex columns draw their magnitude — the mag/phase
+/// pairing is CSV material; the measurements stay tabular there too and
+/// are not drawn. Axes are linear, the y scale anchored at zero, both
+/// padded 5%; anything fancier (log axes) is per-plot work with its own
+/// TODO entries.
 pub fn svg_document(raw: &RawFile, traces: &[String]) -> String {
     svg_document_with_cursors(raw, traces, &[])
 }
 
 /// [`svg_document`] with attached cursors: each request within a panel's
 /// x span (up to two, like LTspice) snaps to the nearest finite sample of
-/// the panel's first kept trace and draws as a crosshair with a dot on
-/// that trace plus a coordinate readout, and two accepted cursors also
-/// read out their deltas (a time Δ additionally as the frequency 1/Δt).
-/// Quiet on cursorless, traceless, and off-range requests.
+/// the panel's first curve (run 0's first kept trace) and draws as a
+/// crosshair with a dot on that trace plus a coordinate readout, and two
+/// accepted cursors also read out their deltas (a time Δ additionally as
+/// the frequency 1/Δt). Quiet on cursorless, traceless, and off-range
+/// requests.
 pub fn svg_document_with_cursors(raw: &RawFile, traces: &[String], cursors: &[f64]) -> String {
-    let panels = raw.datasets.len() as u32;
+    let groups = panel_groups(&raw.datasets);
+    let panels = groups.len() as u32;
     let height = panels * PANEL_H + panels.saturating_sub(1) * PANEL_GAP;
     let mut out = String::new();
     out.push_str(&format!(
         "<svg xmlns=\"http://www.w3.org/2000/svg\" width=\"{PANEL_W}\" height=\"{height}\" viewBox=\"0 0 {PANEL_W} {height}\" font-family=\"sans-serif\">\n"
     ));
-    for (i, ds) in raw.datasets.iter().enumerate() {
+    for (i, runs) in groups.iter().enumerate() {
         if i > 0 {
             out.push('\n');
         }
         let top = i as u32 * (PANEL_H + PANEL_GAP);
-        let keep = selected_variables(ds, traces);
-        svg_panel(&mut out, ds, top, &keep, is_complex(ds), cursors);
+        let keep = selected_variables(runs[0], traces);
+        svg_panel(&mut out, runs, top, &keep, is_complex(runs[0]), cursors);
     }
     out.push_str("</svg>\n");
     out
 }
 
+/// Partition a file's datasets into overlay groups in first-occurrence
+/// order: each dataset joins the first earlier group whose shape matches
+/// ([`same_shape`]), so a `build()` that interleaves analyses across step
+/// runs (Trans, AC, Trans, AC, …) still lands each analysis in one panel.
+fn panel_groups(datasets: &[RawDataset]) -> Vec<Vec<&RawDataset>> {
+    let mut groups: Vec<Vec<&RawDataset>> = Vec::new();
+    for ds in datasets {
+        match groups.iter_mut().find(|group| same_shape(group[0], ds)) {
+            Some(group) => group.push(ds),
+            None => groups.push(vec![ds]),
+        }
+    }
+    groups
+}
+
+/// Same overlay shape: the plot name, the flag row, and every variable's
+/// name and kind line up pairwise.
+fn same_shape(a: &RawDataset, b: &RawDataset) -> bool {
+    a.plotname == b.plotname
+        && a.flags == b.flags
+        && a.variables.len() == b.variables.len()
+        && a.variables
+            .iter()
+            .zip(&b.variables)
+            .all(|(x, y)| x.name == y.name && x.kind == y.kind)
+}
+
 /// One panel: a `<g>` translated to its stack slot, holding the plotname,
 /// the legend chips, a rectangular frame, gray gridlines, and one polyline
-/// per selected trace. Single-row plots (`.op`, `.tf`, `.noise` synthetic
-/// axes) draw their sample as a small circle, since a one-point polyline
-/// would render nothing. Attached cursors in-range snap to the first kept
-/// trace and crosshair it.
+/// per curve. A stepped group (`runs` long, same shapes) draws one curve
+/// per (run, selected trace) on shared scales, chips naming each run's
+/// steps; a single-run group keeps one curve per trace with the plain
+/// chips. Step columns ride along as identification metadata, not curves.
+/// Single-row plots (`.op`, `.tf`, `.noise` synthetic axes) draw their
+/// sample as a small circle, since a one-point polyline would render
+/// nothing. Attached cursors in-range snap to the first curve (run 0's
+/// first kept trace) and crosshair it.
 fn svg_panel(
     out: &mut String,
-    ds: &RawDataset,
+    runs: &[&RawDataset],
     top: u32,
     keep: &[usize],
     complex: bool,
     cursors: &[f64],
 ) {
+    let head = runs[0];
     out.push_str(&format!("<g transform=\"translate(0,{top})\">\n"));
     out.push_str(&format!(
         "<text x=\"{MARGIN_L}\" y=\"20\" font-size=\"13\">{}</text>\n",
-        xml_escape(&ds.plotname)
+        xml_escape(&head.plotname)
     ));
     let pw = PANEL_W - MARGIN_L - MARGIN_R;
     let ph = PANEL_H - MARGIN_T - MARGIN_B;
@@ -205,14 +244,27 @@ fn svg_panel(
     let right = (MARGIN_L + pw) as f64;
     let bottom = (MARGIN_T + ph) as f64;
 
-    // The y scale: zero anchors it, both ends pad 5% (flat data widens ±1
-    // first); the x scale spans the axis samples over at least [0, 1] so
-    // synthetic axes stay degenerate-safe.
-    let columns: Vec<Vec<f64>> = keep
+    // One curve per (run, kept trace): step columns are the runs'
+    // identification metadata and draw nothing themselves. The y scale
+    // spans every curve of the overlay (zero anchors it, both ends pad 5%,
+    // flat data widens ±1 first); the x scale spans every run's axis
+    // samples, both ends padded 5% (a degenerate axis — one sample, as in
+    // synthetic `.op` rows — widens to [a, a+1] to stay degenerate-safe).
+    let mut layers: Vec<(usize, usize)> = Vec::new();
+    for (run, ds) in runs.iter().enumerate() {
+        for &i in keep.iter().skip(1) {
+            let name = &ds.variables[i].name;
+            if ds.steps.iter().any(|target| target == name) {
+                continue;
+            }
+            layers.push((run, i));
+        }
+    }
+    let columns: Vec<Vec<f64>> = layers
         .iter()
-        .skip(1)
-        .map(|&i| {
-            ds.values
+        .map(|&(run, i)| {
+            runs[run]
+                .values
                 .iter()
                 .filter_map(|row| {
                     let cell = row[i];
@@ -240,12 +292,15 @@ fn svg_panel(
         let pad = 0.05 * (max_y - min_y);
         (min_y - pad, max_y + pad)
     };
-    let axis: Vec<f64> = ds.values.iter().map(|row| row[0].re).collect();
+    let axis: Vec<f64> = runs
+        .iter()
+        .flat_map(|ds| ds.values.iter().map(|row| row[0].re))
+        .collect();
     let (min_x, max_x) = axis
         .iter()
         .copied()
         .filter(|x| x.is_finite())
-        .chain([0.0, 1.0])
+        .chain([0.0])
         .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
             (lo.min(v), hi.max(v))
         });
@@ -296,19 +351,28 @@ fn svg_panel(
         ));
     }
 
-    for (slot, (&i, column)) in keep.iter().skip(1).zip(&columns).enumerate() {
+    for (slot, &(run, i)) in layers.iter().enumerate() {
+        let ds = runs[run];
         let name = &ds.variables[i].name;
+        let column = &columns[slot];
         let color = TRACE_COLORS[slot % TRACE_COLORS.len()];
+        let chip = if runs.len() == 1 {
+            name.clone()
+        } else {
+            run_tag(ds, run, name)
+        };
         out.push_str(&format!(
             "<text x=\"{right:.2}\" y=\"{}\" text-anchor=\"end\" fill=\"{color}\">{}</text>\n",
             14.0 + 14.0 * slot as f64,
-            xml_escape(name)
+            xml_escape(&chip)
         ));
-        let pairs: Vec<(f64, f64)> = axis
+        let pairs: Vec<(f64, f64)> = ds
+            .values
             .iter()
-            .zip(column)
+            .map(|row| row[0].re)
+            .zip(column.iter().copied())
             .filter(|(x, y)| x.is_finite() && y.is_finite())
-            .map(|(x, y)| (x_at(*x), y_at(*y)))
+            .map(|(x, y)| (x_at(x), y_at(y)))
             .collect();
         let points = pairs
             .iter()
@@ -327,19 +391,20 @@ fn svg_panel(
     }
 
     // Attached cursors (LTspice): up to two requests inside the padded x
-    // span snap to the nearest finite sample of the first kept trace and
-    // crosshair it in magenta with a dot at the snapped point; the
-    // readouts list each cursor's coordinates, and with two accepted
-    // cursors also the deltas (a time Δ additionally as 1/Δt in Hz).
-    if keep.len() > 1 && !cursors.is_empty() {
-        let first = keep[1];
-        let first_pairs: Vec<(f64, f64)> = axis
+    // span snap to the nearest finite sample of the first curve — run 0's
+    // first kept trace — and crosshair it in magenta with a dot at the
+    // snapped point; the readouts list each cursor's coordinates, and with
+    // two accepted cursors also the deltas (a time Δ additionally as 1/Δt
+    // in Hz).
+    if !layers.is_empty() && !cursors.is_empty() {
+        let (first_run, first) = layers[0];
+        let first_pairs: Vec<(f64, f64)> = runs[first_run]
+            .values
             .iter()
-            .zip(ds.values.iter())
-            .filter_map(|(x, row)| {
+            .filter_map(|row| {
                 let cell = row[first];
                 let y = if complex { cell.norm() } else { cell.re };
-                (x.is_finite() && y.is_finite()).then_some((*x, y))
+                (row[0].re.is_finite() && y.is_finite()).then_some((row[0].re, y))
             })
             .collect();
         if !first_pairs.is_empty() {
@@ -358,8 +423,8 @@ fn svg_panel(
                     "<circle cx=\"{cx:.2}\" cy=\"{cy:.2}\" r=\"3\" fill=\"#aa00aa\"/>\n"
                 ));
             }
-            let axis_name = &ds.variables[0].name;
-            let trace_name = &ds.variables[first].name;
+            let axis_name = &runs[first_run].variables[0].name;
+            let trace_name = &runs[first_run].variables[first].name;
             let mut ry = MARGIN_T as f64 + 16.0;
             for (n, (sx, sy)) in snaps.iter().enumerate() {
                 out.push_str(&format!(
@@ -396,6 +461,32 @@ fn svg_panel(
         }
     }
     out.push_str("</g>\n");
+}
+
+/// The per-curve chip text naming which run a curve belongs to: the step
+/// targets spelled with their column values when the dataset carries step
+/// columns (readers recover none of those names, so their chips fall back
+/// to the run ordinal), else the run ordinal. Single-run groups never
+/// reach this and keep the bare trace name.
+fn run_tag(ds: &RawDataset, run: usize, name: &str) -> String {
+    if ds.steps.is_empty() {
+        return format!("{name} run {}", run + 1);
+    }
+    let spelled: Vec<String> = ds
+        .steps
+        .iter()
+        .map(|target| {
+            let value = ds.values.first().and_then(|row| {
+                let index = ds.variables.iter().position(|v| &v.name == target)?;
+                Some(row[index].re)
+            });
+            match value {
+                Some(v) => format!("{target}={}", tick_label(v)),
+                None => target.clone(),
+            }
+        })
+        .collect();
+    format!("{name}: {}", spelled.join(", "))
 }
 
 /// The nearest finite `(axis, value)` pair to `x` by axis distance: the
@@ -631,20 +722,20 @@ R2 out 0 3k
         assert!(!doc.contains("vmax"));
     }
 
-    /// Stepped runs stack one panel per run; the stack height adds the gap,
-    /// the second panel rides at the correct offset, and the step column
-    /// rides along in the legend.
+    /// Stepped runs overlay onto one panel: one curve per run on shared
+    /// scales, chips naming each run's step value, and the step column
+    /// riding as metadata (no `>r</text>` chip of its own).
     #[test]
-    fn svg_document_stacks_stepped_panels() {
+    fn svg_document_overlays_stepped_runs() {
         let (raw, _) = sim(STEPPED);
         let doc = svg_document(&raw, &tr(&["V(out)"]));
-        assert!(doc.contains(r#"width="760" height="866""#));
-        assert_eq!(doc.matches("translate(0,").count(), 2);
-        assert!(doc.contains("translate(0,446)"));
-        assert_eq!(doc.matches("<polyline").count(), 4);
-        assert_eq!(doc.matches("<circle").count(), 4, "one-point traces");
-        assert!(doc.contains(">V(out)</text>"));
-        assert!(doc.contains(">r</text>"));
+        assert!(doc.contains(r#"width="760" height="420""#), "{doc}");
+        assert_eq!(doc.matches("translate(0,").count(), 1);
+        assert_eq!(doc.matches("<polyline").count(), 2, "{doc}");
+        assert_eq!(doc.matches("<circle").count(), 2, "one-point traces");
+        assert!(doc.contains(">V(out): r=1000</text>"), "{doc}");
+        assert!(doc.contains(">V(out): r=2000</text>"), "{doc}");
+        assert!(!doc.contains(">r</text>"));
     }
 
     /// Complex (AC) panels draw magnitudes only, labeled by the bare column
@@ -787,5 +878,165 @@ R2 out 0 3k
         assert!(doc.contains(">2: freq=2000, V(out)=6</text>"), "{doc}");
         assert!(doc.contains(">Δfreq=1000, ΔV(out)=1</text>"), "{doc}");
         assert!(!doc.contains("f = 1/Δ"), "{doc}");
+    }
+
+    /// Two same-shape transient runs; `named` toggles between the
+    /// `.step`-built form (the `r` step column registered in `steps`) and
+    /// the reader-built form (column present, names unrecoverable). Run
+    /// two doubles run one everywhere.
+    fn two_run_raw(named: bool) -> RawFile {
+        let variable = |name: &str| RawVariable {
+            name: name.to_owned(),
+            kind: String::new(),
+        };
+        let row = |(t, v, r)| {
+            vec![
+                Complex64::new(t, 0.0),
+                Complex64::new(v, 0.0),
+                Complex64::new(r, 0.0),
+            ]
+        };
+        let run = |values: &[(f64, f64, f64)]| RawDataset {
+            title: "test".to_owned(),
+            plotname: "Transient Analysis".to_owned(),
+            flags: vec!["real".to_owned()],
+            variables: vec![variable("time"), variable("V(out)"), variable("r")],
+            values: values.iter().copied().map(row).collect(),
+            steps: if named {
+                vec!["r".to_owned()]
+            } else {
+                Vec::new()
+            },
+        };
+        RawFile {
+            datasets: vec![
+                run(&[(0.0, 1.0, 1000.0), (1.0, 2.0, 1000.0), (2.0, 3.0, 1000.0)]),
+                run(&[(0.0, 2.0, 2000.0), (1.0, 4.0, 2000.0), (2.0, 6.0, 2000.0)]),
+            ],
+        }
+    }
+
+    /// A two-run stepped transient overlays one panel: one curve per run,
+    /// step-value chips, per-curve colors, and shared cross-run scaling —
+    /// the doubled run stretches the scale, so the first run's own max
+    /// lands mid-panel instead of at the top.
+    #[test]
+    fn stepped_transient_overlays_runs_on_one_panel() {
+        let doc = svg_document(&two_run_raw(true), &tr(&["V(out)"]));
+        assert!(doc.contains(r#"width="760" height="420""#), "{doc}");
+        assert_eq!(doc.matches("translate(0,").count(), 1, "{doc}");
+        assert_eq!(doc.matches("<polyline").count(), 2, "{doc}");
+        assert!(doc.contains(">V(out): r=1000</text>"), "{doc}");
+        assert!(doc.contains(">V(out): r=2000</text>"), "{doc}");
+        assert!(doc.contains("stroke=\"#008000\""), "{doc}");
+        assert!(doc.contains("stroke=\"#0000d0\""), "{doc}");
+        // Shared y scale: values reach 6, both ends pad 5% → the top tick
+        // is 6.3; a first-run-only scale would top out at 3.15. And run
+        // one's max (3) maps to exact mid-panel y under that shared scale.
+        assert!(doc.contains(">6.3</text>"), "{doc}");
+        let green = doc
+            .lines()
+            .find(|line| line.contains("stroke=\"#008000\""))
+            .expect("green polyline");
+        assert!(green.contains(",204.00"), "{green}");
+    }
+
+    /// Real transient axes live in seconds: a sub-1.0 span (here 20 µs)
+    /// must spread the full plot width — clamping the x span to [0, 1]
+    /// would crush every time-domain trace onto the left edge.
+    #[test]
+    fn sub_unit_axis_spreads_the_plot() {
+        let mut raw = two_run_raw(true);
+        for ds in raw.datasets.iter_mut() {
+            for row in ds.values.iter_mut() {
+                row[0] *= 2e-5 / 2.0;
+            }
+        }
+        let doc = svg_document(&raw, &tr(&["V(out)"]));
+        assert!(doc.contains("410.00,255.52"), "{doc}");
+        assert!(doc.contains("711.82,49.45"), "{doc}");
+    }
+
+    /// Reader-built runs carry no `steps`; the runs still overlay, with
+    /// the chips falling back to per-run ordinals.
+    #[test]
+    fn reader_runs_without_steps_get_ordinal_chips() {
+        let doc = svg_document(&two_run_raw(false), &tr(&["V(out)"]));
+        assert_eq!(doc.matches("<polyline").count(), 2);
+        assert!(doc.contains(">V(out) run 1</text>"), "{doc}");
+        assert!(doc.contains(">V(out) run 2</text>"), "{doc}");
+        assert!(!doc.contains(">V(out)</text>"));
+    }
+
+    /// Overlay grouping is by plot shape: the same shape merges even when
+    /// other plots interleave between the runs, and a different variable
+    /// row or plot name splits the stack again.
+    #[test]
+    fn mismatched_shapes_keep_separate_panels() {
+        let variable = |name: &str| RawVariable {
+            name: name.to_owned(),
+            kind: String::new(),
+        };
+        let ds = |plotname: &str, names: &[&str]| RawDataset {
+            title: "test".to_owned(),
+            plotname: plotname.to_owned(),
+            flags: vec!["real".to_owned()],
+            variables: names.iter().map(|&name| variable(name)).collect(),
+            values: vec![names.iter().map(|_| Complex64::new(0.0, 0.0)).collect()],
+            steps: Vec::new(),
+        };
+        let raw = RawFile {
+            datasets: vec![
+                ds("Transient Analysis", &["time", "V(out)"]),
+                ds("AC Analysis", &["frequency", "V(out)"]),
+                ds("Transient Analysis", &["time", "V(out)", "V(hi)"]),
+                ds("Transient Analysis", &["time", "V(out)"]),
+            ],
+        };
+        let doc = svg_document(&raw, &tr(&["V(out)"]));
+        assert_eq!(doc.matches("translate(0,").count(), 3, "{doc}");
+        assert!(doc.contains("translate(0,446)"), "{doc}");
+        assert!(doc.contains("translate(0,892)"), "{doc}");
+    }
+
+    /// On a file that carries step columns, the cursor snaps to the first
+    /// non-step trace (V(out), not the `r` column), and the step value
+    /// never surfaces in this panel.
+    #[test]
+    fn cursor_on_stepped_snaps_to_first_non_step_trace() {
+        let variable = |name: &str| RawVariable {
+            name: name.to_owned(),
+            kind: String::new(),
+        };
+        let step_variable = RawVariable {
+            name: "r".to_owned(),
+            kind: "parameter".to_owned(),
+        };
+        let row = |(t, v)| {
+            vec![
+                Complex64::new(t, 0.0),
+                Complex64::new(v, 0.0),
+                Complex64::new(1000.0, 0.0),
+            ]
+        };
+        let raw = RawFile {
+            datasets: vec![RawDataset {
+                title: "test".to_owned(),
+                plotname: "Transient Analysis".to_owned(),
+                flags: vec!["real".to_owned()],
+                variables: vec![variable("time"), variable("V(out)"), step_variable],
+                values: vec![
+                    row((0.0, 1.0)),
+                    row((1.0, 2.0)),
+                    row((2.0, 5.0)),
+                    row((3.0, 10.0)),
+                ],
+                steps: vec!["r".to_owned()],
+            }],
+        };
+        let doc = svg_document_with_cursors(&raw, &[], &[0.6]);
+        assert_eq!(doc.matches("<polyline").count(), 1, "{doc}");
+        assert!(doc.contains(">1: time=1, V(out)=2</text>"), "{doc}");
+        assert!(!doc.contains("1000"), "{doc}");
     }
 }

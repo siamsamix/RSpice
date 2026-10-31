@@ -124,10 +124,11 @@ use crate::theme::{
 };
 
 const DEFAULT_NETLIST: &str = r#"* RC charging — edit and press Run (F5)
+* UIC starts C1 uncharged (0 V); without it the run begins at the DC operating point
 V1 1 0 DC 5
 R1 1 2 1k
 C1 2 0 1u
-.tran 10u 5m
+.tran 10u 5m UIC
 .end
 "#;
 
@@ -144,10 +145,11 @@ impl Example {
         match self {
             Example::RcCharge => {
                 r#"* RC charging
+                * UIC starts C1 uncharged (0 V); without it the run begins at the DC operating point
                 V1 1 0 DC 5
                 R1 1 2 1k
                 C1 2 0 1u
-                .tran 10u 5m
+                .tran 10u 5m UIC
                 .end
                 "#
             }
@@ -2048,4 +2050,33 @@ impl CircuitSimApp {
         self.plot.ac_apply = false;
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// V(2) of the RC-charging decks must be a real 0 V → 5 V charge. Started
+    /// from the DC operating point instead, the capacitor is already charged,
+    /// the trace sits at 5 V and autoscale stretches ~5 nV of gmin relaxation
+    /// across the whole y axis.
+    fn assert_rc_charges_from_zero(netlist: &str) {
+        let parsed = parse(netlist).expect("deck parses");
+        let tran = run(&parsed).expect("deck runs").tran.expect("transient result");
+        let v2: Vec<f64> = tran.points.iter().map(|p| p.node_voltages[2]).collect();
+        let first = *v2.first().unwrap();
+        let last = *v2.last().unwrap();
+        assert!(first.abs() < 1e-3, "V(2) should start at 0 V, got {first}");
+        assert!(last > 4.5 && last <= 5.0, "V(2) should charge toward 5 V, got {last}");
+    }
+
+    #[test]
+    fn default_netlist_charges_from_zero() {
+        assert_rc_charges_from_zero(DEFAULT_NETLIST);
+    }
+
+    #[test]
+    fn rc_charge_example_charges_from_zero() {
+        assert_rc_charges_from_zero(Example::RcCharge.netlist());
+    }
 }

@@ -38,13 +38,18 @@ cargo run --release -p rspice    # graphical app
 
 ### GUI (`circuitsim-gui`)
 
-Desktop app built with **egui** — dark theme, netlist editor, schematic view, DC tables and
-sweep plots, and interactive waveform plots.
+Desktop app built with **egui**, laid out after LTspice: a light interface with a menu bar and
+icon toolbar, document tabs (`.asc` schematic, `.cir` netlist, `.raw` results) over tiled
+child windows, a netlist editor, schematic view, DC tables and sweep plots, and interactive
+waveform plots on a black background.
 
-- **Run** or **F5** — simulate the current netlist
-- **Examples** — load RC, voltage divider, RL, or RC low-pass circuits
-- **Open / Save** — netlist files (`.cir`)
-- Tabs: **Overview**, **DC** (operating point + `.dc` sweep plot/table),
+- **Run** (toolbar or Simulate menu) or **F5** — simulate the current netlist
+- **File ▸ Examples** — load RC, voltage divider, RL, or RC low-pass circuits
+- **File ▸ Open / Save As** (**Ctrl+O** / **Ctrl+S**) — netlist files (`.cir`)
+- **Tools ▸ Import Netlist to Schematic / Generate Netlist from Schematic** — move a circuit
+  between the netlist and the schematic
+- **Window** menu or the toolbar — tile the editor and the results side by side or stacked
+- Result tabs: **Overview**, **DC** (operating point + `.dc` sweep plot/table),
   **Waveforms**, **Frequency response**
 
 ## Netlist format
@@ -118,9 +123,12 @@ that (bad count, zero or negative increment, empty LIST) are errors, never ignor
 V1 in 0 DC 5 ; drive node "in"
 R1 in 2 {r}
 C1 2 0 1u
-.tran 10u 5m
+.tran 10u 5m UIC
 .end
 ```
+
+`UIC` starts the capacitor uncharged. Like SPICE and LTspice, `.tran` otherwise begins at the
+DC operating point, where a DC-driven RC has long since settled and the trace is a flat line.
 
 CLI: the summary and tables print named nodes; waveform CSV keeps the deck's node names.
 

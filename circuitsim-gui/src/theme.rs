@@ -1,122 +1,194 @@
-use egui::{Color32, FontFamily, FontId, Rounding, Stroke, TextStyle, Visuals};
+use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, Rounding, Stroke, TextStyle, Visuals};
 
 // ---------------------------------------------------------------------------
-// Color Palette — "Instrument Panel" aesthetic
-// Modeled after high-end test & measurement equipment (Tektronix, Keysight).
-// Pure neutral grays, no blue/warm tint. Steel-blue accent only for active
-// interactive states. Everything else reads as hardware, not a web app.
+// Color Palette — LTspice look.
+// The `LT_*` colors were sampled pixel-for-pixel from the reference
+// screenshots `docs/ltspice-window.png` and
+// `docs/ltspice-window_with_circuit_and_graph.png`; the surface/text/accent
+// constants below are derived from them, so every card, grid and button in the
+// app follows the same light chrome.
 // ---------------------------------------------------------------------------
 
-/// Primary interactive accent — muted steel blue, not eye-wateringly bright.
-pub const ACCENT: Color32 = Color32::from_rgb(41, 128, 185);
-pub const ACCENT_DIM: Color32 = Color32::from_rgb(28, 93, 138);
-pub const ACCENT_SUBTLE: Color32 = Color32::from_rgba_premultiplied(41, 128, 185, 60);
+/// Menu bar, toolbar and the selected tab — pure white.
+pub const LT_WHITE: Color32 = Color32::from_rgb(255, 255, 255);
+/// Tab strip and status bar.
+pub const LT_STRIP: Color32 = Color32::from_rgb(245, 245, 245);
+/// MDI workspace and the schematic canvas.
+pub const LT_WORKSPACE: Color32 = Color32::from_rgb(192, 192, 192);
+/// Workspace / child-window border.
+pub const LT_FRAME: Color32 = Color32::from_rgb(106, 106, 106);
+/// Title bar of the active child window.
+pub const LT_TITLE_ACTIVE: Color32 = Color32::from_rgb(50, 150, 250);
+/// Title bar of an inactive child window.
+pub const LT_TITLE_INACTIVE: Color32 = Color32::from_rgb(128, 128, 128);
+/// Title text of an inactive child window.
+pub const LT_TITLE_INACTIVE_TEXT: Color32 = Color32::from_rgb(192, 192, 192);
+/// Waveform viewer background.
+pub const LT_PLOT_BG: Color32 = Color32::BLACK;
+/// Waveform viewer frame, tick marks and axis text.
+pub const LT_PLOT_FRAME: Color32 = Color32::from_rgb(175, 175, 175);
+/// Schematic wires and symbols.
+pub const LT_WIRE: Color32 = Color32::from_rgb(0, 0, 255);
+/// Schematic text (names, values, directives).
+pub const LT_SCHEM_TEXT: Color32 = Color32::BLACK;
 
-/// Surface hierarchy — pure neutral, zero chromatic bias.
-pub const BG_BASE: Color32 = Color32::from_rgb(18, 18, 20);       // Main window / canvas
-pub const BG_PANEL: Color32 = Color32::from_rgb(28, 28, 30);      // Sidebars, toolbars
-pub const BG_SURFACE: Color32 = Color32::from_rgb(38, 38, 42);    // Cards, elevated panels
-pub const BG_CONTROL: Color32 = Color32::from_rgb(52, 52, 56);    // Input fields, inactive buttons
-pub const BG_HOVER: Color32 = Color32::from_rgb(66, 66, 72);      // Hovered controls
+/// Primary interactive accent — the active-title blue.
+pub const ACCENT: Color32 = LT_TITLE_ACTIVE;
+pub const ACCENT_DIM: Color32 = Color32::from_rgb(30, 110, 200);
 
-/// Borders — two levels: structural and subtle.
-pub const BORDER: Color32 = Color32::from_rgb(60, 60, 66);
-pub const BORDER_SUBTLE: Color32 = Color32::from_rgb(44, 44, 48);
+/// Surface hierarchy.
+pub const BG_BASE: Color32 = LT_WHITE;                            // Text editors, input fields
+pub const BG_PANEL: Color32 = LT_STRIP;                           // Bars, panels
+pub const BG_SURFACE: Color32 = LT_WHITE;                         // Cards
+pub const BG_CONTROL: Color32 = Color32::from_rgb(225, 225, 225); // Buttons
+pub const BG_HOVER: Color32 = Color32::from_rgb(214, 232, 251);   // Hovered controls
 
-/// Text — high contrast primary, two muted levels for hierarchy.
-pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(220, 220, 224);
-pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(148, 148, 158);
-pub const TEXT_DISABLED: Color32 = Color32::from_rgb(88, 88, 96);
+/// Borders — structural and subtle.
+pub const BORDER: Color32 = LT_FRAME;
+pub const BORDER_SUBTLE: Color32 = Color32::from_rgb(200, 200, 200);
 
-/// Status — standard engineering traffic-light palette.
-pub const STATUS_OK: Color32 = Color32::from_rgb(39, 174, 96);
-pub const STATUS_WARN: Color32 = Color32::from_rgb(230, 152, 0);
-pub const STATUS_ERROR: Color32 = Color32::from_rgb(192, 57, 43);
-pub const STATUS_INFO: Color32 = Color32::from_rgb(41, 128, 185);
+/// Text — black primary, two muted levels.
+pub const TEXT_PRIMARY: Color32 = Color32::BLACK;
+pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(80, 80, 80);
+pub const TEXT_DISABLED: Color32 = Color32::from_rgb(144, 144, 144);
+
+/// Status — readable on the light chrome.
+pub const STATUS_OK: Color32 = Color32::from_rgb(20, 130, 60);
+pub const STATUS_WARN: Color32 = Color32::from_rgb(180, 110, 0);
+pub const STATUS_ERROR: Color32 = Color32::from_rgb(190, 30, 30);
+pub const STATUS_INFO: Color32 = Color32::from_rgb(30, 110, 200);
 
 // ---------------------------------------------------------------------------
-// Waveform / Schematic Trace Colors
-// Ordered to match Tektronix channel conventions (Ch1=Yellow, Ch2=Cyan, …).
-// Saturation kept high but luminance capped so they don't blow out on dark BG.
+// Waveform Trace Colors — bright on the black viewer. The first trace is
+// LTspice's green (sampled from the reference); the rest are distinct,
+// high-luminance colors in a fixed order.
 // ---------------------------------------------------------------------------
 pub const PLOT_COLORS: [Color32; 8] = [
-    Color32::from_rgb(255, 220, 0),   // Ch 1 — Scope Yellow      (V_out, primary node)
-    Color32::from_rgb(0, 220, 220),   // Ch 2 — Cyan              (I_source, secondary)
-    Color32::from_rgb(255, 100, 50),  // Ch 3 — Burnt Orange      (V_in)
-    Color32::from_rgb(160, 110, 255), // Ch 4 — Soft Violet       (V_ref)
-    Color32::from_rgb(80, 200, 120),  // Ch 5 — Instrument Green  (V_dd)
-    Color32::from_rgb(80, 160, 255),  // Ch 6 — Sky Blue          (V_gnd probe)
-    Color32::from_rgb(255, 255, 255), // Ch 7 — White             (math channel / derived)
-    Color32::from_rgb(200, 60, 90),   // Ch 8 — Crimson           (error / DRC flag)
+    Color32::from_rgb(0, 255, 0),     // 1 — LTspice green (reference)
+    Color32::from_rgb(255, 60, 60),   // 2 — red
+    Color32::from_rgb(70, 130, 255),  // 3 — blue
+    Color32::from_rgb(255, 230, 0),   // 4 — yellow
+    Color32::from_rgb(0, 230, 230),   // 5 — cyan
+    Color32::from_rgb(255, 80, 255),  // 6 — magenta
+    Color32::from_rgb(255, 255, 255), // 7 — white
+    Color32::from_rgb(255, 150, 40),  // 8 — orange
 ];
+
+// ---------------------------------------------------------------------------
+// Fonts
+// ---------------------------------------------------------------------------
+
+/// Name of the bold font family (schematic labels and plot text are bold in
+/// the reference; egui's `.strong()` only brightens the color).
+pub const BOLD_FAMILY: &str = "bold";
+
+/// A bold `FontId`. Requires [`install_fonts`] to have run on the context.
+pub fn bold(size: f32) -> FontId {
+    FontId::new(size, FontFamily::Name(BOLD_FAMILY.into()))
+}
+
+/// Install the app fonts: DejaVu Sans first (it carries the technical
+/// symbols the default font lacks), plus the bold family.
+pub fn install_fonts(ctx: &egui::Context) {
+    let mut fonts = FontDefinitions::default();
+    fonts.font_data.insert(
+        "technical_symbols".to_owned(),
+        FontData::from_static(include_bytes!("../fonts/DejaVuSans.ttf")),
+    );
+    fonts.font_data.insert(
+        "technical_bold".to_owned(),
+        FontData::from_static(include_bytes!("../fonts/DejaVuSans-Bold.ttf")),
+    );
+    for family in [FontFamily::Proportional, FontFamily::Monospace] {
+        if let Some(stack) = fonts.families.get_mut(&family) {
+            stack.insert(0, "technical_symbols".to_owned());
+        }
+    }
+    // Bold first, then the regular stack as glyph fallback.
+    let mut bold_stack = vec!["technical_bold".to_owned()];
+    if let Some(stack) = fonts.families.get(&FontFamily::Proportional) {
+        bold_stack.extend(stack.iter().cloned());
+    }
+    fonts
+        .families
+        .insert(FontFamily::Name(BOLD_FAMILY.into()), bold_stack);
+    ctx.set_fonts(fonts);
+}
 
 // ---------------------------------------------------------------------------
 // Theme Application
 // ---------------------------------------------------------------------------
 
 pub fn apply(ctx: &egui::Context) {
-    let mut visuals = Visuals::dark();
+    let mut visuals = Visuals::light();
 
     // Base fills
     visuals.panel_fill = BG_PANEL;
-    visuals.window_fill = BG_SURFACE;
-    visuals.extreme_bg_color = BG_BASE;          // Plot canvas, code editors
-    visuals.faint_bg_color = BG_PANEL;
-    visuals.code_bg_color = Color32::from_rgb(24, 24, 26);
+    visuals.window_fill = LT_WHITE;
+    visuals.extreme_bg_color = BG_BASE;          // Text editors, input fields
+    visuals.faint_bg_color = Color32::from_rgb(238, 238, 238);
+    visuals.code_bg_color = Color32::from_rgb(235, 235, 235);
 
-    // Structural chrome
+    // Structural chrome — flat, light shadows.
     visuals.window_stroke = Stroke::new(1.0, BORDER);
-    visuals.window_shadow = egui::epaint::Shadow {
-        offset: egui::vec2(0.0, 4.0),
-        blur: 12.0,
+    let shadow = egui::epaint::Shadow {
+        offset: egui::vec2(1.0, 2.0),
+        blur: 6.0,
         spread: 0.0,
-        color: Color32::from_black_alpha(120),
+        color: Color32::from_black_alpha(60),
     };
+    visuals.window_shadow = shadow;
+    visuals.popup_shadow = shadow;
 
-    // Widget state machine — five states, each a deliberate step.
+    // Widget state machine.
     // noninteractive: labels, read-only fields
     visuals.widgets.noninteractive.bg_fill = BG_PANEL;
+    visuals.widgets.noninteractive.weak_bg_fill = BG_PANEL;
     visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER_SUBTLE);
-    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_SECONDARY);
-    visuals.widgets.noninteractive.rounding = Rounding::same(2.0);
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+    visuals.widgets.noninteractive.rounding = Rounding::same(0.0);
 
     // inactive: default clickable controls
     visuals.widgets.inactive.bg_fill = BG_CONTROL;
-    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, BORDER);
+    visuals.widgets.inactive.weak_bg_fill = BG_CONTROL;
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(150, 150, 150));
     visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
-    visuals.widgets.inactive.rounding = Rounding::same(2.0);
+    visuals.widgets.inactive.rounding = Rounding::same(1.0);
 
     // hovered
     visuals.widgets.hovered.bg_fill = BG_HOVER;
-    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(88, 88, 96));
-    visuals.widgets.hovered.fg_stroke = Stroke::new(1.5, TEXT_PRIMARY);
-    visuals.widgets.hovered.rounding = Rounding::same(2.0);
+    visuals.widgets.hovered.weak_bg_fill = BG_HOVER;
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT_DIM);
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+    visuals.widgets.hovered.rounding = Rounding::same(1.0);
 
     // active (pressed / toggled on)
-    visuals.widgets.active.bg_fill = ACCENT_DIM;
-    visuals.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT);
-    visuals.widgets.active.fg_stroke = Stroke::new(1.5, Color32::WHITE);
-    visuals.widgets.active.rounding = Rounding::same(2.0);
+    visuals.widgets.active.bg_fill = Color32::from_rgb(184, 217, 252);
+    visuals.widgets.active.weak_bg_fill = Color32::from_rgb(184, 217, 252);
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT_DIM);
+    visuals.widgets.active.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+    visuals.widgets.active.rounding = Rounding::same(1.0);
 
     // open (combo boxes, drop-downs)
-    visuals.widgets.open.bg_fill = ACCENT_DIM;
-    visuals.widgets.open.bg_stroke = Stroke::new(1.0, ACCENT);
-    visuals.widgets.open.fg_stroke = Stroke::new(1.0, Color32::WHITE);
-    visuals.widgets.open.rounding = Rounding::same(2.0);
+    visuals.widgets.open.bg_fill = Color32::from_rgb(184, 217, 252);
+    visuals.widgets.open.weak_bg_fill = Color32::from_rgb(184, 217, 252);
+    visuals.widgets.open.bg_stroke = Stroke::new(1.0, ACCENT_DIM);
+    visuals.widgets.open.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
+    visuals.widgets.open.rounding = Rounding::same(1.0);
 
     // Selection / highlight
-    visuals.selection.bg_fill = ACCENT_SUBTLE;
-    visuals.selection.stroke = Stroke::new(1.0, ACCENT);
+    visuals.selection.bg_fill = Color32::from_rgb(184, 217, 252);
+    visuals.selection.stroke = Stroke::new(1.0, ACCENT_DIM);
 
     // Semantic colors
-    visuals.hyperlink_color = ACCENT;
+    visuals.hyperlink_color = ACCENT_DIM;
     visuals.warn_fg_color = STATUS_WARN;
     visuals.error_fg_color = STATUS_ERROR;
     visuals.override_text_color = Some(TEXT_PRIMARY);
 
-    // Geometry — flat, precise, instrument-like. No bubbly corners anywhere.
-    visuals.window_rounding = Rounding::same(3.0);
-    visuals.menu_rounding = Rounding::same(3.0);
+    // Geometry — square, like the reference's native widgets.
+    visuals.window_rounding = Rounding::same(0.0);
+    visuals.menu_rounding = Rounding::same(0.0);
 
     ctx.set_visuals(visuals);
 
@@ -125,44 +197,22 @@ pub fn apply(ctx: &egui::Context) {
     // -----------------------------------------------------------------------
     let mut style = (*ctx.style()).clone();
 
-    // Scrollbars — thin, unobtrusive (field lives on Spacing in egui ≥0.27)
-    style.spacing.scroll.bar_width = 6.0;
+    style.spacing.scroll.bar_width = 8.0;
     style.spacing.scroll.handle_min_length = 24.0;
 
-    // Compact but breathable — maximises schematic/waveform real estate.
-    style.spacing.item_spacing = egui::vec2(6.0, 5.0);
-    style.spacing.button_padding = egui::vec2(10.0, 4.0);
-    style.spacing.window_margin = egui::Margin::same(10.0);
-    style.spacing.menu_margin = egui::Margin::same(4.0);
+    style.spacing.item_spacing = egui::vec2(6.0, 4.0);
+    style.spacing.button_padding = egui::vec2(8.0, 3.0);
+    style.spacing.window_margin = egui::Margin::same(8.0);
+    style.spacing.menu_margin = egui::Margin::same(2.0);
     style.spacing.indent = 14.0;
-    style.spacing.interact_size.y = 22.0;   // Tighter row height for property lists
+    style.spacing.interact_size.y = 20.0;
 
-    // Font scale: readable but data-dense.
-    // Heading: section labels in sidebars / inspector panels.
-    style.text_styles.insert(
-        TextStyle::Heading,
-        FontId::new(13.0, FontFamily::Proportional),
-    );
-    // Body: property values, netlists, log output.
-    style.text_styles.insert(
-        TextStyle::Body,
-        FontId::new(12.0, FontFamily::Proportional),
-    );
-    // Monospace: SPICE netlists, expression editor, node names.
-    style.text_styles.insert(
-        TextStyle::Monospace,
-        FontId::new(11.0, FontFamily::Monospace),
-    );
-    // Button: toolbar actions, dialog buttons.
-    style.text_styles.insert(
-        TextStyle::Button,
-        FontId::new(12.0, FontFamily::Proportional),
-    );
-    // Small: status bar, coordinate readout, zoom level.
-    style.text_styles.insert(
-        TextStyle::Small,
-        FontId::new(10.5, FontFamily::Proportional),
-    );
+    // Font scale: small and data-dense like the reference.
+    style.text_styles.insert(TextStyle::Heading, FontId::new(13.0, FontFamily::Proportional));
+    style.text_styles.insert(TextStyle::Body, FontId::new(12.0, FontFamily::Proportional));
+    style.text_styles.insert(TextStyle::Monospace, FontId::new(12.0, FontFamily::Monospace));
+    style.text_styles.insert(TextStyle::Button, FontId::new(12.0, FontFamily::Proportional));
+    style.text_styles.insert(TextStyle::Small, FontId::new(10.5, FontFamily::Proportional));
 
     ctx.set_style(style);
 }
@@ -171,39 +221,27 @@ pub fn apply(ctx: &egui::Context) {
 // Frame Constructors
 // ---------------------------------------------------------------------------
 
-/// Standard elevated card — property inspector, component detail panels.
+/// Standard card — result tables and property panels (white on the gray workspace).
 pub fn card_frame() -> egui::Frame {
     egui::Frame::none()
         .fill(BG_SURFACE)
         .stroke(Stroke::new(1.0, BORDER))
-        .rounding(Rounding::same(3.0))
+        .rounding(Rounding::same(0.0))
         .inner_margin(egui::Margin::same(10.0))
 }
 
-/// Sidebar / toolbar panel. Caller provides the fill from the surface hierarchy.
-pub fn panel_frame(fill: Color32) -> egui::Frame {
-    egui::Frame::none()
-        .fill(fill)
-        .stroke(Stroke::new(1.0, BORDER))
-        .inner_margin(egui::Margin::symmetric(10.0, 7.0))
+/// Flat bar (menu bar, toolbar, tab strip, status bar): fill + margin, no outline.
+pub fn bar_frame(fill: Color32, margin: egui::Margin) -> egui::Frame {
+    egui::Frame::none().fill(fill).inner_margin(margin)
 }
 
-/// Main schematic / waveform canvas — near-black, zero rounding, sharp boundary.
-pub fn editor_frame() -> egui::Frame {
-    egui::Frame::none()
-        .fill(BG_BASE)
-        .stroke(Stroke::new(1.0, BORDER))
-        .rounding(Rounding::same(0.0))
-        .inner_margin(egui::Margin::same(0.0))
-}
-
-/// Inset panel for SPICE netlist / expression editors.
+/// Waveform viewer surface — black, edge to edge, like the reference.
 pub fn code_frame() -> egui::Frame {
     egui::Frame::none()
-        .fill(Color32::from_rgb(24, 24, 26))
-        .stroke(Stroke::new(1.0, BORDER_SUBTLE))
-        .rounding(Rounding::same(2.0))
-        .inner_margin(egui::Margin::same(8.0))
+        .fill(LT_PLOT_BG)
+        .stroke(Stroke::new(1.0, LT_PLOT_FRAME))
+        .rounding(Rounding::same(0.0))
+        .inner_margin(egui::Margin::same(0.0))
 }
 
 // ---------------------------------------------------------------------------

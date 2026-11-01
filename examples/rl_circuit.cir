@@ -1,7 +1,10 @@
 * RL circuit — DC (inductor shorts) and transient
+* UIC starts L1 with no current, so the transient shows the current rising with
+* tau = L/R = 10 us; 100 us is ten time constants. Without UIC the run begins at
+* the DC operating point, where L1 already carries the full 120 mA.
 V1 1 0 DC 12
 R1 1 2 100
 L1 2 0 1m
 .op
-.tran 1u 1m
+.tran 1u 100u UIC
 .end

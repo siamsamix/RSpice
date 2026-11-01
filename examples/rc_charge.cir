@@ -1,6 +1,8 @@
 * RC charging circuit — transient
+* UIC starts C1 uncharged (0 V); without it the run begins at the DC operating
+* point, where the capacitor is already charged and the trace is a flat 5 V line.
 V1 1 0 DC 5
 R1 1 2 1k
 C1 2 0 1u
-.tran 10u 5m
+.tran 10u 5m UIC
 .end

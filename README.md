@@ -118,9 +118,12 @@ that (bad count, zero or negative increment, empty LIST) are errors, never ignor
 V1 in 0 DC 5 ; drive node "in"
 R1 in 2 {r}
 C1 2 0 1u
-.tran 10u 5m
+.tran 10u 5m UIC
 .end
 ```
+
+`UIC` starts the capacitor uncharged. Like SPICE and LTspice, `.tran` otherwise begins at the
+DC operating point, where a DC-driven RC has long since settled and the trace is a flat line.
 
 CLI: the summary and tables print named nodes; waveform CSV keeps the deck's node names.
 

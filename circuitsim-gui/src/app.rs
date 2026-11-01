@@ -200,11 +200,12 @@ impl Example {
             }
             Example::RlCircuit => {
                 r#"* RL circuit
+                * UIC starts L1 with no current; tau = L/R = 10 us, so 100 us is ten time constants
                 V1 1 0 DC 12
                 R1 1 2 100
                 L1 2 0 1m
                 .op
-                .tran 1u 1m
+                .tran 1u 100u UIC
                 .end
                 "#
             }
@@ -2458,5 +2459,32 @@ mod tests {
     #[test]
     fn rc_charge_example_charges_from_zero() {
         assert_rc_charges_from_zero(Example::RcCharge.netlist());
+    }
+
+    /// The RL example must energise L1 from no current: V(2) = L·di/dt starts
+    /// near the 12 V source and decays to ~0 as the current reaches 120 mA.
+    /// Started from the DC operating point the inductor already shorts node 2
+    /// to ground, so V(2) is a flat 0 V line.
+    #[test]
+    fn rl_example_energises_from_zero() {
+        let parsed = parse(Example::RlCircuit.netlist()).expect("deck parses");
+        let tran = run(&parsed).expect("deck runs").tran.expect("transient result");
+        let first = tran.points.first().unwrap();
+        let last = tran.points.last().unwrap();
+        assert!(
+            first.branch_currents.inductors[0].abs() < 1e-6,
+            "L1 should start with no current, got {}",
+            first.branch_currents.inductors[0]
+        );
+        let tau = 1e-3 / 100.0;
+        let expected = 0.12 * (1.0 - (-last.time / tau).exp());
+        assert!(
+            (last.branch_currents.inductors[0] - expected).abs() < 1e-3 * 0.12,
+            "I(L1) at {} s should be {expected}, got {}",
+            last.time,
+            last.branch_currents.inductors[0]
+        );
+        let peak = tran.points.iter().map(|p| p.node_voltages[2]).fold(0.0_f64, f64::max);
+        assert!(peak > 5.0, "V(2) should spike toward the source voltage, peak {peak}");
     }
 }

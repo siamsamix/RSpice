@@ -55,6 +55,22 @@ C1 out 0 1u
 }
 
 #[test]
+fn rc_charge_example_starts_uncharged() {
+    // The deck is DC-driven; only `UIC` makes the transient a charging curve
+    // instead of a flat line at the operating point.
+    let n = simulate_example("rc_charge.cir");
+    let r = run(&n).unwrap();
+    let tran = r.tran.unwrap();
+    let cap = node(&n, "2");
+    let first = tran.points.first().unwrap();
+    let last = tran.points.last().unwrap();
+    assert_relative_eq!(first.node_voltages[cap], 0.0, epsilon = 1e-6);
+    // τ = 1 kΩ · 1 µF = 1 ms, tstop = 5 ms.
+    let analytic = 5.0 * (1.0 - (-last.time / 1.0e-3f64).exp());
+    assert_relative_eq!(last.node_voltages[cap], analytic, epsilon = 1e-2);
+}
+
+#[test]
 fn rl_step_matches_analytic_current() {
     let n = simulate_example("rl_circuit.cir");
     let r = run(&n).unwrap();

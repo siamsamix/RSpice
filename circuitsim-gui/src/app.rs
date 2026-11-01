@@ -232,7 +232,7 @@ impl Example {
     }
 }
 
-#[derive(Default, Clone, Copy, PartialEq, Eq)]
+#[derive(Default, Clone, Copy, PartialEq, Eq, Debug)]
 enum ResultTab {
     #[default]
     Overview,
@@ -334,28 +334,44 @@ impl CircuitSimApp {
 
         Self::default()
     }
-    fn generate_netlist_from_schematic(&mut self) {
+    /// Rebuild the netlist text from the schematic. Returns whether it worked:
+    /// on failure the netlist is untouched and the status says why, so callers
+    /// switch to the netlist only when this returns `true`.
+    fn generate_netlist_from_schematic(&mut self) -> bool {
         match self.schematic.build_netlist() {
             Ok(netlist) => {
                 self.netlist = netlist_emit(&netlist);
                 self.status = Some((true, "Generated netlist from schematic".into()));
+                true
             }
             Err(e) => {
                 self.status = Some((false, format!("Cannot generate netlist: {e}")));
+                false
             }
         }
     }
 
     /// Parse the current netlist text and rebuild the schematic from it —
-    /// the column/interval layout lives with the IR in [`crate::schematic`];
-    /// this shell only reports the outcome.
-    fn generate_schematic_from_netlist(&mut self) {
-        match SchematicState::from_netlist(&self.netlist, &self.schematic) {
-            Ok((schematic, status)) => {
-                self.schematic = schematic;
+    /// the column/interval layout lives with the IR in [`crate::schematic`].
+    /// `Ok` carries the import summary; on `Err` the schematic is untouched.
+    fn import_schematic(&mut self) -> Result<String, String> {
+        let (schematic, status) = SchematicState::from_netlist(&self.netlist, &self.schematic)?;
+        self.schematic = schematic;
+        Ok(status)
+    }
+
+    /// [`Self::import_schematic`] reporting through the status line. Returns
+    /// whether it worked, so callers switch to the schematic only then.
+    fn generate_schematic_from_netlist(&mut self) -> bool {
+        match self.import_schematic() {
+            Ok(status) => {
                 self.status = Some((true, status));
+                true
             }
-            Err(e) => self.status = Some((false, e)),
+            Err(e) => {
+                self.status = Some((false, e));
+                false
+            }
         }
     }
 
@@ -421,11 +437,28 @@ impl CircuitSimApp {
         for i in 1..max_nodes.min(self.ac_plot_nodes.len()) {
             self.ac_plot_nodes[i] = i <= 3;
         }
+        self.result_tab = self.tab_for_new_results();
+    }
+
+    /// The tab a freshly applied result opens on. AC and DC-sweep runs jump
+    /// to their own view; otherwise the current tab stays only if the new
+    /// result has something to show there. Without that, an AC run followed
+    /// by a transient one would keep an empty Frequency tab open.
+    fn tab_for_new_results(&self) -> ResultTab {
         if self.ac.is_some() {
-            self.result_tab = ResultTab::FreqResponse;
-        } else if self.dc_sweep.is_some() && self.tran.is_none() {
-            self.result_tab = ResultTab::Dc;
+            return ResultTab::FreqResponse;
         }
+        if self.dc_sweep.is_some() && self.tran.is_none() {
+            return ResultTab::Dc;
+        }
+        let has_content = match self.result_tab {
+            ResultTab::Overview => true,
+            ResultTab::Dc => self.dc.is_some() || self.dc_sweep.is_some(),
+            ResultTab::Waveforms => self.tran.is_some(),
+            // `self.ac` is `None` here, so there is no frequency response.
+            ResultTab::FreqResponse => false,
+        };
+        if has_content { self.result_tab } else { ResultTab::Overview }
     }
 
     fn clear_results(&mut self) {
@@ -441,8 +474,31 @@ impl CircuitSimApp {
         self.netlist = ex.netlist().to_string();
         self.file_label = format!("{}.cir", ex.label().to_lowercase().replace(' ', "_"));
         self.status = Some((true, format!("Loaded example: {}", ex.label())));
-        self.generate_schematic_from_netlist();
+        if !self.generate_schematic_from_netlist() {
+            // The schematic could not follow the deck; show the deck itself
+            // rather than a circuit that no longer belongs to it.
+            self.show_netlist();
+        }
         self.clear_results();
+    }
+
+    /// Make `text` the open document. The results belong to the old deck and
+    /// are cleared; the schematic follows the new deck, and a deck it cannot
+    /// draw still opens — as text, over an empty canvas, never over the
+    /// previous document's circuit. The netlist is what the user sees next.
+    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
+    fn adopt_document(&mut self, text: String, label: String) {
+        self.netlist = text;
+        self.file_label = label;
+        self.clear_results();
+        self.status = Some(match self.import_schematic() {
+            Ok(_) => (true, format!("Opened {}", self.file_label)),
+            Err(e) => {
+                self.schematic = SchematicState::default();
+                (true, format!("Opened {} (schematic not drawn: {e})", self.file_label))
+            }
+        });
+        self.show_netlist();
     }
 
     fn open_file(&mut self) {
@@ -453,13 +509,11 @@ impl CircuitSimApp {
             {
                 match std::fs::read_to_string(&path) {
                     Ok(text) => {
-                        self.netlist = text;
-                        self.file_label = path
+                        let label = path
                         .file_name()
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_else(|| "circuit.cir".into());
-                        self.status = Some((true, format!("Opened {}", self.file_label)));
-                        self.clear_results();
+                        self.adopt_document(text, label);
                     }
                     Err(e) => self.status = Some((false, e.to_string())),
                 }
@@ -610,14 +664,59 @@ impl CircuitSimApp {
         self.active_pane = Pane::Editor;
     }
 
+    /// Tools ▸ Import Netlist to Schematic. Switches to the schematic only if
+    /// the import worked; after a failure the user stays with the netlist, so
+    /// the error and its cause are side by side rather than the old circuit
+    /// being shown as if it were the result.
+    fn import_and_show_schematic(&mut self) {
+        if self.generate_schematic_from_netlist() {
+            self.show_schematic();
+        } else {
+            self.show_netlist();
+        }
+    }
+
+    /// Tools ▸ Generate Netlist from Schematic; the mirror of
+    /// [`Self::import_and_show_schematic`].
+    fn generate_and_show_netlist(&mut self) {
+        if self.generate_netlist_from_schematic() {
+            self.show_netlist();
+        } else {
+            self.show_schematic();
+        }
+    }
+
     /// Pick a schematic tool, opening the schematic window if needed.
     fn pick_tool(&mut self, tool: Tool) {
         self.schematic.select_tool(tool);
         self.show_schematic();
     }
 
+    /// Rotate the selected part (or the next placement). Schematic edits act
+    /// only while the schematic window is the active one: with Results
+    /// focused, Space or the Edit menu must not change a circuit that is
+    /// merely visible beside it.
+    fn rotate_selection(&mut self) {
+        if self.schematic_active() {
+            self.schematic.rotate_or_advance();
+        }
+    }
+
+    /// Delete the selected wire or part — only from the active schematic
+    /// window (see [`Self::rotate_selection`]).
+    fn delete_selection(&mut self) {
+        if self.schematic_active() {
+            self.schematic.delete_selection();
+        }
+    }
+
     /// After a successful run the waveform window opens beside the editor
     /// and takes focus, as LTspice's does.
+    ///
+    /// Only a run started from the maximised editor re-tiles: that is the
+    /// moment the waveform window appears. A Results window the user has
+    /// maximised themselves stays maximised on a re-run — the editor is one
+    /// tab away, and un-maximising it would undo their layout choice.
     fn show_results_after_run(&mut self) {
         if self.has_results() {
             if self.tiling == Tiling::Single && self.active_pane == Pane::Editor {
@@ -697,14 +796,15 @@ impl CircuitSimApp {
             });
 
             ui.menu_button("Edit", |ui| {
+                let can_edit = self.schematic_active();
                 let has_component = self.schematic.selected_component.is_some();
                 let has_selection = has_component || self.schematic.selected_wire.is_some();
-                if ui.add_enabled(has_component, egui::Button::new("Rotate").shortcut_text("Space")).clicked() {
-                    self.schematic.rotate_or_advance();
+                if ui.add_enabled(can_edit && has_component, egui::Button::new("Rotate").shortcut_text("Space")).clicked() {
+                    self.rotate_selection();
                     ui.close_menu();
                 }
-                if ui.add_enabled(has_selection, egui::Button::new("Delete").shortcut_text("Del")).clicked() {
-                    self.schematic.delete_selection();
+                if ui.add_enabled(can_edit && has_selection, egui::Button::new("Delete").shortcut_text("Del")).clicked() {
+                    self.delete_selection();
                     ui.close_menu();
                 }
                 ui.separator();
@@ -754,13 +854,11 @@ impl CircuitSimApp {
 
             ui.menu_button("Tools", |ui| {
                 if ui.button("Import Netlist to Schematic").clicked() {
-                    self.generate_schematic_from_netlist();
-                    self.show_schematic();
+                    self.import_and_show_schematic();
                     ui.close_menu();
                 }
                 if ui.button("Generate Netlist from Schematic").clicked() {
-                    self.generate_netlist_from_schematic();
-                    self.show_netlist();
+                    self.generate_and_show_netlist();
                     ui.close_menu();
                 }
             });
@@ -869,11 +967,11 @@ impl CircuitSimApp {
 
             let has_component = self.schematic.selected_component.is_some();
             let has_selection = has_component || self.schematic.selected_wire.is_some();
-            if icon_button(ui, Icon::Rotate, "Rotate (Space)", false, true).clicked() {
-                self.schematic.rotate_or_advance();
+            if icon_button(ui, Icon::Rotate, "Rotate (Space)", false, schematic).clicked() {
+                self.rotate_selection();
             }
-            if icon_button(ui, Icon::Delete, "Delete selection (Del)", false, has_selection).clicked() {
-                self.schematic.delete_selection();
+            if icon_button(ui, Icon::Delete, "Delete selection (Del)", false, schematic && has_selection).clicked() {
+                self.delete_selection();
             }
         });
     }
@@ -1065,7 +1163,7 @@ impl CircuitSimApp {
         // Spacebar rotates the selection (or the next placement) — unless a
         // text field has focus, where Space is just a character.
         if !ui.ctx().wants_keyboard_input() && ui.input(|i| i.key_pressed(egui::Key::Space)) {
-            self.schematic.rotate_or_advance();
+            self.rotate_selection();
         }
 
         // Simulation command strip (LTspice's "Edit Simulation Command"): the
@@ -1078,8 +1176,7 @@ impl CircuitSimApp {
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal_wrapped(|ui| {
-                if ui.button("Generate Netlist").clicked() {
-                    self.generate_netlist_from_schematic();
+                if ui.button("Generate Netlist").clicked() && self.generate_netlist_from_schematic() {
                     self.editor_mode = EditorMode::Text;
                 }
 
@@ -1623,7 +1720,7 @@ impl CircuitSimApp {
         // Delete key removes selected wire or component
         // (Skipped while a text field has focus: Delete there edits the text.)
         if !ui.ctx().wants_keyboard_input() && ui.input(|i| i.key_pressed(egui::Key::Delete)) {
-            self.schematic.delete_selection();
+            self.delete_selection();
         }
 
         // Wire selection popup — shows near the wire midpoint
@@ -2490,5 +2587,152 @@ mod tests {
         );
         let peak = tran.points.iter().map(|p| p.node_voltages[2]).fold(0.0_f64, f64::max);
         assert!(peak > 5.0, "V(2) should spike toward the source voltage, peak {peak}");
+    }
+
+    // ── Editor / pane handling ──────────────────────────────────────────────
+
+    use crate::schematic::{CompKind, Component, GridPt};
+
+    const RC_DECK: &str = "V1 1 0 DC 5\nR1 1 2 1k\nC1 2 0 1u\n.tran 10u 5m UIC\n.end\n";
+    /// A resistor card with a missing value: neither parseable nor drawable.
+    const BAD_DECK: &str = "R1 1\n.end\n";
+
+    fn resistor(val: &str) -> Component {
+        Component { kind: CompKind::Resistor, p1: GridPt(2, 2), p2: GridPt(5, 2), val: val.into() }
+    }
+
+    fn status_is_error(app: &CircuitSimApp) -> bool {
+        matches!(app.status, Some((false, _)))
+    }
+
+    /// With Results active, a schematic that is merely visible beside it must
+    /// not be rotated or deleted by Space, Delete or the Edit menu.
+    #[test]
+    fn schematic_edits_ignore_a_hidden_schematic() {
+        let mut app = CircuitSimApp::default();
+        app.schematic.components = vec![resistor("1k")];
+        app.schematic.selected_component = Some(0);
+        app.editor_mode = EditorMode::Schematic;
+        app.active_pane = Pane::Results;
+
+        let before = app.schematic.components[0].p2;
+        app.rotate_selection();
+        app.delete_selection();
+        assert!(app.schematic.components[0].p2 == before, "rotated while Results was active");
+        assert_eq!(app.schematic.components.len(), 1, "deleted while Results was active");
+
+        // The same calls act once the schematic window is the active one.
+        app.active_pane = Pane::Editor;
+        app.rotate_selection();
+        assert!(app.schematic.components[0].p2 != before, "rotation ignored in the active window");
+        app.delete_selection();
+        assert!(app.schematic.components.is_empty(), "delete ignored in the active window");
+    }
+
+    #[test]
+    fn schematic_edits_ignore_the_text_editor() {
+        let mut app = CircuitSimApp::default();
+        app.schematic.components = vec![resistor("1k")];
+        app.schematic.selected_component = Some(0);
+        app.show_netlist();
+        app.delete_selection();
+        assert_eq!(app.schematic.components.len(), 1);
+    }
+
+    #[test]
+    fn failed_import_leaves_the_user_on_the_netlist() {
+        assert!(parse(BAD_DECK).is_err(), "fixture must not parse");
+        let mut app = CircuitSimApp::default();
+        app.schematic.components = vec![resistor("1k")];
+        app.netlist = BAD_DECK.into();
+        app.show_schematic();
+        app.import_and_show_schematic();
+        assert!(app.editor_mode == EditorMode::Text, "switched to a stale schematic");
+        assert_eq!(app.schematic.components.len(), 1, "schematic modified by a failed import");
+        assert!(status_is_error(&app));
+    }
+
+    #[test]
+    fn failed_generation_leaves_the_user_on_the_schematic() {
+        let mut app = CircuitSimApp::default();
+        app.schematic.components = vec![resistor("abc")];
+        assert!(app.schematic.build_netlist().is_err(), "fixture must not build");
+        app.netlist = "original".into();
+        app.show_netlist();
+        app.generate_and_show_netlist();
+        assert!(app.editor_mode == EditorMode::Schematic, "switched to a stale netlist");
+        assert_eq!(app.netlist, "original");
+        assert!(status_is_error(&app));
+    }
+
+    #[test]
+    fn successful_conversions_switch_to_the_result() {
+        let mut app = CircuitSimApp::default();
+        app.netlist = RC_DECK.into();
+        app.show_netlist();
+        app.import_and_show_schematic();
+        assert!(app.editor_mode == EditorMode::Schematic);
+        assert!(app.schematic.components.iter().any(|c| c.kind == CompKind::Capacitor));
+        app.generate_and_show_netlist();
+        assert!(app.editor_mode == EditorMode::Text);
+        assert!(app.netlist.contains("C1"), "{}", app.netlist);
+    }
+
+    /// Opening a deck while the schematic is showing must not leave the old
+    /// circuit on screen under the new document's `.asc` title.
+    #[test]
+    fn opening_a_deck_replaces_the_schematic_and_shows_the_netlist() {
+        let mut app = CircuitSimApp::default();
+        app.schematic.components = vec![resistor("1k")];
+        app.show_schematic();
+        app.adopt_document(RC_DECK.into(), "rc.cir".into());
+        assert!(app.editor_mode == EditorMode::Text);
+        assert_eq!(app.file_label, "rc.cir");
+        assert_eq!(app.netlist, RC_DECK);
+        assert!(
+            app.schematic.components.iter().any(|c| c.kind == CompKind::Capacitor),
+            "schematic still shows the previous document"
+        );
+        assert!(matches!(app.status, Some((true, _))));
+    }
+
+    #[test]
+    fn opening_an_undrawable_deck_opens_it_over_an_empty_schematic() {
+        let mut app = CircuitSimApp::default();
+        app.schematic.components = vec![resistor("1k")];
+        app.show_schematic();
+        app.adopt_document(BAD_DECK.into(), "bad.cir".into());
+        assert!(app.editor_mode == EditorMode::Text);
+        assert_eq!(app.netlist, BAD_DECK);
+        assert!(app.schematic.components.is_empty(), "previous document's circuit left behind");
+        match &app.status {
+            Some((true, msg)) => assert!(msg.contains("schematic not drawn"), "{msg}"),
+            other => panic!("expected an Opened status, got {other:?}"),
+        }
+    }
+
+    // ── Result tab across runs ──────────────────────────────────────────────
+
+    #[test]
+    fn result_tab_follows_the_new_run() {
+        let mut app = CircuitSimApp::default();
+        app.netlist = Example::RcLowPass.netlist().into();
+        app.run_simulation();
+        assert_eq!(app.result_tab, ResultTab::FreqResponse);
+
+        // A transient run has no frequency response: the tab must not stay there.
+        app.netlist = Example::RcCharge.netlist().into();
+        app.run_simulation();
+        assert_eq!(app.result_tab, ResultTab::Overview);
+
+        // A tab the new result can fill is kept…
+        app.result_tab = ResultTab::Waveforms;
+        app.run_simulation();
+        assert_eq!(app.result_tab, ResultTab::Waveforms);
+
+        // …and one it cannot is not.
+        app.netlist = Example::VoltageDivider.netlist().into();
+        app.run_simulation();
+        assert_eq!(app.result_tab, ResultTab::Overview);
     }
 }

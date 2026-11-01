@@ -363,7 +363,9 @@ pub fn tran_voltage_series(
         }
         out.push(PlotSeries {
             name: format!("V({})", node_name(names, node)),
-            color: PLOT_COLORS[(node - 1) % PLOT_COLORS.len()],
+            // By emitted order, not node number: the first trace on screen is
+            // always green, whichever node it is (as in LTspice).
+            color: PLOT_COLORS[out.len() % PLOT_COLORS.len()],
             points: tran
                 .points
                 .iter()
@@ -499,7 +501,9 @@ pub fn ac_voltage_series(
         };
         out.push(PlotSeries {
             name: format!("V({}){suffix}", node_name(names, node)),
-            color: PLOT_COLORS[(node - 1) % PLOT_COLORS.len()],
+            // By emitted order, not node number: the first trace on screen is
+            // always green, whichever node it is (as in LTspice).
+            color: PLOT_COLORS[out.len() % PLOT_COLORS.len()],
             points: ac
                 .points
                 .iter()
@@ -588,7 +592,9 @@ pub fn dc_sweep_series(
         }
         out.push(PlotSeries {
             name: format!("V({})", node_name(names, node)),
-            color: PLOT_COLORS[(node - 1) % PLOT_COLORS.len()],
+            // By emitted order, not node number: the first trace on screen is
+            // always green, whichever node it is (as in LTspice).
+            color: PLOT_COLORS[out.len() % PLOT_COLORS.len()],
             points: sweep
                 .points
                 .iter()
@@ -600,4 +606,54 @@ pub fn dc_sweep_series(
         });
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use circuitsim::{parse, run};
+
+    /// Three-node chain, so a plot can omit node 1 and still have traces.
+    const NODES_ONLY_2_AND_3: [bool; 4] = [false, false, true, true];
+
+    fn names(netlist: &circuitsim::Netlist) -> Vec<String> {
+        netlist.circuit.node_names.clone()
+    }
+
+    /// Whatever node a plot starts at, its first trace is the palette's
+    /// first colour (green) and the rest follow in emitted order.
+    fn assert_colours_follow_emitted_order(series: &[PlotSeries]) {
+        assert_eq!(series.len(), 2, "two nodes enabled");
+        assert_eq!(series[0].color, PLOT_COLORS[0], "{}", series[0].name);
+        assert_eq!(series[1].color, PLOT_COLORS[1], "{}", series[1].name);
+    }
+
+    #[test]
+    fn transient_voltage_colours_follow_emitted_order() {
+        let n = parse("V1 1 0 DC 5\nR1 1 2 1k\nR2 2 3 1k\nC1 3 0 1u\n.tran 10u 1m UIC\n.end\n")
+            .expect("deck parses");
+        let tran = run(&n).expect("deck runs").tran.expect("transient result");
+        let series = tran_voltage_series(&tran, &NODES_ONLY_2_AND_3, &names(&n), 1.0, 1.0);
+        assert_colours_follow_emitted_order(&series);
+    }
+
+    #[test]
+    fn ac_voltage_colours_follow_emitted_order() {
+        let n = parse("V1 1 0 AC 1\nR1 1 2 1k\nR2 2 3 1k\nC1 3 0 100n\n.ac dec 5 10 100k\n.end\n")
+            .expect("deck parses");
+        let ac = run(&n).expect("deck runs").ac.expect("ac result");
+        let series = ac_voltage_series(
+            &ac, &NODES_ONLY_2_AND_3, &names(&n), AcQuantity::MagnitudeDb, 1.0, 1.0, false,
+        );
+        assert_colours_follow_emitted_order(&series);
+    }
+
+    #[test]
+    fn dc_sweep_voltage_colours_follow_emitted_order() {
+        let n = parse("V1 1 0 DC 0\nR1 1 2 1k\nR2 2 3 1k\nR3 3 0 1k\n.dc V1 0 5 1\n.end\n")
+            .expect("deck parses");
+        let sweep = run(&n).expect("deck runs").dc_sweep.expect("dc sweep result");
+        let series = dc_sweep_series(&sweep, &NODES_ONLY_2_AND_3, &names(&n), 1.0, 1.0);
+        assert_colours_follow_emitted_order(&series);
+    }
 }

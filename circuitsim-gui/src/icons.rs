@@ -272,10 +272,20 @@ fn paint(painter: &Painter, rect: Rect, icon: Icon, enabled: bool) {
 mod tests {
     use super::*;
 
-    /// Every icon paints without panicking at toolbar and tab sizes, and
-    /// disabled variants paint too.
+    /// Paint `icon` alone on a bare layer — no panel, so nothing else in the
+    /// frame draws — and return the shapes it produced.
+    fn paint_alone(ctx: &egui::Context, rect: Rect, icon: Icon, enabled: bool) -> Vec<egui::epaint::ClippedShape> {
+        ctx.run(egui::RawInput::default(), |ctx| {
+            let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("icon_test"));
+            paint(&ctx.layer_painter(layer), rect, icon, enabled);
+        })
+        .shapes
+    }
+
+    /// Every icon, enabled or disabled, at toolbar and tab sizes, draws
+    /// something — and only inside its own square.
     #[test]
-    fn all_icons_paint() {
+    fn all_icons_paint_inside_their_rect() {
         let ctx = egui::Context::default();
         crate::theme::install_fonts(&ctx);
         let icons = [
@@ -285,17 +295,36 @@ mod tests {
             Icon::Resistor, Icon::Capacitor, Icon::Inductor, Icon::Voltage, Icon::Rotate,
             Icon::Delete, Icon::Schematic, Icon::Netlist, Icon::Waveform,
         ];
-        let out = ctx.run(egui::RawInput::default(), |ctx| {
-            egui::CentralPanel::default().show(ctx, |ui| {
-                for icon in icons {
-                    for size in [16.0, 24.0] {
-                        let r = Rect::from_min_size(egui::pos2(10.0, 10.0), vec2(size, size));
-                        paint(ui.painter(), r, icon, true);
-                        paint(ui.painter(), r, icon, false);
+        for (n, icon) in icons.into_iter().enumerate() {
+            for size in [16.0, 24.0] {
+                for enabled in [true, false] {
+                    let rect = Rect::from_min_size(egui::pos2(10.0, 10.0), vec2(size, size));
+                    let shapes = paint_alone(&ctx, rect, icon, enabled);
+                    assert!(
+                        !shapes.is_empty(),
+                        "icon #{n} (size {size}, enabled {enabled}) painted nothing"
+                    );
+                    for clipped in &shapes {
+                        let bounds = clipped.shape.visual_bounding_rect();
+                        assert!(
+                            rect.expand(2.0).contains_rect(bounds),
+                            "icon #{n} (size {size}) drew outside its {rect:?}: {bounds:?}"
+                        );
                     }
                 }
-            });
+            }
+        }
+    }
+
+    /// The harness itself must see a no-op: if painting nothing also produced
+    /// shapes, the test above could not fail.
+    #[test]
+    fn an_empty_frame_has_no_shapes() {
+        let ctx = egui::Context::default();
+        let out = ctx.run(egui::RawInput::default(), |ctx| {
+            let layer = egui::LayerId::new(egui::Order::Foreground, egui::Id::new("icon_test"));
+            let _unused = ctx.layer_painter(layer);
         });
-        assert!(!out.shapes.is_empty());
+        assert!(out.shapes.is_empty());
     }
 }

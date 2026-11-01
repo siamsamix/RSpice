@@ -20,6 +20,12 @@ pub const GRID_SIZE: f32 = 20.0;
 pub const MIN_ZOOM: f32 = 0.2;
 pub const MAX_ZOOM: f32 = 5.0;
 
+/// Pixels kept clear on every side when zooming to fit.
+const FIT_MARGIN: f32 = 60.0;
+/// Zoom-to-fit never magnifies past this: a lone part (or a single point)
+/// would otherwise "fit" at the zoom limit.
+const FIT_MAX_ZOOM: f32 = 2.0;
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GridPt(pub i32, pub i32);
 
@@ -511,12 +517,10 @@ impl SchematicState {
             self.pan = Vec2::ZERO;
             return;
         };
-        let margin = 60.0;
-        let avail = (canvas - Vec2::splat(2.0 * margin)).max(Vec2::splat(20.0));
+        let avail = (canvas - Vec2::splat(2.0 * FIT_MARGIN)).max(Vec2::splat(20.0));
         let zx = if bounds.width() > 0.0 { avail.x / bounds.width() } else { f32::MAX };
         let zy = if bounds.height() > 0.0 { avail.y / bounds.height() } else { f32::MAX };
-        // A lone point would "fit" at the zoom limit; cap the fit at 2x.
-        let zoom = zx.min(zy).clamp(MIN_ZOOM, 2.0);
+        let zoom = zx.min(zy).clamp(MIN_ZOOM, FIT_MAX_ZOOM);
         self.zoom = zoom;
         self.pan = canvas / 2.0 - bounds.center().to_vec2() * zoom;
     }
@@ -1024,9 +1028,58 @@ mod tests {
         let center = (top_left + bottom_right) / 2.0;
         assert!((center - canvas / 2.0).length() < 1.0, "{center:?}");
 
+        // Contained and centred holds at any scale, so also pin the scale: this
+        // 60 x 200 px circuit is limited by height, 380 px of a 500 px canvas.
+        assert_zoom_is(&st, expected_fit_zoom(b, canvas));
+        assert!(st.zoom > MIN_ZOOM && st.zoom < FIT_MAX_ZOOM, "zoom {}", st.zoom);
+
         st.components.clear();
         st.wires.clear();
         st.fit_view(canvas);
         assert_eq!((st.zoom, st.pan), (1.0, Vec2::ZERO));
+    }
+
+    /// The scale `fit_view` should choose: the largest that keeps `bounds`
+    /// inside the margins, within the fit limits.
+    fn expected_fit_zoom(bounds: egui::Rect, canvas: Vec2) -> f32 {
+        let avail = canvas - Vec2::splat(2.0 * FIT_MARGIN);
+        (avail.x / bounds.width())
+            .min(avail.y / bounds.height())
+            .clamp(MIN_ZOOM, FIT_MAX_ZOOM)
+    }
+
+    fn assert_zoom_is(st: &SchematicState, expected: f32) {
+        assert!((st.zoom - expected).abs() < 1e-4, "zoom {} but expected {expected}", st.zoom);
+    }
+
+    /// Zoom-to-fit on a lone vertical wire of `len` grid units.
+    fn fit_wire(len: i32, canvas: Vec2) -> (SchematicState, egui::Rect) {
+        let mut st = SchematicState::default();
+        st.wires = vec![Wire { p1: GridPt(0, 0), p2: GridPt(0, len) }];
+        st.fit_view(canvas);
+        let bounds = st.content_bounds().unwrap();
+        (st, bounds)
+    }
+
+    #[test]
+    fn fit_view_scales_large_content_down_to_the_canvas() {
+        // 1200 px tall in a 380 px band: between the limits, so exactly 380/1200.
+        let canvas = Vec2::new(800.0, 500.0);
+        let (st, bounds) = fit_wire(60, canvas);
+        assert_zoom_is(&st, 380.0 / 1200.0);
+        assert_zoom_is(&st, expected_fit_zoom(bounds, canvas));
+    }
+
+    #[test]
+    fn fit_view_caps_small_content_and_floors_huge_content() {
+        let canvas = Vec2::new(800.0, 500.0);
+        // A lone resistor would fit at 11x; the cap stops it at FIT_MAX_ZOOM.
+        let mut st = SchematicState::default();
+        st.components = vec![comp(CompKind::Resistor, 2, 2, "1k")];
+        st.fit_view(canvas);
+        assert_zoom_is(&st, FIT_MAX_ZOOM);
+        // 8000 px of wire would fit at 0.05x; the floor keeps it at MIN_ZOOM.
+        let (st, _) = fit_wire(400, canvas);
+        assert_zoom_is(&st, MIN_ZOOM);
     }
 }

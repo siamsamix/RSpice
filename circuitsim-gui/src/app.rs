@@ -7,8 +7,10 @@ use egui_plot::Plot;
 use std::collections::HashMap;
 use egui::{Color32, Pos2, Rect, Stroke, Vec2};
 
+use crate::chrome;
+use crate::icons::{icon_button, Icon};
 use crate::schematic::{
-    AnalysisType, CompKind, Direction, GridPt, NodeAssignment, SchematicState, Tool,
+    instance_names, AnalysisType, CompKind, GridPt, NodeAssignment, SchematicState, Tool,
     GRID_SIZE,
 };
 use crate::plot::{
@@ -114,13 +116,40 @@ fn source_value_from_fields(family: &str, fields: &[String]) -> Result<SourceVal
     })
 }
 
-#[derive(PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq)]
 enum EditorMode { Text, Schematic }
+
+/// The two child windows of the workspace: the netlist/schematic editor and
+/// the waveform/results viewer.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Pane { Editor, Results }
+
+/// How the workspace arranges its child windows (Window menu).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Tiling {
+    /// One window fills the workspace — the active one.
+    Single,
+    /// Stacked: waveforms above the editor, as in the reference.
+    Horizontal,
+    /// Side by side: editor left, waveforms right.
+    Vertical,
+}
+
+/// Schematic tools as the toolbar and the Edit menu present them.
+const TOOLS: [(Tool, Icon, &str); 7] = [
+    (Tool::Select, Icon::Select, "Select"),
+    (Tool::Wire, Icon::Wire, "Draw Wire"),
+    (Tool::Gnd, Icon::Ground, "Ground"),
+    (Tool::R, Icon::Resistor, "Resistor"),
+    (Tool::C, Icon::Capacitor, "Capacitor"),
+    (Tool::L, Icon::Inductor, "Inductor"),
+    (Tool::V, Icon::Voltage, "Voltage Source"),
+];
 
 
 use crate::theme::{
-    self, card_frame, code_frame, editor_frame, panel_frame, section_heading, status_chip,
-    ACCENT, BG_PANEL, BG_SURFACE, STATUS_ERROR, STATUS_OK, TEXT_SECONDARY,
+    self, bar_frame, card_frame, code_frame, section_heading, ACCENT, ACCENT_DIM, LT_STRIP,
+    LT_WHITE, LT_WORKSPACE, STATUS_ERROR, STATUS_OK, TEXT_SECONDARY,
 };
 
 const DEFAULT_NETLIST: &str = r#"* RC charging — edit and press Run (F5)
@@ -141,6 +170,13 @@ enum Example {
 }
 
 impl Example {
+    const ALL: [Example; 4] = [
+        Example::RcCharge,
+        Example::VoltageDivider,
+        Example::RlCircuit,
+        Example::RcLowPass,
+    ];
+
     fn netlist(self) -> &'static str {
         match self {
             Example::RcCharge => {
@@ -240,6 +276,18 @@ pub struct CircuitSimApp {
     // Differential voltage plot node selectors
     diff_node_a: usize,
     diff_node_b: usize,
+
+    // Workspace: which child window has focus and how they are arranged.
+    active_pane: Pane,
+    tiling: Tiling,
+    show_about: bool,
+    /// Dot grid on the schematic canvas (off by default, as in the reference).
+    schematic_grid: bool,
+    /// Grid lines in the waveform viewer (off by default).
+    plot_grid: bool,
+    /// Last painted schematic canvas, in screen space — the zoom buttons
+    /// zoom about its center.
+    canvas_rect: Rect,
 }
 
 impl Default for CircuitSimApp {
@@ -267,36 +315,21 @@ impl Default for CircuitSimApp {
 
             diff_node_a: 1,
             diff_node_b: 2,
+
+            active_pane: Pane::Editor,
+            tiling: Tiling::Single,
+            show_about: false,
+            schematic_grid: false,
+            plot_grid: false,
+            canvas_rect: Rect::NOTHING,
         }
     }
 }
 
 impl CircuitSimApp {
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
-        let mut fonts = egui::FontDefinitions::default();
-
         egui_extras::install_image_loaders(&cc.egui_ctx);
-
-        // 1. Load the custom font data
-        fonts.font_data.insert(
-            "technical_symbols".to_owned(),
-                               egui::FontData::from_static(include_bytes!("../fonts/DejaVuSans.ttf")),
-        );
-
-        // 2. Insert it as a fallback for Proportional fonts (UI text)
-        // By pushing it to the end, egui will use its default font first,
-        // and fall back to our custom font for missing symbols.
-        if let Some(vec) = fonts.families.get_mut(&egui::FontFamily::Proportional) {
-            vec.insert(0, "technical_symbols".to_owned());
-        }
-
-        // 3. Do the same for Monospace text
-        if let Some(vec) = fonts.families.get_mut(&egui::FontFamily::Monospace) {
-            vec.insert(0, "technical_symbols".to_owned());
-        }
-
-        // 4. Apply the new font definitions to the egui context
-        cc.egui_ctx.set_fonts(fonts);
+        theme::install_fonts(&cc.egui_ctx);
 
         Self::default()
     }
@@ -347,6 +380,7 @@ impl CircuitSimApp {
                 match run(&netlist) {
                     Ok(result) => {
                         self.apply_result(result);
+                        self.show_results_after_run();
                         self.status = Some((true, "Simulation finished".into()));
                     }
                     Err(e) => {
@@ -458,278 +492,592 @@ impl CircuitSimApp {
 
 impl eframe::App for CircuitSimApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
-        if ctx.input(|i| i.key_pressed(egui::Key::F5)) {
-            self.run_simulation();
-        }
+        self.handle_shortcuts(ctx);
+        crate::plot::set_grid(ctx, self.plot_grid);
+
+        // LTspice's frame: menu bar, icon toolbar, document tabs, the gray
+        // MDI workspace, status bar.
+        egui::TopBottomPanel::top("menubar")
+        .frame(bar_frame(LT_WHITE, egui::Margin::symmetric(4.0, 0.0)))
+        .show(ctx, |ui| {
+            self.menu_bar(ui);
+        });
 
         egui::TopBottomPanel::top("toolbar")
-        .frame(panel_frame(BG_PANEL))
+        .frame(bar_frame(LT_WHITE, egui::Margin::symmetric(6.0, 4.0)))
         .show(ctx, |ui| {
             self.toolbar(ui);
         });
 
-        egui::TopBottomPanel::bottom("status")
-        .frame(
-            egui::Frame::none()
-            .fill(BG_PANEL)
-            .stroke(egui::Stroke::new(1.0, theme::BORDER))
-            .inner_margin(egui::Margin::symmetric(16.0, 8.0)),
-        )
+        egui::TopBottomPanel::top("tabs")
+        .frame(bar_frame(
+            LT_STRIP,
+            egui::Margin { left: 4.0, right: 4.0, top: 4.0, bottom: 0.0 },
+        ))
         .show(ctx, |ui| {
-            self.status_bar(ui);
+            self.tab_strip(ui);
         });
 
-        egui::SidePanel::left("editor")
-        .resizable(true)
-        .default_width(420.0)
-        .min_width(280.0)
-        .frame(
-            egui::Frame::none()
-            .fill(BG_SURFACE)
-            .inner_margin(egui::Margin::same(14.0)),
-        )
+        egui::TopBottomPanel::bottom("status")
+        .frame(bar_frame(LT_STRIP, egui::Margin::symmetric(8.0, 3.0)))
         .show(ctx, |ui| {
-            self.editor_panel(ui);
+            self.status_bar(ui);
         });
 
         egui::CentralPanel::default()
         .frame(
             egui::Frame::none()
-            .fill(BG_PANEL)
-            .inner_margin(egui::Margin::same(14.0)),
+            .fill(LT_WORKSPACE)
+            .stroke(egui::Stroke::new(1.0, theme::LT_FRAME))
+            .inner_margin(egui::Margin::same(3.0)),
         )
         .show(ctx, |ui| {
-            self.results_panel(ui);
+            self.workspace(ui);
         });
+
+        self.about_window(ctx);
     }
 }
 
 impl CircuitSimApp {
-    fn toolbar(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.label(
-                egui::RichText::new("⚡ RSpice")
-                .strong()
-                .size(20.0)
-                .color(ACCENT),
-            );
-            ui.add_space(12.0);
+    // ── Keyboard ────────────────────────────────────────────────────────────
 
-            let run = ui.add(
-                egui::Button::new(egui::RichText::new("▶  Run").strong().color(egui::Color32::WHITE))
-                .fill(ACCENT)
-                .min_size(egui::vec2(100.0, 32.0)),
-            );
-            if run.clicked() {
-                self.run_simulation();
+    fn handle_shortcuts(&mut self, ctx: &egui::Context) {
+        use egui::{Key, KeyboardShortcut, Modifiers};
+        let (run, open, save, grid) = ctx.input_mut(|i| {
+            (
+                i.key_pressed(Key::F5),
+                i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::O)),
+                i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::S)),
+                i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::G)),
+            )
+        });
+        if run {
+            self.run_simulation();
+        }
+        if open {
+            self.open_file();
+        }
+        if save {
+            self.save_file();
+        }
+        if grid {
+            // Ctrl+G toggles the grid of whichever window is active.
+            if self.active_pane == Pane::Results {
+                self.plot_grid = !self.plot_grid;
+            } else {
+                self.schematic_grid = !self.schematic_grid;
             }
-            if ui
-                .add(egui::Button::new("Open"))
-                .on_hover_text("Open netlist file")
-                .clicked()
-                {
+        }
+    }
+
+    // ── Document state ──────────────────────────────────────────────────────
+
+    fn has_results(&self) -> bool {
+        self.dc.is_some() || self.dc_sweep.is_some() || self.tran.is_some() || self.ac.is_some()
+    }
+
+    /// The open document's name without its extension (`untitled`, `rc_charge`).
+    fn doc_stem(&self) -> String {
+        std::path::Path::new(&self.file_label)
+            .file_stem()
+            .map(|s| s.to_string_lossy().into_owned())
+            .filter(|s| !s.is_empty())
+            .unwrap_or_else(|| "untitled".to_string())
+    }
+
+    /// Title and icon of a child window, LTspice-style: the editor is the
+    /// `.asc` schematic or the `.cir` netlist, the results window the `.raw`.
+    fn pane_title(&self, pane: Pane) -> (String, Icon) {
+        let stem = self.doc_stem();
+        match pane {
+            Pane::Editor => match self.editor_mode {
+                EditorMode::Schematic => (format!("{stem}.asc"), Icon::Schematic),
+                EditorMode::Text => (format!("{stem}.cir"), Icon::Netlist),
+            },
+            Pane::Results => (format!("{stem}.raw"), Icon::Waveform),
+        }
+    }
+
+    fn show_schematic(&mut self) {
+        self.editor_mode = EditorMode::Schematic;
+        self.active_pane = Pane::Editor;
+    }
+
+    fn show_netlist(&mut self) {
+        self.editor_mode = EditorMode::Text;
+        self.active_pane = Pane::Editor;
+    }
+
+    /// Pick a schematic tool, opening the schematic window if needed.
+    fn pick_tool(&mut self, tool: Tool) {
+        self.schematic.select_tool(tool);
+        self.show_schematic();
+    }
+
+    /// After a successful run the waveform window opens beside the editor
+    /// and takes focus, as LTspice's does.
+    fn show_results_after_run(&mut self) {
+        if self.has_results() {
+            if self.tiling == Tiling::Single && self.active_pane == Pane::Editor {
+                self.tiling = Tiling::Horizontal;
+            }
+            self.active_pane = Pane::Results;
+        }
+    }
+
+    // ── View ────────────────────────────────────────────────────────────────
+
+    fn schematic_active(&self) -> bool {
+        self.active_pane == Pane::Editor && self.editor_mode == EditorMode::Schematic
+    }
+
+    fn zoom_schematic(&mut self, factor: f32) {
+        let anchor = if self.canvas_rect.is_positive() {
+            self.canvas_rect.size() / 2.0
+        } else {
+            Vec2::ZERO
+        };
+        self.schematic.zoom_about(factor, anchor);
+    }
+
+    /// Zoom to fit: the schematic's content, or the plots' auto-fit.
+    fn zoom_fit(&mut self) {
+        if self.active_pane == Pane::Results {
+            self.plot.tran_bounds.reset();
+            self.plot.ac_mag_bounds.reset();
+            self.plot.ac_phase_bounds.reset();
+            self.plot.dc_bounds.reset();
+            self.plot.tran_apply = true;
+            self.plot.ac_apply = true;
+            self.plot.dc_apply = true;
+        } else if self.editor_mode == EditorMode::Schematic {
+            let size = if self.canvas_rect.is_positive() {
+                self.canvas_rect.size()
+            } else {
+                Vec2::new(800.0, 500.0)
+            };
+            self.schematic.fit_view(size);
+        }
+    }
+
+    // ── Menu bar ────────────────────────────────────────────────────────────
+
+    fn menu_bar(&mut self, ui: &mut egui::Ui) {
+        egui::menu::bar(ui, |ui| {
+            ui.spacing_mut().button_padding = egui::vec2(6.0, 2.0);
+            ui.spacing_mut().item_spacing.x = 2.0;
+
+            ui.menu_button("File", |ui| {
+                if ui.add(egui::Button::new("Open…").shortcut_text("Ctrl+O")).clicked() {
                     self.open_file();
+                    ui.close_menu();
                 }
-                if ui
-                    .add(egui::Button::new("Save"))
-                    .on_hover_text("Save netlist")
-                    .clicked()
-                    {
-                        self.save_file();
-                    }
-
-                    ui.separator();
-
+                if ui.add(egui::Button::new("Save As…").shortcut_text("Ctrl+S")).clicked() {
+                    self.save_file();
+                    ui.close_menu();
+                }
+                ui.separator();
                 ui.menu_button("Examples", |ui| {
-                    for ex in [
-                        Example::RcCharge,
-                        Example::VoltageDivider,
-                        Example::RlCircuit,
-                        Example::RcLowPass,
-                    ] {
+                    for ex in Example::ALL {
                         if ui.button(ex.label()).clicked() {
                             self.load_example(ex);
                             ui.close_menu();
                         }
                     }
                 });
+                #[cfg(not(target_arch = "wasm32"))]
+                {
+                    ui.separator();
+                    if ui.button("Exit").clicked() {
+                        ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                    }
+                }
+            });
 
-                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    ui.label(
-                        egui::RichText::new("F5 run · SPICE-style netlist")
-                        .color(TEXT_SECONDARY)
-                        .size(12.0),
-                    );
-                });
+            ui.menu_button("Edit", |ui| {
+                let has_component = self.schematic.selected_component.is_some();
+                let has_selection = has_component || self.schematic.selected_wire.is_some();
+                if ui.add_enabled(has_component, egui::Button::new("Rotate").shortcut_text("Space")).clicked() {
+                    self.schematic.rotate_or_advance();
+                    ui.close_menu();
+                }
+                if ui.add_enabled(has_selection, egui::Button::new("Delete").shortcut_text("Del")).clicked() {
+                    self.schematic.delete_selection();
+                    ui.close_menu();
+                }
+                ui.separator();
+                for (tool, _, label) in TOOLS {
+                    if ui.button(label).clicked() {
+                        self.pick_tool(tool);
+                        ui.close_menu();
+                    }
+                }
+            });
+
+            ui.menu_button("Hierarchy", |ui| {
+                ui.add_enabled(false, egui::Button::new("Hierarchical schematics are not supported yet"));
+            });
+
+            ui.menu_button("View", |ui| {
+                let schematic = self.schematic_active();
+                if ui.add_enabled(schematic, egui::Button::new("Zoom In")).clicked() {
+                    self.zoom_schematic(1.25);
+                    ui.close_menu();
+                }
+                if ui.add_enabled(schematic, egui::Button::new("Zoom Out")).clicked() {
+                    self.zoom_schematic(0.8);
+                    ui.close_menu();
+                }
+                if ui.button("Zoom to Fit").clicked() {
+                    self.zoom_fit();
+                    ui.close_menu();
+                }
+                ui.separator();
+                ui.checkbox(&mut self.schematic_grid, "Schematic Grid");
+                ui.checkbox(&mut self.plot_grid, "Plot Grid");
+            });
+
+            ui.menu_button("Simulate", |ui| {
+                if ui.add(egui::Button::new("Run").shortcut_text("F5")).clicked() {
+                    self.run_simulation();
+                    ui.close_menu();
+                }
+                ui.add_enabled(false, egui::Button::new("Stop"));
+                ui.separator();
+                if ui.button("Edit Simulation Command…").clicked() {
+                    self.show_schematic();
+                    ui.close_menu();
+                }
+            });
+
+            ui.menu_button("Tools", |ui| {
+                if ui.button("Import Netlist to Schematic").clicked() {
+                    self.generate_schematic_from_netlist();
+                    self.show_schematic();
+                    ui.close_menu();
+                }
+                if ui.button("Generate Netlist from Schematic").clicked() {
+                    self.generate_netlist_from_schematic();
+                    self.show_netlist();
+                    ui.close_menu();
+                }
+            });
+
+            ui.menu_button("Window", |ui| {
+                if ui.button("Tile Horizontally").clicked() {
+                    self.tiling = Tiling::Horizontal;
+                    ui.close_menu();
+                }
+                if ui.button("Tile Vertically").clicked() {
+                    self.tiling = Tiling::Vertical;
+                    ui.close_menu();
+                }
+                ui.separator();
+                for pane in [Pane::Editor, Pane::Results] {
+                    if pane == Pane::Results && !self.has_results() {
+                        continue;
+                    }
+                    let (title, _) = self.pane_title(pane);
+                    if ui.selectable_label(self.active_pane == pane, title).clicked() {
+                        self.active_pane = pane;
+                        ui.close_menu();
+                    }
+                }
+            });
+
+            ui.menu_button("Help", |ui| {
+                if ui.button("About RSpice").clicked() {
+                    self.show_about = true;
+                    ui.close_menu();
+                }
+            });
         });
     }
+
+    fn about_window(&mut self, ctx: &egui::Context) {
+        let mut open = self.show_about;
+        egui::Window::new("About RSpice")
+        .open(&mut open)
+        .collapsible(false)
+        .resizable(false)
+        .show(ctx, |ui| {
+            ui.label(egui::RichText::new(format!("RSpice {}", env!("CARGO_PKG_VERSION"))).size(14.0));
+            ui.label("A SPICE-style circuit simulator.");
+            ui.label(egui::RichText::new("Interface modeled on LTspice.").color(TEXT_SECONDARY));
+        });
+        self.show_about = open;
+    }
+
+    // ── Toolbar ─────────────────────────────────────────────────────────────
+
+    fn toolbar(&mut self, ui: &mut egui::Ui) {
+        ui.horizontal_wrapped(|ui| {
+            ui.spacing_mut().item_spacing = egui::vec2(2.0, 2.0);
+            let gap = 10.0;
+
+            if icon_button(ui, Icon::Open, "Open netlist (Ctrl+O)", false, true).clicked() {
+                self.open_file();
+            }
+            if icon_button(ui, Icon::Save, "Save netlist (Ctrl+S)", false, true).clicked() {
+                self.save_file();
+            }
+            ui.add_space(gap);
+
+            let analysis = match self.schematic.analysis_type {
+                AnalysisType::Tran => ".tran",
+                AnalysisType::Ac => ".ac",
+            };
+            if icon_button(ui, Icon::Analysis(analysis), "Edit simulation command", false, true).clicked() {
+                self.show_schematic();
+            }
+            if icon_button(ui, Icon::Run, "Run (F5)", false, true).clicked() {
+                self.run_simulation();
+            }
+            icon_button(ui, Icon::Stop, "Stop (a run always finishes)", false, false);
+            ui.add_space(gap);
+
+            if icon_button(ui, Icon::TileVertical, "Tile windows vertically", self.tiling == Tiling::Vertical, true).clicked() {
+                self.tiling = Tiling::Vertical;
+            }
+            if icon_button(ui, Icon::TileHorizontal, "Tile windows horizontally", self.tiling == Tiling::Horizontal, true).clicked() {
+                self.tiling = Tiling::Horizontal;
+            }
+            ui.add_space(gap);
+
+            let schematic = self.schematic_active();
+            if icon_button(ui, Icon::ZoomIn, "Zoom in", false, schematic).clicked() {
+                self.zoom_schematic(1.25);
+            }
+            if icon_button(ui, Icon::ZoomOut, "Zoom out", false, schematic).clicked() {
+                self.zoom_schematic(0.8);
+            }
+            let can_fit = schematic || self.active_pane == Pane::Results;
+            if icon_button(ui, Icon::ZoomFit, "Zoom to fit", false, can_fit).clicked() {
+                self.zoom_fit();
+            }
+            ui.add_space(gap);
+
+            for (tool, icon, tip) in TOOLS {
+                let selected = self.editor_mode == EditorMode::Schematic && self.schematic.tool == tool;
+                if icon_button(ui, icon, tip, selected, true).clicked() {
+                    self.pick_tool(tool);
+                }
+            }
+            ui.add_space(gap);
+
+            let has_component = self.schematic.selected_component.is_some();
+            let has_selection = has_component || self.schematic.selected_wire.is_some();
+            if icon_button(ui, Icon::Rotate, "Rotate (Space)", false, true).clicked() {
+                self.schematic.rotate_or_advance();
+            }
+            if icon_button(ui, Icon::Delete, "Delete selection (Del)", false, has_selection).clicked() {
+                self.schematic.delete_selection();
+            }
+        });
+    }
+
+    // ── Document tabs ───────────────────────────────────────────────────────
+
+    fn tab_strip(&mut self, ui: &mut egui::Ui) {
+        let stem = self.doc_stem();
+        ui.horizontal(|ui| {
+            ui.spacing_mut().item_spacing.x = 2.0;
+            let editor_active = self.active_pane == Pane::Editor;
+            let schematic_tab = chrome::tab(
+                ui,
+                &format!("{stem}.asc"),
+                Icon::Schematic,
+                editor_active && self.editor_mode == EditorMode::Schematic,
+            );
+            if schematic_tab.clicked() {
+                self.show_schematic();
+            }
+            let netlist_tab = chrome::tab(
+                ui,
+                &format!("{stem}.cir"),
+                Icon::Netlist,
+                editor_active && self.editor_mode == EditorMode::Text,
+            );
+            if netlist_tab.clicked() {
+                self.show_netlist();
+            }
+            if self.has_results() {
+                let raw_tab = chrome::tab(
+                    ui,
+                    &format!("{stem}.raw"),
+                    Icon::Waveform,
+                    self.active_pane == Pane::Results,
+                );
+                if raw_tab.clicked() {
+                    self.active_pane = Pane::Results;
+                }
+            }
+        });
+    }
+
+    // ── Workspace (MDI) ─────────────────────────────────────────────────────
+
+    fn workspace(&mut self, ui: &mut egui::Ui) {
+        let full = ui.available_rect_before_wrap();
+        ui.allocate_rect(full, egui::Sense::hover());
+
+        // The waveform window only exists once there is something to show.
+        let results = self.has_results();
+        if !results {
+            self.active_pane = Pane::Editor;
+        }
+
+        let gap = 4.0;
+        let layout: Vec<(Pane, Rect)> = if !results || self.tiling == Tiling::Single {
+            vec![(self.active_pane, full)]
+        } else if self.tiling == Tiling::Horizontal {
+            let h = ((full.height() - gap) / 2.0).max(0.0);
+            vec![
+                (Pane::Results, Rect::from_min_size(full.min, Vec2::new(full.width(), h))),
+                (
+                    Pane::Editor,
+                    Rect::from_min_size(egui::pos2(full.min.x, full.min.y + h + gap), Vec2::new(full.width(), h)),
+                ),
+            ]
+        } else {
+            let w = ((full.width() - gap) / 2.0).max(0.0);
+            vec![
+                (Pane::Editor, Rect::from_min_size(full.min, Vec2::new(w, full.height()))),
+                (
+                    Pane::Results,
+                    Rect::from_min_size(egui::pos2(full.min.x + w + gap, full.min.y), Vec2::new(w, full.height())),
+                ),
+            ]
+        };
+        let single = layout.len() == 1;
+
+        let mut events = Vec::new();
+        for (pane, rect) in layout {
+            let (title, icon) = self.pane_title(pane);
+            let active = self.active_pane == pane;
+            let body_fill = match (pane, &self.editor_mode) {
+                (Pane::Editor, EditorMode::Text) => LT_WHITE,
+                _ => LT_WORKSPACE,
+            };
+            let id = egui::Id::new(match pane {
+                Pane::Editor => "pane_editor",
+                Pane::Results => "pane_results",
+            });
+            let ev = chrome::child_window(
+                ui,
+                id,
+                rect,
+                &title,
+                icon,
+                active,
+                single,
+                pane == Pane::Results,
+                body_fill,
+                |ui| match pane {
+                    Pane::Editor => self.editor_body(ui),
+                    Pane::Results => self.results_body(ui),
+                },
+            );
+            events.push((pane, ev));
+        }
+
+        for (pane, ev) in events {
+            if ev.activated {
+                self.active_pane = pane;
+            }
+            if ev.minimize {
+                self.active_pane = if pane == Pane::Editor { Pane::Results } else { Pane::Editor };
+                self.tiling = Tiling::Single;
+            }
+            if ev.maximize {
+                if single {
+                    self.tiling = Tiling::Horizontal;
+                } else {
+                    self.active_pane = pane;
+                    self.tiling = Tiling::Single;
+                }
+            }
+            if ev.close && pane == Pane::Results {
+                self.clear_results();
+                self.active_pane = Pane::Editor;
+            }
+        }
+    }
+
+    fn editor_body(&mut self, ui: &mut egui::Ui) {
+        match self.editor_mode {
+            EditorMode::Text => {
+                let line_h = ui.text_style_height(&egui::TextStyle::Monospace);
+                let rows = (ui.available_height() / line_h).floor().max(4.0) as usize;
+                egui::ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.netlist)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(f32::INFINITY)
+                        .desired_rows(rows)
+                        .lock_focus(true)
+                        .code_editor()
+                        .frame(false)
+                        .margin(egui::Margin::same(6.0)),
+                    );
+                });
+            }
+            EditorMode::Schematic => self.schematic_panel(ui),
+        }
+    }
+
+    fn results_body(&mut self, ui: &mut egui::Ui) {
+        egui::Frame::none()
+        .inner_margin(egui::Margin::same(6.0))
+        .show(ui, |ui| {
+            self.results_panel(ui);
+        });
+    }
+
+    // ── Status bar ──────────────────────────────────────────────────────────
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            if let Some((ok, msg)) = &self.status {
-                let color = if *ok { STATUS_OK } else { STATUS_ERROR };
-                status_chip(ui, msg, color);
-            } else {
-                ui.label(
-                    egui::RichText::new("Ready")
-                    .color(TEXT_SECONDARY)
-                    .italics(),
-                );
+            match &self.status {
+                Some((true, msg)) => {
+                    ui.label(msg);
+                }
+                Some((false, msg)) => {
+                    ui.label(egui::RichText::new(msg).color(STATUS_ERROR));
+                }
+                None => {
+                    ui.label(egui::RichText::new("Ready").color(TEXT_SECONDARY));
+                }
             }
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                ui.label(
-                    egui::RichText::new(&self.file_label)
-                    .color(TEXT_SECONDARY)
-                    .family(egui::FontFamily::Monospace),
-                );
-            });
-        });
-    }
-
-    fn editor_panel(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            section_heading(ui, "Editor");
-            ui.add_space(16.0);
-            ui.selectable_value(&mut self.editor_mode, EditorMode::Text, "Text");
-            ui.selectable_value(&mut self.editor_mode, EditorMode::Schematic, "Schematic");
-        });
-        ui.add_space(6.0);
-
-        if self.editor_mode == EditorMode::Text {
-            ui.horizontal(|ui| {
-                ui.label(egui::RichText::new("R · C · L · V  —  .op  .tran  .ac").color(TEXT_SECONDARY).size(12.0));
+            if let Some(summary) = &self.circuit_summary {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                    let import_btn = egui::Button::new(
-                        egui::RichText::new("⟶ Import to Schematic").size(12.0).color(egui::Color32::WHITE)
-                    )
-                    .fill(egui::Color32::from_rgb(60, 100, 160))
-                    .rounding(egui::Rounding::same(4.0))
-                    .min_size(egui::vec2(0.0, 22.0));
-                    if ui.add(import_btn).on_hover_text("Parse the netlist and render it as a schematic").clicked() {
-                        self.generate_schematic_from_netlist();
-                        self.editor_mode = EditorMode::Schematic;
-                    }
+                    ui.label(egui::RichText::new(summary).color(TEXT_SECONDARY));
                 });
-            });
-            editor_frame().show(ui, |ui| {
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.netlist)
-                    .font(egui::TextStyle::Monospace)
-                    .desired_width(f32::INFINITY)
-                    .desired_rows(28)
-                    .lock_focus(true)
-                    .code_editor(),
-                );
-            });
-        } else {
-            self.schematic_panel(ui);
-        }
+            }
+        });
     }
 
     fn schematic_panel(&mut self, ui: &mut egui::Ui) {
-        // Handle keyboard shortcut for rotation (Spacebar)
-        if ui.input(|i| i.key_pressed(egui::Key::Space)) {
-            if self.schematic.selected_component.is_some() {
-                self.schematic.rotate_selected();
-            } else {
-                // No component selected, update future placement direction
-                self.schematic.advance_direction();
-            }
+        // Spacebar rotates the selection (or the next placement) — unless a
+        // text field has focus, where Space is just a character.
+        if !ui.ctx().wants_keyboard_input() && ui.input(|i| i.key_pressed(egui::Key::Space)) {
+            self.schematic.rotate_or_advance();
         }
 
-        // Toolbar — styled tool buttons with icons
+        // Simulation command strip (LTspice's "Edit Simulation Command"): the
+        // analysis the Run button compiles. The drawing tools live in the
+        // main toolbar.
         egui::Frame::none()
-        .fill(theme::BG_SURFACE)
-        .stroke(egui::Stroke::new(1.0, theme::BORDER))
-        .rounding(egui::Rounding::same(6.0))
-        .inner_margin(egui::Margin::symmetric(8.0, 4.0))
+        .fill(theme::LT_STRIP)
+        .stroke(egui::Stroke::new(1.0, theme::BORDER_SUBTLE))
+        .inner_margin(egui::Margin::symmetric(8.0, 3.0))
         .show(ui, |ui| {
-
-            // FIX: Use horizontal_wrapped to naturally wrap components to a new row on small screens
+            ui.set_width(ui.available_width());
             ui.horizontal_wrapped(|ui| {
-
-                // 1. General Tools Array using include_image!
-                let tools = [
-                    // Assuming you put your SVGs in an "assets" folder next to "src"
-                    (Tool::Select, egui::include_image!("../assets/select.svg"), "Select"),
-                                  (Tool::Wire,   egui::include_image!("../assets/wire.svg"), "Wire"),
-                ];
-
-                for &(t, ref icon_source, label) in &tools {
-                    let active = self.schematic.tool == t;
-                    let color = if active { egui::Color32::WHITE } else { TEXT_SECONDARY };
-
-                    // Create the SVG image instance, scale it, and tint it
-                    let image = egui::Image::new(icon_source.clone())
-                    .max_height(14.0)
-                    .tint(color);
-
-                    let btn_text = egui::RichText::new(label)
-                    .size(12.0)
-                    .color(color);
-
-                    let btn = egui::Button::image_and_text(image, btn_text)
-                    .fill(if active { ACCENT } else { egui::Color32::TRANSPARENT })
-                    .rounding(egui::Rounding::same(4.0))
-                    .min_size(egui::vec2(0.0, 24.0));
-
-                    if ui.add(btn).clicked() {
-                        self.schematic.select_tool(t);
-                    }
-                }
-
-                ui.separator();
-
-                // 2. Component Tools Array using include_image!
-                let comp_tools = [
-                    (Tool::R,   egui::include_image!("../assets/resistor.svg"), "R"),
-                                  (Tool::C,   egui::include_image!("../assets/capacitor.svg"), "C"),
-                                  (Tool::L,   egui::include_image!("../assets/inductor.svg"), "L"),
-                                  (Tool::V,   egui::include_image!("../assets/voltage.svg"), "V"),
-                                  (Tool::Gnd, egui::include_image!("../assets/ground.svg"), "GND"),
-                ];
-
-                for &(t, ref icon_source, label) in &comp_tools {
-                    let active = self.schematic.tool == t;
-                    let color = if active { egui::Color32::WHITE } else { TEXT_SECONDARY };
-
-                    let image = egui::Image::new(icon_source.clone())
-                    .max_height(14.0)
-                    .tint(color);
-
-                    let btn_text = egui::RichText::new(label)
-                    .size(12.0)
-                    .color(color);
-
-                    let btn = egui::Button::image_and_text(image, btn_text)
-                    .fill(if active { ACCENT.gamma_multiply(0.9) } else { egui::Color32::TRANSPARENT })
-                    .rounding(egui::Rounding::same(4.0))
-                    .min_size(egui::vec2(0.0, 24.0));
-
-                    if ui.add(btn).clicked() {
-                        self.schematic.select_tool(t);
-                    }
-                }
-
-                ui.separator();
-
-                // FIX: Replaced `right_to_left` block with Left-To-Right rendering.
-                // This flows nicely into the wrapper when squished.
-                let rot_dir = match self.schematic.current_dir {
-                    Direction::Right => "→", Direction::Down => "↓",
-                    Direction::Left => "←",  Direction::Up => "↑",
-                };
-                ui.label(egui::RichText::new(format!("Space: rotate {rot_dir}")).size(11.0).color(TEXT_SECONDARY));
-
-                ui.add_space(4.0);
-
-                let gen_btn = egui::Button::new(
-                    egui::RichText::new("Generate Netlist").size(12.0).color(egui::Color32::WHITE)
-                )
-                .fill(egui::Color32::from_rgb(60, 130, 80))
-                .rounding(egui::Rounding::same(4.0))
-                .min_size(egui::vec2(0.0, 24.0));
-                if ui.add(gen_btn).clicked() {
+                if ui.button("Generate Netlist").clicked() {
                     self.generate_netlist_from_schematic();
                     self.editor_mode = EditorMode::Text;
                 }
@@ -786,11 +1134,11 @@ impl CircuitSimApp {
             });
         });
 
-        ui.add_space(4.0);
-
         // Canvas Drawing
         let (response, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
         let rect = response.rect;
+        self.canvas_rect = rect;
+        painter.rect_filled(rect, 0.0, theme::LT_WORKSPACE);
 
         // --- NEW PAN & ZOOM LOGIC ---
         // Handle Zoom (Ctrl + Scroll or Pinch)
@@ -816,7 +1164,7 @@ impl CircuitSimApp {
         let pan = self.schematic.pan;
 
         // Draw dot grid (Dynamic based on visible bounds)
-        let dot_color = theme::BORDER.gamma_multiply(0.6);
+        let dot_color = Color32::from_rgb(96, 96, 96);
         let bounds_min = -pan / z;
         let bounds_max = (rect.size() - pan) / z;
 
@@ -825,24 +1173,46 @@ impl CircuitSimApp {
         let start_y = (bounds_min.y / GRID_SIZE).floor() as i32;
         let end_y = (bounds_max.y / GRID_SIZE).ceil() as i32;
 
-        for xi in start_x..=end_x {
-            for yi in start_y..=end_y {
-                let pos = rect.left_top() + pan + Vec2::new(xi as f32 * GRID_SIZE, yi as f32 * GRID_SIZE) * z;
-                painter.circle_filled(pos, 0.8 * z.max(0.5), dot_color);
+        if self.schematic_grid {
+            for xi in start_x..=end_x {
+                for yi in start_y..=end_y {
+                    let pos = rect.left_top() + pan + Vec2::new(xi as f32 * GRID_SIZE, yi as f32 * GRID_SIZE) * z;
+                    painter.circle_filled(pos, 0.8 * z.max(0.5), dot_color);
+                }
             }
         }
 
         let to_screen = |grid_pt: GridPt| rect.left_top() + pan + (grid_pt.to_pos().to_vec2() * z);
         // --- END PAN & ZOOM LOGIC ---
 
-        // Draw existing wires
-        let wire_color = Color32::from_rgb(80, 200, 120);
-        let wire_selected_color = Color32::from_rgb(255, 100, 80);
+        // Draw existing wires — thin blue, with a dot where three or more
+        // wire ends / pins meet (a junction), as in the reference.
+        let wire_color = theme::LT_WIRE;
+        let wire_selected_color = Color32::from_rgb(230, 80, 40);
         for (wi, w) in self.schematic.wires.iter().enumerate() {
-            let color = if self.schematic.selected_wire == Some(wi) { wire_selected_color } else { wire_color };
-            painter.line_segment([to_screen(w.p1), to_screen(w.p2)], Stroke::new(if self.schematic.selected_wire == Some(wi) { 3.0 * z } else { 2.0 * z }, color));
-            painter.circle_filled(to_screen(w.p1), 2.5 * z, color);
-            painter.circle_filled(to_screen(w.p2), 2.5 * z, color);
+            let selected = self.schematic.selected_wire == Some(wi);
+            let color = if selected { wire_selected_color } else { wire_color };
+            let width = if selected { 2.5 * z } else { 1.5 * z };
+            painter.line_segment([to_screen(w.p1), to_screen(w.p2)], Stroke::new(width, color));
+        }
+        {
+            let mut degree: HashMap<GridPt, usize> = HashMap::new();
+            for w in &self.schematic.wires {
+                *degree.entry(w.p1).or_default() += 1;
+                *degree.entry(w.p2).or_default() += 1;
+            }
+            for c in &self.schematic.components {
+                *degree.entry(c.p1).or_default() += 1;
+                if c.kind != CompKind::Ground {
+                    *degree.entry(c.p2).or_default() += 1;
+                }
+            }
+            for (pt, n) in degree {
+                if n >= 3 {
+                    let dot = Rect::from_center_size(to_screen(pt), Vec2::splat(5.0 * z.max(0.6)));
+                    painter.rect_filled(dot, 0.0, wire_color);
+                }
+            }
         }
 
         // Draw active wire preview
@@ -855,9 +1225,9 @@ impl CircuitSimApp {
 
             if self.schematic.tool == Tool::Wire {
                 if let Some(start_grid) = self.schematic.active_wire_start {
-                    painter.line_segment([to_screen(start_grid), to_screen(hover_grid)], Stroke::new(2.0 * z, theme::ACCENT));
+                    painter.line_segment([to_screen(start_grid), to_screen(hover_grid)], Stroke::new(1.5 * z, theme::LT_WIRE));
                 }
-                painter.circle_filled(to_screen(hover_grid), 4.0 * z, theme::ACCENT);
+                painter.circle_filled(to_screen(hover_grid), 3.0 * z, theme::LT_WIRE);
             } else if matches!(self.schematic.tool, Tool::R | Tool::C | Tool::L | Tool::V) {
                 // Ghost component preview
                 let (dx, dy) = self.schematic.current_dir.offset(3);
@@ -865,21 +1235,23 @@ impl CircuitSimApp {
 
                 painter.line_segment(
                     [to_screen(hover_grid), to_screen(p2_grid)],
-                                     Stroke::new(1.5 * z, theme::TEXT_SECONDARY.gamma_multiply(0.4))
+                                     Stroke::new(1.0 * z, theme::LT_WIRE.gamma_multiply(0.5))
                 );
                 // Ghost body box at center of preview
                 let ghost_center = to_screen(hover_grid) + (to_screen(p2_grid) - to_screen(hover_grid)) / 2.0;
                 let is_h = hover_grid.1 == p2_grid.1;
                 let ghost_rect = Rect::from_center_size(ghost_center,
                                                         if is_h { Vec2::new(28.0 * z, 16.0 * z) } else { Vec2::new(16.0 * z, 28.0 * z) });
-                painter.rect_stroke(ghost_rect, 3.0 * z, Stroke::new(1.5 * z, theme::ACCENT.gamma_multiply(0.5)));
-                painter.circle_filled(to_screen(hover_grid), 3.5 * z, theme::ACCENT.gamma_multiply(0.9));
+                painter.rect_stroke(ghost_rect, 0.0, Stroke::new(1.0 * z, theme::LT_WIRE.gamma_multiply(0.5)));
+                painter.circle_filled(to_screen(hover_grid), 3.0 * z, theme::LT_WIRE);
             }
         }
 
         // Draw Components with proper electronic symbols
-        let comp_stroke = Stroke::new(2.0 * z, Color32::from_rgb(220, 225, 235));
-        let selected_stroke = Stroke::new(2.0 * z, theme::ACCENT);
+        let comp_stroke = Stroke::new(1.5 * z, theme::LT_WIRE);
+        let selected_stroke = Stroke::new(1.5 * z, Color32::from_rgb(230, 80, 40));
+        let names = instance_names(&self.schematic.components);
+        let label_font = theme::bold(10.0);
 
         for (i, c) in self.schematic.components.iter().enumerate() {
             let p1 = to_screen(c.p1);
@@ -887,6 +1259,15 @@ impl CircuitSimApp {
             let center = p1 + (p2 - p1) / 2.0;
             let is_horizontal = c.p1.1 == c.p2.1;
             let is_selected = self.schematic.selected_component == Some(i);
+
+            // Horizontal parts label above/below; vertical parts put the name
+            // on the left and the value on the right of the symbol, as the
+            // reference does — long values never run across the plates.
+            let (name_anchor, val_anchor) = if is_horizontal {
+                (egui::Align2::CENTER_CENTER, egui::Align2::CENTER_CENTER)
+            } else {
+                (egui::Align2::RIGHT_CENTER, egui::Align2::LEFT_CENTER)
+            };
 
             // Lead wires from terminal to component body
             let lead_frac = 0.28_f32;
@@ -928,10 +1309,10 @@ impl CircuitSimApp {
 
                     // Value label
                     let off = if is_horizontal { Vec2::new(0.0, 14.0) } else { Vec2::new(18.0, 0.0) };
-                    painter.text(center + off, egui::Align2::CENTER_CENTER, &c.val,
-                                 egui::FontId::proportional(10.0), TEXT_SECONDARY);
-                    painter.text(center - off * 0.8, egui::Align2::CENTER_CENTER, "R",
-                                 egui::FontId::proportional(9.0), ACCENT);
+                    painter.text(center + off, val_anchor, &c.val,
+                                 label_font.clone(), theme::LT_SCHEM_TEXT);
+                    painter.text(center - off * 0.8, name_anchor, &names[i],
+                                 label_font.clone(), theme::LT_SCHEM_TEXT);
                 }
 
                 CompKind::Capacitor => {
@@ -949,9 +1330,9 @@ impl CircuitSimApp {
                     let plate2_c = center + dir * (gap / 2.0);
 
                     painter.line_segment([plate1_c - perp * plate_half, plate1_c + perp * plate_half],
-                                         Stroke::new(2.5, Color32::from_rgb(220, 225, 235)));
+                                         Stroke::new(2.0, theme::LT_WIRE));
                     painter.line_segment([plate2_c - perp * plate_half, plate2_c + perp * plate_half],
-                                         Stroke::new(2.5, Color32::from_rgb(220, 225, 235)));
+                                         Stroke::new(2.0, theme::LT_WIRE));
 
                     if is_selected {
                         let sel_rect = Rect::from_center_size(center,
@@ -961,10 +1342,10 @@ impl CircuitSimApp {
                     }
 
                     let off = if is_horizontal { Vec2::new(0.0, 16.0) } else { Vec2::new(20.0, 0.0) };
-                    painter.text(center + off, egui::Align2::CENTER_CENTER, &c.val,
-                                 egui::FontId::proportional(10.0), TEXT_SECONDARY);
-                    painter.text(center - off * 0.8, egui::Align2::CENTER_CENTER, "C",
-                                 egui::FontId::proportional(9.0), ACCENT);
+                    painter.text(center + off, val_anchor, &c.val,
+                                 label_font.clone(), theme::LT_SCHEM_TEXT);
+                    painter.text(center - off * 0.8, name_anchor, &names[i],
+                                 label_font.clone(), theme::LT_SCHEM_TEXT);
                 }
 
                 CompKind::Inductor => {
@@ -1001,10 +1382,10 @@ impl CircuitSimApp {
                     }
 
                     let off = if is_horizontal { Vec2::new(0.0, 14.0) } else { Vec2::new(18.0, 0.0) };
-                    painter.text(center + off, egui::Align2::CENTER_CENTER, &c.val,
-                                 egui::FontId::proportional(10.0), TEXT_SECONDARY);
-                    painter.text(center - off * 0.8, egui::Align2::CENTER_CENTER, "L",
-                                 egui::FontId::proportional(9.0), ACCENT);
+                    painter.text(center + off, val_anchor, &c.val,
+                                 label_font.clone(), theme::LT_SCHEM_TEXT);
+                    painter.text(center - off * 0.8, name_anchor, &names[i],
+                                 label_font.clone(), theme::LT_SCHEM_TEXT);
                 }
 
                 CompKind::Voltage => {
@@ -1014,8 +1395,7 @@ impl CircuitSimApp {
 
                     // Circle body
                     let r = 11.0_f32;
-                    painter.circle_stroke(center, r,
-                                          Stroke::new(2.0, Color32::from_rgb(255, 200, 80)));
+                    painter.circle_stroke(center, r, Stroke::new(1.5, theme::LT_WIRE));
 
                     // + and - polarity symbols inside
                     let dir = (p2 - p1).normalized();
@@ -1023,45 +1403,41 @@ impl CircuitSimApp {
                     let minus_c = center - dir * (r * 0.45);
                     let ps = 3.0_f32;
                     painter.line_segment([plus_c - dir * ps, plus_c + dir * ps],
-                                         Stroke::new(1.5, Color32::from_rgb(255, 200, 80)));
+                                         Stroke::new(1.0, theme::LT_SCHEM_TEXT));
                     let perp = Vec2::new(-dir.y, dir.x);
                     painter.line_segment([plus_c - perp * ps, plus_c + perp * ps],
-                                         Stroke::new(1.5, Color32::from_rgb(255, 200, 80)));
+                                         Stroke::new(1.0, theme::LT_SCHEM_TEXT));
                     painter.line_segment([minus_c - dir * ps, minus_c + dir * ps],
-                                         Stroke::new(1.5, Color32::from_rgb(200, 200, 200)));
+                                         Stroke::new(1.0, theme::LT_SCHEM_TEXT));
 
                     if is_selected {
                         painter.circle_stroke(center, r + 4.0, selected_stroke);
                     }
 
                     let off = if is_horizontal { Vec2::new(0.0, 16.0) } else { Vec2::new(20.0, 0.0) };
-                    painter.text(center + off, egui::Align2::CENTER_CENTER, &c.val,
-                                 egui::FontId::proportional(10.0), TEXT_SECONDARY);
-                    painter.text(center - off * 0.8, egui::Align2::CENTER_CENTER, "V",
-                                 egui::FontId::proportional(9.0), Color32::from_rgb(255, 200, 80));
+                    painter.text(center + off, val_anchor, &c.val,
+                                 label_font.clone(), theme::LT_SCHEM_TEXT);
+                    painter.text(center - off * 0.8, name_anchor, &names[i],
+                                 label_font.clone(), theme::LT_SCHEM_TEXT);
                 }
 
                 CompKind::Ground => {
-                    // Vertical line down from pin
-                    let gnd_color = Color32::from_rgb(160, 170, 185);
+                    // Stem down from the pin into an open, downward triangle.
                     let pin = p1;
-                    let bar_y1 = pin + Vec2::new(0.0, 10.0);
-                    painter.line_segment([pin, bar_y1], Stroke::new(2.0, gnd_color));
-                    // Three decreasing horizontal bars
-                    for (k, half) in [(0, 10.0_f32), (1, 7.0_f32), (2, 4.0_f32)] {
-                        let y = bar_y1.y + k as f32 * 4.0;
-                        painter.line_segment(
-                            [Pos2::new(pin.x - half, y), Pos2::new(pin.x + half, y)],
-                                             Stroke::new(2.0, gnd_color),
-                        );
-                    }
-                    // "GND" label
-                    painter.text(pin + Vec2::new(0.0, 26.0), egui::Align2::CENTER_CENTER,
-                                 "GND", egui::FontId::proportional(9.0), gnd_color);
+                    let stem = pin + Vec2::new(0.0, 12.0);
+                    painter.line_segment([pin, stem], comp_stroke);
+                    painter.add(egui::Shape::closed_line(
+                        vec![
+                            stem + Vec2::new(-9.0, 0.0),
+                            stem + Vec2::new(9.0, 0.0),
+                            stem + Vec2::new(0.0, 11.0),
+                        ],
+                        comp_stroke,
+                    ));
 
                     if is_selected {
                         let sel_rect = Rect::from_center_size(pin + Vec2::new(0.0, 12.0), Vec2::new(26.0, 28.0));
-                        painter.rect_stroke(sel_rect, 3.0, selected_stroke);
+                        painter.rect_stroke(sel_rect, 0.0, selected_stroke);
                     }
                 }
             }
@@ -1092,15 +1468,11 @@ impl CircuitSimApp {
             // 6. Draw node labels.
             for (node_num, (pos, _grid_pt)) in &node_positions {
                 let label = format!("{node_num}");
-                let bg_color = if *node_num == 0 {
-                    Color32::from_rgba_unmultiplied(40, 40, 50, 200)
-                } else {
-                    Color32::from_rgba_unmultiplied(20, 50, 80, 210)
-                };
+                let bg_color = Color32::from_rgb(255, 255, 225);
                 let text_color = if *node_num == 0 {
-                    Color32::from_rgb(160, 170, 185)
+                    Color32::from_gray(70)
                 } else {
-                    Color32::from_rgb(100, 210, 255)
+                    Color32::from_rgb(0, 0, 128)
                 };
 
                 // Small filled pill background for legibility.
@@ -1113,8 +1485,8 @@ impl CircuitSimApp {
                     *pos + label_offset - pad,
                     text_size + pad * 2.0,
                 );
-                painter.rect_filled(pill_rect, 3.0, bg_color);
-                painter.rect_stroke(pill_rect, 3.0, egui::Stroke::new(0.5, text_color.gamma_multiply(0.5)));
+                painter.rect_filled(pill_rect, 0.0, bg_color);
+                painter.rect_stroke(pill_rect, 0.0, egui::Stroke::new(0.5, theme::LT_FRAME));
                 painter.text(
                     *pos + label_offset,
                     egui::Align2::LEFT_TOP,
@@ -1248,14 +1620,9 @@ impl CircuitSimApp {
         }
 
         // Delete key removes selected wire or component
-        if ui.input(|i| i.key_pressed(egui::Key::Delete)) {
-            if let Some(wi) = self.schematic.selected_wire {
-                self.schematic.wires.remove(wi);
-                self.schematic.selected_wire = None;
-            } else if let Some(ci) = self.schematic.selected_component {
-                self.schematic.components.remove(ci);
-                self.schematic.selected_component = None;
-            }
+        // (Skipped while a text field has focus: Delete there edits the text.)
+        if !ui.ctx().wants_keyboard_input() && ui.input(|i| i.key_pressed(egui::Key::Delete)) {
+            self.schematic.delete_selection();
         }
 
         // Wire selection popup — shows near the wire midpoint
@@ -1274,13 +1641,13 @@ impl CircuitSimApp {
                 .frame(
                     egui::Frame::none()
                     .fill(theme::BG_SURFACE)
-                    .stroke(egui::Stroke::new(1.5, Color32::from_rgb(255, 100, 80).gamma_multiply(0.6)))
-                    .rounding(egui::Rounding::same(8.0))
+                    .stroke(egui::Stroke::new(1.0, theme::LT_FRAME))
+                    .rounding(egui::Rounding::same(0.0))
                     .inner_margin(egui::Margin::same(10.0))
                 )
                 .show(ui.ctx(), |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Wire").strong().size(12.0).color(Color32::from_rgb(80, 200, 120)));
+                        ui.label(egui::RichText::new("Wire").strong().size(12.0).color(theme::LT_WIRE));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(egui::RichText::new("✕ close").size(10.0).color(TEXT_SECONDARY));
                         });
@@ -1321,11 +1688,11 @@ impl CircuitSimApp {
 
                 // Component kind display name and color
                 let (kind_label, kind_color) = match c.kind {
-                    CompKind::Resistor  => ("Resistor",  Color32::from_rgb(100, 180, 255)),
-                    CompKind::Capacitor => ("Capacitor", Color32::from_rgb(180, 130, 255)),
-                    CompKind::Inductor  => ("Inductor",  Color32::from_rgb(255, 180, 80)),
-                    CompKind::Voltage   => ("Voltage Source", Color32::from_rgb(255, 200, 80)),
-                    CompKind::Ground    => ("Ground",    Color32::from_rgb(160, 170, 185)),
+                    CompKind::Resistor  => ("Resistor",  Color32::from_rgb(0, 70, 170)),
+                    CompKind::Capacitor => ("Capacitor", Color32::from_rgb(100, 40, 170)),
+                    CompKind::Inductor  => ("Inductor",  Color32::from_rgb(170, 90, 0)),
+                    CompKind::Voltage   => ("Voltage Source", Color32::from_rgb(150, 100, 0)),
+                    CompKind::Ground    => ("Ground",    Color32::from_rgb(70, 70, 70)),
                 };
 
                 egui::Window::new("")
@@ -1338,8 +1705,8 @@ impl CircuitSimApp {
                 .frame(
                     egui::Frame::none()
                     .fill(theme::BG_SURFACE)
-                    .stroke(egui::Stroke::new(1.5, kind_color.gamma_multiply(0.6)))
-                    .rounding(egui::Rounding::same(8.0))
+                    .stroke(egui::Stroke::new(1.0, theme::LT_FRAME))
+                    .rounding(egui::Rounding::same(0.0))
                     .inner_margin(egui::Margin::same(12.0))
                 )
                 .show(ui.ctx(), |ui| {
@@ -1513,19 +1880,26 @@ impl CircuitSimApp {
 
     fn results_panel(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
-            section_heading(ui, "Results");
-            ui.add_space(8.0);
             ui.selectable_value(&mut self.result_tab, ResultTab::Overview, "Overview");
             ui.selectable_value(&mut self.result_tab, ResultTab::Dc, "DC");
             ui.selectable_value(&mut self.result_tab, ResultTab::Waveforms, "Waveforms");
             ui.selectable_value(&mut self.result_tab, ResultTab::FreqResponse, "Frequency");
         });
-        ui.add_space(8.0);
+        ui.add_space(6.0);
 
+        // The card tabs scroll; the plot tabs size their plots to the window.
         match self.result_tab {
-            ResultTab::Overview    => self.overview_tab(ui),
-            ResultTab::Dc          => self.dc_tab(ui),
-            ResultTab::Waveforms   => self.waveforms_tab(ui),
+            ResultTab::Overview => {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    self.overview_tab(ui);
+                });
+            }
+            ResultTab::Dc => {
+                egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+                    self.dc_tab(ui);
+                });
+            }
+            ResultTab::Waveforms    => self.waveforms_tab(ui),
             ResultTab::FreqResponse => self.freq_response_tab(ui),
         }
     }
@@ -1604,6 +1978,7 @@ impl CircuitSimApp {
     fn mini_plot(&self, ui: &mut egui::Ui, tran: &TranResult) {
         let plot = Plot::new("mini")
         .height(200.0)
+        .show_grid(crate::plot::grid_on(ui))
         .allow_drag(false)
         .allow_zoom(false)
         .allow_scroll(false)
@@ -1611,8 +1986,10 @@ impl CircuitSimApp {
         .show_background(true);
 
         let series = tran_voltage_series(tran, &self.plot_nodes, &self.node_names, 1.0, 1.0);
-        plot.show(ui, |plot_ui| {
-            draw(plot_ui, &series, 1.5);
+        crate::plot::viewer_scope(ui, |ui| {
+            plot.show(ui, |plot_ui| {
+                draw(plot_ui, &series, 1.5);
+            });
         });
     }
 
@@ -1622,7 +1999,7 @@ impl CircuitSimApp {
         ui.label(
             egui::RichText::new(format!("{cur:.6e} A"))
             .family(egui::FontFamily::Monospace)
-            .color(ACCENT),
+            .color(ACCENT_DIM),
         );
         ui.end_row();
     }
@@ -1662,7 +2039,7 @@ impl CircuitSimApp {
                     ui.label(
                         egui::RichText::new(format!("{v:.6e} V"))
                         .family(egui::FontFamily::Monospace)
-                        .color(ACCENT),
+                        .color(ACCENT_DIM),
                     );
                     ui.end_row();
                 }
@@ -1969,6 +2346,7 @@ impl CircuitSimApp {
         ui.add_space(6.0);
 
         let log_x = matches!(self.ac_mag_scale, AcMagScale::Db);
+        // Four plots stack in a scroll area; each takes half the window.
         let available_h = ui.available_height();
         let half_h = (available_h - 24.0) / 2.0;
 
@@ -1992,58 +2370,60 @@ impl CircuitSimApp {
         let mag_bounds = self.plot.ac_mag_bounds.x_through_log10();
         let phase_bounds = self.plot.ac_phase_bounds.x_through_log10();
 
-        // ── Magnitude plot ───────────────────────────────────────────────────
-        let mag_scale = self.ac_mag_scale;
-        let mag_label = match mag_scale {
-            AcMagScale::Db     => "magnitude (dB)",
-            AcMagScale::Linear => "magnitude (V)",
-        };
-
-        code_frame().show(ui, |ui| {
-            let apply = apply_b.then(|| mag_bounds);
-            ac_plot_frame(
-                "ac_magnitude", half_h.max(120.0), mag_scale, AcCursor::Quantity(mag_label.to_string()),
-                &mag_label, &node_mag_series, apply, ui,
-            );
-        });
-
-        ui.add_space(8.0);
-
-        // ── Phase plot ───────────────────────────────────────────────────────
-        code_frame().show(ui, |ui| {
-            let apply = apply_b.then(|| phase_bounds);
-            ac_plot_frame(
-                "ac_phase", half_h.max(120.0), mag_scale, AcCursor::Phase,
-                "phase (°)", &node_phase_series, apply, ui,
-            );
-        });
-
-        ui.add_space(8.0);
-
-        // ── Branch current magnitude plot ─────────────────────────────────────
-        code_frame().show(ui, |ui| {
-            let cur_mag_label = match mag_scale {
-                AcMagScale::Db     => "current magnitude (dB·A)",
-                AcMagScale::Linear => "current magnitude (A)",
+        egui::ScrollArea::vertical().auto_shrink([false, false]).show(ui, |ui| {
+            // ── Magnitude plot ───────────────────────────────────────────────────
+            let mag_scale = self.ac_mag_scale;
+            let mag_label = match mag_scale {
+                AcMagScale::Db     => "magnitude (dB)",
+                AcMagScale::Linear => "magnitude (V)",
             };
-            let apply = apply_b.then(|| mag_bounds);
-            ac_plot_frame(
-                "ac_branch_current_mag", half_h.max(120.0), mag_scale,
-                AcCursor::Quantity(cur_mag_label.to_string()), cur_mag_label,
-                &cur_mag_series, apply, ui,
-            );
-        });
 
-        ui.add_space(8.0);
+            code_frame().show(ui, |ui| {
+                let apply = apply_b.then(|| mag_bounds);
+                ac_plot_frame(
+                    "ac_magnitude", half_h.max(120.0), mag_scale, AcCursor::Quantity(mag_label.to_string()),
+                    &mag_label, &node_mag_series, apply, ui,
+                );
+            });
 
-        // ── Branch current phase plot ─────────────────────────────────────────
-        code_frame().show(ui, |ui| {
-            let apply = apply_b.then(|| phase_bounds);
-            ac_plot_frame(
-                "ac_branch_current_phase", half_h.max(120.0), mag_scale,
-                AcCursor::Phase, "current phase (°)",
-                &cur_phase_series, apply, ui,
-            );
+            ui.add_space(8.0);
+
+            // ── Phase plot ───────────────────────────────────────────────────────
+            code_frame().show(ui, |ui| {
+                let apply = apply_b.then(|| phase_bounds);
+                ac_plot_frame(
+                    "ac_phase", half_h.max(120.0), mag_scale, AcCursor::Phase,
+                    "phase (°)", &node_phase_series, apply, ui,
+                );
+            });
+
+            ui.add_space(8.0);
+
+            // ── Branch current magnitude plot ─────────────────────────────────────
+            code_frame().show(ui, |ui| {
+                let cur_mag_label = match mag_scale {
+                    AcMagScale::Db     => "current magnitude (dB·A)",
+                    AcMagScale::Linear => "current magnitude (A)",
+                };
+                let apply = apply_b.then(|| mag_bounds);
+                ac_plot_frame(
+                    "ac_branch_current_mag", half_h.max(120.0), mag_scale,
+                    AcCursor::Quantity(cur_mag_label.to_string()), cur_mag_label,
+                    &cur_mag_series, apply, ui,
+                );
+            });
+
+            ui.add_space(8.0);
+
+            // ── Branch current phase plot ─────────────────────────────────────────
+            code_frame().show(ui, |ui| {
+                let apply = apply_b.then(|| phase_bounds);
+                ac_plot_frame(
+                    "ac_branch_current_phase", half_h.max(120.0), mag_scale,
+                    AcCursor::Phase, "current phase (°)",
+                    &cur_phase_series, apply, ui,
+                );
+            });
         });
 
         // Toggle off the bounds application after all plots have processed it

@@ -11,9 +11,10 @@
 
 use circuitsim::analysis::{AcResult, DcSweepResult, TranResult};
 use circuitsim::circuit::{Circuit, ElementFamily, CURRENT_FAMILIES};
-use egui_plot::{Legend, Line, Plot, PlotPoints, PlotUi};
+use egui::{Stroke, TextStyle};
+use egui_plot::{GridMark, Legend, Line, Plot, PlotPoints, PlotUi};
 
-use crate::theme::PLOT_COLORS;
+use crate::theme::{bold, LT_PLOT_BG, LT_PLOT_FRAME, PLOT_COLORS};
 
 /// One named polyline with its palette color and data in axis units.
 pub struct PlotSeries {
@@ -122,6 +123,92 @@ pub fn apply_bounds(plot_ui: &mut PlotUi, bounds: &Bounds) {
     ));
 }
 
+// ── The waveform viewer's look ───────────────────────────────────────────────
+
+const GRID_KEY: &str = "rspice_plot_grid";
+
+/// Publish the View → Plot Grid switch to every plot drawn this frame.
+pub fn set_grid(ctx: &egui::Context, on: bool) {
+    ctx.data_mut(|d| d.insert_temp(egui::Id::new(GRID_KEY), on));
+}
+
+/// Grid lines are off unless switched on, as in the reference viewer.
+pub fn grid_on(ui: &egui::Ui) -> bool {
+    ui.ctx()
+        .data(|d| d.get_temp::<bool>(egui::Id::new(GRID_KEY)))
+        .unwrap_or(false)
+}
+
+/// Run `add` with the waveform viewer's look: black surface, light bold axis
+/// and legend text. Scoped to the plot, so the rest of the app keeps the
+/// light chrome.
+pub fn viewer_scope<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
+    ui.scope(|ui| {
+        let visuals = ui.visuals_mut();
+        visuals.extreme_bg_color = LT_PLOT_BG;
+        visuals.override_text_color = Some(LT_PLOT_FRAME);
+        visuals.window_stroke = Stroke::new(1.0, LT_PLOT_FRAME);
+        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, LT_PLOT_FRAME);
+        // Legend entries take their text from the widget states.
+        for w in [
+            &mut visuals.widgets.noninteractive,
+            &mut visuals.widgets.inactive,
+            &mut visuals.widgets.hovered,
+            &mut visuals.widgets.active,
+        ] {
+            w.fg_stroke.color = LT_PLOT_FRAME;
+        }
+        ui.style_mut().text_styles.insert(TextStyle::Body, bold(11.5));
+        add(ui)
+    })
+    .inner
+}
+
+/// Decimal places a grid step needs: 1 → 0, 0.5 → 1, 0.01 → 2.
+fn decimals_for(step: f64) -> usize {
+    if !step.is_finite() || step <= 0.0 {
+        return 0;
+    }
+    (-step.log10() - 1e-9).ceil().max(0.0) as usize
+}
+
+/// A tick value at the precision of its grid step, never `-0`.
+fn tick_number(value: f64, step: f64) -> String {
+    let text = format!("{value:.*}", decimals_for(step));
+    match text.strip_prefix('-') {
+        Some(rest) if rest.chars().all(|c| c == '0' || c == '.') => rest.to_string(),
+        _ => text,
+    }
+}
+
+/// Magnitude tick in dB: `18dB`, `-6dB`.
+pub fn db_tick(mark: GridMark) -> String {
+    format!("{}dB", tick_number(mark.value, mark.step_size))
+}
+
+/// Phase tick in degrees: `-45°`.
+pub fn degree_tick(mark: GridMark) -> String {
+    format!("{}°", tick_number(mark.value, mark.step_size))
+}
+
+/// A frequency as the reference prints it: `10Hz`, `1KHz`, `100KHz`, `2.5MHz`.
+pub fn format_hz(f: f64) -> String {
+    let (scaled, unit) = if f >= 1e9 {
+        (f / 1e9, "GHz")
+    } else if f >= 1e6 {
+        (f / 1e6, "MHz")
+    } else if f >= 1e3 {
+        (f / 1e3, "KHz")
+    } else {
+        (f, "Hz")
+    };
+    let mut text = format!("{scaled:.3}");
+    if text.contains('.') {
+        text = text.trim_end_matches('0').trim_end_matches('.').to_string();
+    }
+    format!("{text}{unit}")
+}
+
 /// One standard result-tab plot: axis labels, legend, scroll/drag/zoom
 /// gestures, the one-time bounds application and the series draw were the
 /// same nine lines chained at every tab — the caller now passes only the
@@ -139,17 +226,20 @@ pub fn plot_frame(
         .height(height)
         .x_axis_label(x_label)
         .y_axis_label(y_label)
-        .y_axis_min_width(50.0)
+        .y_axis_min_width(56.0)
         .legend(Legend::default().position(egui_plot::Corner::RightTop))
+        .show_grid(grid_on(ui))
         .show_background(true)
         .allow_scroll(true)
         .allow_drag(true)
         .allow_boxed_zoom(true);
-    plot.show(ui, |plot_ui| {
-        if let Some(bounds) = apply {
-            apply_bounds(plot_ui, &bounds);
-        }
-        draw(plot_ui, series, 2.0);
+    viewer_scope(ui, |ui| {
+        plot.show(ui, |plot_ui| {
+            if let Some(bounds) = apply {
+                apply_bounds(plot_ui, &bounds);
+            }
+            draw(plot_ui, series, 2.0);
+        });
     });
 }
 
@@ -187,8 +277,9 @@ pub fn ac_plot_frame(
         .height(height)
         .x_axis_label("frequency (Hz)")
         .y_axis_label(y_label)
-        .y_axis_min_width(50.0)
+        .y_axis_min_width(56.0)
         .legend(Legend::default().position(egui_plot::Corner::RightTop))
+        .show_grid(grid_on(ui))
         .show_background(true)
         .allow_scroll(true)
         .allow_drag(true)
@@ -197,18 +288,22 @@ pub fn ac_plot_frame(
     if scale == AcMagScale::Db {
         plot = plot.x_grid_spacer(egui_plot::log_grid_spacer(10));
     }
-    if let AcCursor::Quantity(_) = cursor {
-        let frequency_of = |x: f64| match scale {
-            AcMagScale::Db => 10.0_f64.powf(x),
-            AcMagScale::Linear => x,
-        };
-        plot = plot.x_axis_formatter(move |mark, _range| {
-            let f = frequency_of(mark.value);
-            if f >= 1e9 { format!("{:.1} G", f / 1e9) }
-            else if f >= 1e6 { format!("{:.1} M", f / 1e6) }
-            else if f >= 1e3 { format!("{:.1} k", f / 1e3) }
-            else { format!("{:.1}", f) }
-        });
+    // Frequency ticks read `10Hz … 100KHz` on every AC panel (the dB-mode
+    // axis carries log10(f), which must never be printed as a raw exponent).
+    let frequency_of = |x: f64| match scale {
+        AcMagScale::Db => 10.0_f64.powf(x),
+        AcMagScale::Linear => x,
+    };
+    plot = plot.x_axis_formatter(move |mark, _range| format_hz(frequency_of(mark.value)));
+    // Y ticks carry their unit: `18dB` on dB magnitudes, `-45°` on phase.
+    match (&cursor, scale) {
+        (AcCursor::Phase, _) => {
+            plot = plot.y_axis_formatter(|mark, _range| degree_tick(mark));
+        }
+        (AcCursor::Quantity(_), AcMagScale::Db) => {
+            plot = plot.y_axis_formatter(|mark, _range| db_tick(mark));
+        }
+        _ => {}
     }
     let plot = plot.label_formatter(move |name, val| {
         if name.is_empty() { return String::new(); }
@@ -221,11 +316,13 @@ pub fn ac_plot_frame(
             AcCursor::Phase => format!("{name}\nf = {f:.3e} Hz\nphase = {:.2}°", val.y),
         }
     });
-    plot.show(ui, |plot_ui| {
-        if let Some(bounds) = apply {
-            apply_bounds(plot_ui, &bounds);
-        }
-        draw(plot_ui, series, 2.0);
+    viewer_scope(ui, |ui| {
+        plot.show(ui, |plot_ui| {
+            if let Some(bounds) = apply {
+                apply_bounds(plot_ui, &bounds);
+            }
+            draw(plot_ui, series, 2.0);
+        });
     });
 }
 
@@ -266,7 +363,7 @@ pub fn tran_voltage_series(
         }
         out.push(PlotSeries {
             name: format!("V({})", node_name(names, node)),
-            color: PLOT_COLORS[node % PLOT_COLORS.len()],
+            color: PLOT_COLORS[(node - 1) % PLOT_COLORS.len()],
             points: tran
                 .points
                 .iter()
@@ -288,7 +385,7 @@ pub fn tran_diff_series(
 ) -> Vec<PlotSeries> {
     vec![PlotSeries {
         name: format!("V({})−V({})", node_name(names, a), node_name(names, b)),
-        color: PLOT_COLORS[1 % PLOT_COLORS.len()],
+        color: PLOT_COLORS[0],
         points: tran
             .points
             .iter()
@@ -402,7 +499,7 @@ pub fn ac_voltage_series(
         };
         out.push(PlotSeries {
             name: format!("V({}){suffix}", node_name(names, node)),
-            color: PLOT_COLORS[node % PLOT_COLORS.len()],
+            color: PLOT_COLORS[(node - 1) % PLOT_COLORS.len()],
             points: ac
                 .points
                 .iter()
@@ -491,7 +588,7 @@ pub fn dc_sweep_series(
         }
         out.push(PlotSeries {
             name: format!("V({})", node_name(names, node)),
-            color: PLOT_COLORS[node % PLOT_COLORS.len()],
+            color: PLOT_COLORS[(node - 1) % PLOT_COLORS.len()],
             points: sweep
                 .points
                 .iter()

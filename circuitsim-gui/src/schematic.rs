@@ -16,6 +16,10 @@ use std::collections::{HashMap, HashSet};
 /// Canvas grid pitch in screen pixels.
 pub const GRID_SIZE: f32 = 20.0;
 
+/// Canvas zoom limits (shared by the wheel, the zoom buttons and zoom-to-fit).
+pub const MIN_ZOOM: f32 = 0.2;
+pub const MAX_ZOOM: f32 = 5.0;
+
 #[derive(Clone, Copy, PartialEq, Eq, Hash)]
 pub struct GridPt(pub i32, pub i32);
 
@@ -44,6 +48,53 @@ pub struct Component {
     pub p1: GridPt,
     pub p2: GridPt,
     pub val: String,
+}
+
+/// A value in SPICE engineering notation (`1k`, `4.7u`, `100n`) when that
+/// spelling parses back to exactly `v`; otherwise plain decimal, which
+/// `parse_value` always re-parses.
+pub fn fmt_si(v: f64) -> String {
+    let plain = format!("{v}");
+    if v == 0.0 || !v.is_finite() {
+        return plain;
+    }
+    const SCALES: [(f64, &str); 10] = [
+        (1e12, "T"), (1e9, "G"), (1e6, "Meg"), (1e3, "k"), (1.0, ""),
+        (1e-3, "m"), (1e-6, "u"), (1e-9, "n"), (1e-12, "p"), (1e-15, "f"),
+    ];
+    let magnitude = v.abs();
+    let (scale, suffix) = SCALES
+        .iter()
+        .copied()
+        .find(|&(s, _)| magnitude >= s * (1.0 - 1e-9))
+        .unwrap_or(SCALES[SCALES.len() - 1]);
+    let mut mantissa = format!("{:.9}", v / scale);
+    if mantissa.contains('.') {
+        mantissa = mantissa.trim_end_matches('0').trim_end_matches('.').to_string();
+    }
+    let candidate = format!("{mantissa}{suffix}");
+    match parse_value(&candidate) {
+        Ok(back) if back == v => candidate,
+        _ => plain,
+    }
+}
+
+/// Instance names in component order — the exact `R1`, `C1`, `L1`, `V1`
+/// numbering [`SchematicState::build_netlist`] assigns (counted per kind), so
+/// the canvas can label parts with the names the netlist will carry. Ground
+/// symbols are not elements and get an empty name.
+pub fn instance_names(components: &[Component]) -> Vec<String> {
+    let (mut r, mut c, mut l, mut v) = (0, 0, 0, 0);
+    components
+        .iter()
+        .map(|comp| match comp.kind {
+            CompKind::Resistor => { r += 1; format!("R{r}") }
+            CompKind::Capacitor => { c += 1; format!("C{c}") }
+            CompKind::Inductor => { l += 1; format!("L{l}") }
+            CompKind::Voltage => { v += 1; format!("V{v}") }
+            CompKind::Ground => String::new(),
+        })
+        .collect()
 }
 
 #[derive(Clone)]
@@ -394,6 +445,82 @@ impl SchematicState {
         self.selected_wire = None;
     }
 
+    /// Delete the selected wire, else the selected component — the one
+    /// action behind the Delete key, the Edit menu and the toolbar button.
+    /// True if something was removed.
+    pub fn delete_selection(&mut self) -> bool {
+        if let Some(wi) = self.selected_wire {
+            if wi < self.wires.len() {
+                self.delete_wire(wi);
+                return true;
+            }
+            self.selected_wire = None;
+        }
+        if let Some(ci) = self.selected_component {
+            if ci < self.components.len() {
+                self.delete_component(ci);
+                return true;
+            }
+            self.selected_component = None;
+        }
+        false
+    }
+
+    /// Space / Rotate: turn the selected component, or — with nothing
+    /// selected — the facing of the next placement.
+    pub fn rotate_or_advance(&mut self) {
+        if self.selected_component.is_some() {
+            self.rotate_selected();
+        } else {
+            self.advance_direction();
+        }
+    }
+
+    /// Zoom by `factor`, keeping the canvas-local point `anchor` fixed on
+    /// screen.
+    pub fn zoom_about(&mut self, factor: f32, anchor: Vec2) {
+        let old = self.zoom;
+        let new = (old * factor).clamp(MIN_ZOOM, MAX_ZOOM);
+        let at = (anchor - self.pan) / old;
+        self.pan = anchor - at * new;
+        self.zoom = new;
+    }
+
+    /// Pixel-space bounding box of every component and wire, `None` when the
+    /// schematic is empty.
+    pub fn content_bounds(&self) -> Option<egui::Rect> {
+        let mut pts = self
+            .components
+            .iter()
+            .flat_map(|c| [c.p1, c.p2])
+            .chain(self.wires.iter().flat_map(|w| [w.p1, w.p2]))
+            .map(|g| g.to_pos());
+        let first = pts.next()?;
+        let mut bounds = egui::Rect::from_min_max(first, first);
+        for p in pts {
+            bounds.extend_with(p);
+        }
+        Some(bounds)
+    }
+
+    /// Zoom to fit: scale and center the content in a canvas of `canvas`
+    /// pixels (View → Zoom to Fit). An empty schematic resets the view.
+    pub fn fit_view(&mut self, canvas: Vec2) {
+        let Some(bounds) = self.content_bounds() else {
+            self.zoom = 1.0;
+            self.pan = Vec2::ZERO;
+            return;
+        };
+        let margin = 60.0;
+        let avail = (canvas - Vec2::splat(2.0 * margin)).max(Vec2::splat(20.0));
+        let zx = if bounds.width() > 0.0 { avail.x / bounds.width() } else { f32::MAX };
+        let zy = if bounds.height() > 0.0 { avail.y / bounds.height() } else { f32::MAX };
+        // A lone point would "fit" at the zoom limit; cap the fit at 2x.
+        let zoom = zx.min(zy).clamp(MIN_ZOOM, 2.0);
+        self.zoom = zoom;
+        self.pan = canvas / 2.0 - bounds.center().to_vec2() * zoom;
+    }
+
     /// Build the typed netlist IR from the schematic. The editor and the
     /// simulator then speak one language, and the emitted text comes from
     /// the canonical [`Netlist`] writer instead of hand-built format
@@ -540,9 +667,10 @@ impl SchematicState {
         // (unknown directives, unsupported device families).
         let import_warnings = netlist.warnings.len();
 
-        // Display of an f64 prints plain decimal notation, which parse_value
-        // always re-parses — the round trip never loses the number.
-        let fmt_val = |v: f64| format!("{v}");
+        // Values show the way a schematic writes them (`1k`, `100n`), and
+        // only when that spelling re-parses to the very same number — the
+        // round trip never loses the number.
+        let fmt_val = fmt_si;
 
         let mut parsed: Vec<ParsedComp> = vec![];
         for r in &circuit.resistors {
@@ -779,5 +907,113 @@ impl SchematicState {
             status.push_str(&format!(" · {} import warning(s)", import_warnings));
         }
         Ok((state, status))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn comp(kind: CompKind, x: i32, y: i32, val: &str) -> Component {
+        Component { kind, p1: GridPt(x, y), p2: GridPt(x + 3, y), val: val.to_string() }
+    }
+
+    #[test]
+    fn fmt_si_uses_suffixes_only_when_the_round_trip_is_exact() {
+        // Values as the importer meets them: parsed from suffix spellings.
+        for spelling in ["1k", "4.7k", "100n", "2.2u", "5", "10Meg", "1m", "47p", "0"] {
+            let v = parse_value(spelling).unwrap();
+            assert_eq!(fmt_si(v), spelling, "{spelling}");
+        }
+        // Whatever the spelling, the number survives the round trip exactly —
+        // including values whose suffix form would round (1e-7 is not 100n).
+        for v in [
+            0.123456789012345, 1e-7, 1.0000000000000001e-7, 9.999999999999999e-8, 3.3e-12,
+            4.7e6, -2.5e-3, 123456789.123, 1e15, 7.0e-18, -1e3,
+        ] {
+            assert_eq!(parse_value(&fmt_si(v)).unwrap(), v, "{v} -> {}", fmt_si(v));
+        }
+    }
+
+    #[test]
+    fn instance_names_count_per_kind_and_skip_ground() {
+        let comps = vec![
+            comp(CompKind::Resistor, 0, 0, "1k"),
+            comp(CompKind::Voltage, 0, 4, "5"),
+            comp(CompKind::Resistor, 0, 8, "2k"),
+            comp(CompKind::Ground, 0, 12, ""),
+            comp(CompKind::Capacitor, 0, 16, "1u"),
+            comp(CompKind::Inductor, 0, 20, "1m"),
+        ];
+        assert_eq!(instance_names(&comps), ["R1", "V1", "R2", "", "C1", "L1"]);
+    }
+
+    /// The canvas labels must be the names the netlist writer assigns.
+    #[test]
+    fn instance_names_match_the_netlist_writer() {
+        let mut st = SchematicState::default();
+        st.components = vec![
+            comp(CompKind::Resistor, 0, 0, "1k"),
+            comp(CompKind::Capacitor, 0, 4, "1u"),
+            comp(CompKind::Resistor, 0, 8, "2k"),
+            comp(CompKind::Voltage, 0, 12, "5"),
+            comp(CompKind::Ground, 0, 16, ""),
+        ];
+        let net = st.build_netlist().expect("netlist builds");
+        let names = instance_names(&st.components);
+        assert_eq!(net.circuit.resistors[0].name, names[0]);
+        assert_eq!(net.circuit.capacitors[0].name, names[1]);
+        assert_eq!(net.circuit.resistors[1].name, names[2]);
+        assert_eq!(net.circuit.voltage_sources[0].name, names[3]);
+    }
+
+    #[test]
+    fn delete_selection_prefers_the_wire_then_the_component() {
+        let mut st = SchematicState::default();
+        st.components = vec![comp(CompKind::Resistor, 0, 0, "1k")];
+        st.wires = vec![Wire { p1: GridPt(0, 0), p2: GridPt(3, 0) }];
+        st.select(Some(0), Some(0));
+        assert!(st.delete_selection());
+        assert!(st.wires.is_empty() && st.components.len() == 1);
+        st.select(Some(0), None);
+        assert!(st.delete_selection());
+        assert!(st.components.is_empty());
+        assert!(!st.delete_selection(), "nothing selected, nothing deleted");
+    }
+
+    #[test]
+    fn zoom_about_keeps_the_anchor_fixed() {
+        let mut st = SchematicState::default();
+        st.pan = Vec2::new(30.0, -10.0);
+        let anchor = Vec2::new(200.0, 150.0);
+        let before = (anchor - st.pan) / st.zoom;
+        st.zoom_about(1.5, anchor);
+        let after = (anchor - st.pan) / st.zoom;
+        assert!((before - after).length() < 1e-3, "{before:?} vs {after:?}");
+        assert!((st.zoom - 1.5).abs() < 1e-6);
+        st.zoom_about(1000.0, anchor);
+        assert_eq!(st.zoom, MAX_ZOOM);
+    }
+
+    #[test]
+    fn fit_view_centers_content_inside_the_canvas() {
+        let mut st = SchematicState::default();
+        assert!(st.content_bounds().is_none());
+        st.components = vec![comp(CompKind::Resistor, 2, 2, "1k")];
+        st.wires = vec![Wire { p1: GridPt(5, 2), p2: GridPt(5, 12) }];
+        let canvas = Vec2::new(800.0, 500.0);
+        st.fit_view(canvas);
+        let b = st.content_bounds().unwrap();
+        let top_left = b.min.to_vec2() * st.zoom + st.pan;
+        let bottom_right = b.max.to_vec2() * st.zoom + st.pan;
+        assert!(top_left.x >= 0.0 && top_left.y >= 0.0, "{top_left:?}");
+        assert!(bottom_right.x <= canvas.x && bottom_right.y <= canvas.y, "{bottom_right:?}");
+        let center = (top_left + bottom_right) / 2.0;
+        assert!((center - canvas / 2.0).length() < 1.0, "{center:?}");
+
+        st.components.clear();
+        st.wires.clear();
+        st.fit_view(canvas);
+        assert_eq!((st.zoom, st.pan), (1.0, Vec2::ZERO));
     }
 }

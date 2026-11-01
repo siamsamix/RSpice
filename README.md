@@ -38,13 +38,18 @@ cargo run --release -p rspice    # graphical app
 
 ### GUI (`circuitsim-gui`)
 
-Desktop app built with **egui** — dark theme, netlist editor, schematic view, DC tables and
-sweep plots, and interactive waveform plots.
+Desktop app built with **egui**, laid out after LTspice: a light interface with a menu bar and
+icon toolbar, document tabs (`.asc` schematic, `.cir` netlist, `.raw` results) over tiled
+child windows, a netlist editor, schematic view, DC tables and sweep plots, and interactive
+waveform plots on a black background.
 
-- **Run** or **F5** — simulate the current netlist
-- **Examples** — load RC, voltage divider, RL, or RC low-pass circuits
-- **Open / Save** — netlist files (`.cir`)
-- Tabs: **Overview**, **DC** (operating point + `.dc` sweep plot/table),
+- **Run** (toolbar or Simulate menu) or **F5** — simulate the current netlist
+- **File ▸ Examples** — load RC, voltage divider, RL, or RC low-pass circuits
+- **File ▸ Open / Save As** (**Ctrl+O** / **Ctrl+S**) — netlist files (`.cir`)
+- **Tools ▸ Import Netlist to Schematic / Generate Netlist from Schematic** — move a circuit
+  between the netlist and the schematic
+- **Window** menu or the toolbar — tile the editor and the results side by side or stacked
+- Result tabs: **Overview**, **DC** (operating point + `.dc` sweep plot/table),
   **Waveforms**, **Frequency response**
 
 ## Netlist format

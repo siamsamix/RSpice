@@ -890,8 +890,10 @@ impl SchematicState {
             state.ac_fstop  = format!("{}", ac.f_stop);
         } else if a.tran_step.is_some() {
             state.analysis_type = AnalysisType::Tran;
-            state.tran_step = format!("{}", a.tran_step.unwrap());
-            state.tran_stop = format!("{}", a.tran_stop.unwrap_or(0.0));
+            // SI spellings (`1u`, `5m`) rather than `0.000001`, which the
+            // narrow analysis fields would clip to `0.00000`.
+            state.tran_step = fmt_si(a.tran_step.unwrap());
+            state.tran_stop = fmt_si(a.tran_stop.unwrap_or(0.0));
         }
 
         // ── 6. Commit (a fresh canvas: nothing selected, view reset) ─────────
@@ -933,6 +935,17 @@ mod tests {
         ] {
             assert_eq!(parse_value(&fmt_si(v)).unwrap(), v, "{v} -> {}", fmt_si(v));
         }
+    }
+
+    /// An imported `.tran` fills the step/stop fields with SI spellings; plain
+    /// decimals (`0.000001`) overflow the narrow fields and read as `0.00000`.
+    #[test]
+    fn import_fills_tran_fields_with_si_spellings() {
+        let deck = "* rc\nV1 1 0 DC 5\nR1 1 2 1k\nC1 2 0 1u\n.tran 1u 5m\n.end\n";
+        let (state, _) = SchematicState::from_netlist(deck, &SchematicState::default())
+            .expect("deck imports");
+        assert_eq!(state.tran_step, "1u");
+        assert_eq!(state.tran_stop, "5m");
     }
 
     #[test]

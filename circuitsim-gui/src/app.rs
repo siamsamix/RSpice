@@ -1987,9 +1987,13 @@ impl CircuitSimApp {
         .show_background(true);
 
         let series = tran_voltage_series(tran, &self.plot_nodes, &self.node_names, 1.0, 1.0);
+        // The black frame carries the axis labels too; without it they sit in
+        // light gray (the viewer's text colour) on the white card.
         crate::plot::viewer_scope(ui, |ui| {
-            plot.show(ui, |plot_ui| {
-                draw(plot_ui, &series, 1.5);
+            code_frame().show(ui, |ui| {
+                plot.show(ui, |plot_ui| {
+                    draw(plot_ui, &series, 1.5);
+                });
             });
         });
     }

@@ -14,9 +14,9 @@ use crate::schematic::{
     GRID_SIZE,
 };
 use crate::plot::{
-    ac_current_series, ac_plot_frame, ac_voltage_series, dc_sweep_series, draw, plot_frame,
-    tran_current_series, tran_diff_series, tran_voltage_series, AcCursor, AcMagScale,
-    AcQuantity, PlotState,
+    ac_current_series, ac_plot_frame, ac_voltage_series, dc_sweep_series, draw,
+    first_transient_plot, plot_frame, tran_current_series, tran_diff_series,
+    tran_voltage_series, AcCursor, AcMagScale, AcQuantity, ExpressionTraces, PlotState,
 };
 
 /// Deck-spelling label for a node (`in`, `out`), falling back to its id.
@@ -247,6 +247,8 @@ enum TranSubTab {
     Voltage,
     Current,
     Differential,
+    /// Waveform arithmetic: typed expression traces (`V(out)*I(V1)`).
+    Expression,
 }
 
 pub struct CircuitSimApp {
@@ -277,6 +279,12 @@ pub struct CircuitSimApp {
     // Differential voltage plot node selectors
     diff_node_a: usize,
     diff_node_b: usize,
+
+    // Waveform arithmetic: the expression traces, the text being typed, and
+    // the last add's error.
+    expressions: ExpressionTraces,
+    expr_input: String,
+    expr_error: Option<String>,
 
     // Workspace: which child window has focus and how they are arranged.
     active_pane: Pane,
@@ -316,6 +324,10 @@ impl Default for CircuitSimApp {
 
             diff_node_a: 1,
             diff_node_b: 2,
+
+            expressions: ExpressionTraces::default(),
+            expr_input: String::new(),
+            expr_error: None,
 
             active_pane: Pane::Editor,
             tiling: Tiling::Single,
@@ -396,6 +408,13 @@ impl CircuitSimApp {
 
                 match run(&netlist) {
                     Ok(result) => {
+                        // The expression traces compute over the first run's
+                        // transient plot as `.raw` columns; built before the
+                        // result is taken apart.
+                        let raw = circuitsim::rawwave::build("* gui", &netlist, &result);
+                        self.expressions
+                            .rebase(first_transient_plot(raw), netlist.param_env());
+                        self.expr_error = None;
                         self.apply_result(result);
                         self.show_results_after_run();
                         self.status = Some((true, "Simulation finished".into()));
@@ -468,6 +487,8 @@ impl CircuitSimApp {
         self.tran = None;
         self.ac = None;
         self.node_names = vec!["0".to_string()];
+        self.expressions.rebase(None, Default::default());
+        self.expr_error = None;
     }
 
     fn load_example(&mut self, ex: Example) {
@@ -2284,6 +2305,7 @@ impl CircuitSimApp {
             ui.selectable_value(&mut self.tran_sub_tab, TranSubTab::Voltage, "Voltage");
             ui.selectable_value(&mut self.tran_sub_tab, TranSubTab::Current, "Current");
             ui.selectable_value(&mut self.tran_sub_tab, TranSubTab::Differential, "Differential");
+            ui.selectable_value(&mut self.tran_sub_tab, TranSubTab::Expression, "Expression");
         });
         ui.separator();
 
@@ -2393,6 +2415,88 @@ impl CircuitSimApp {
                     plot_frame(
                         "waveforms_diff", adjusted_height, "time (s)",
                         &format!("V({}) − V({})  (V)", node_label(&self.node_names, node_a), node_label(&self.node_names, node_b)),
+                        &series, apply, ui,
+                    );
+                });
+            }
+
+            TranSubTab::Expression => {
+                // ── Waveform arithmetic: type an expression, plot the result ──
+                let mut submit = false;
+                ui.horizontal_wrapped(|ui| {
+                    if ui.button("Auto Fit").clicked() {
+                        self.plot.tran_bounds.reset();
+                        self.plot.tran_apply = true;
+                    }
+
+                    ui.separator();
+
+                    ui.label(egui::RichText::new("Expression:").color(TEXT_SECONDARY));
+                    let edit = ui.add(
+                        egui::TextEdit::singleline(&mut self.expr_input)
+                            .hint_text("V(out)*I(V1)")
+                            .desired_width(240.0),
+                    );
+                    let enter = edit.lost_focus()
+                        && ui.input(|i| i.key_pressed(egui::Key::Enter));
+                    if ui.button("Add").clicked() || enter {
+                        submit = true;
+                    }
+                    if ui.button("Clear").clicked() {
+                        self.expressions.clear();
+                        self.expr_error = None;
+                    }
+                });
+
+                if submit {
+                    match self.expressions.add(&self.expr_input) {
+                        Ok(()) => {
+                            self.expr_input.clear();
+                            self.expr_error = None;
+                        }
+                        Err(e) => self.expr_error = Some(e),
+                    }
+                    // A new trace refits the view, like the Auto Fit button.
+                    self.plot.tran_bounds.reset();
+                    self.plot.tran_apply = true;
+                }
+
+                if let Some(error) = &self.expr_error {
+                    ui.label(egui::RichText::new(error).color(STATUS_ERROR));
+                }
+
+                let names = self.expressions.names();
+                if names.is_empty() {
+                    ui.label(
+                        egui::RichText::new(
+                            "Plot arithmetic over the traces: V(out)*I(V1) (power), 2*V(out)+1, \
+                             V(a,b), db(V(out)), d(V(out)).",
+                        )
+                        .color(TEXT_SECONDARY),
+                    );
+                } else {
+                    let mut remove = None;
+                    ui.horizontal_wrapped(|ui| {
+                        for (i, name) in names.iter().enumerate() {
+                            if ui.small_button(format!("{name} ×")).clicked() {
+                                remove = Some(i);
+                            }
+                        }
+                    });
+                    if let Some(i) = remove {
+                        self.expressions.remove(i);
+                    }
+                }
+
+                ui.add_space(8.0);
+
+                code_frame().show(ui, |ui| {
+                    let adjusted_height = ui.available_height();
+                    let series = self.expressions.series(x_mult, y_mult);
+                    let apply = self.plot.tran_apply.then(|| self.plot.tran_bounds);
+                    self.plot.tran_apply = false;
+                    plot_frame(
+                        "waveforms_expr", adjusted_height, "time (s)", "Expression",
                         &series, apply, ui,
                     );
                 });

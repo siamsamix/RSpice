@@ -276,8 +276,21 @@ below is written against that state.
   CLI `--cursor` (repeatable, SPICE-suffixed, max 2/pane, snaps to first kept trace, coordinate/
   delta readouts, `f = 1/Δt` on time axes); interactive dragging/ruler-to-cursor wiring is the
   later §7 GUI item)*
-- [ ] **[P1] (LT)** Waveform arithmetic: add arbitrary expression traces (`V(out)*I(V1)` power, scaled,
-  offset, combined) — the viewer plots only raw `V(n)`, `I(el)`, `V(a)-V(b)` today.
+- [x] **[P1] (LT)** Waveform arithmetic: add arbitrary expression traces (`V(out)*I(V1)` power, scaled,
+  offset, combined). *(done: core `arith.rs` — `TraceExpr::parse`/`evaluate` over a plot's `.raw`
+  columns (`+ - * / ^`, SPICE-suffixed numbers, `V(a,b)` differences, `V(0)`/`V(gnd)` = 0,
+  case-insensitive probes, the axis and step columns and numeric deck `.param`s as bare names,
+  `abs mag ph arg re im db sgn sqrt exp ln log log10`, trig/hyperbolic, `floor ceil int round`,
+  `pow pwr pwrs atan2 hypot min max`, and `d()` against the axis); real plots compute in `f64`
+  (domain errors are NaN), `.ac` plots in complex arithmetic, so `V(out)/V(in)` is the transfer
+  phasor. `add_expression_traces` appends the results as ordinary columns named by their
+  expression, so the CSV/SVG exporters, FFT and `.raw` writer take them with no second path; a
+  plot lacking a probe is skipped, an expression no plot can evaluate or a syntax error is a loud
+  error. CLI `--expr` (repeatable) feeds `--waves/--image/--fft`; GUI Waveforms tab gains an
+  **Expression** sub-tab (type, Add/Enter, per-trace ×, Clear; re-evaluated on every run) over the
+  first run's transient plot. Function list written from memory of LTspice's help, not checked
+  against the reference install; `.ac`/`.dc` plots in the GUI and LTspice's `x`/`y` axis-stat
+  functions (`integ`, `avg`, `rms`, `Mag`-over-window, …) are not covered.)*
 - [x] **[P1] (both)** FFT of transient traces with configurable windowing (LTspice Blackman-Harris et
   al.; PSpice Probe FFT). *(done: core `fft.rs` (13 windows incl. `--window`/aliases, unit-mean
   taper, next-power-of-two resample, bin = 1/span, `{trace} (FFT)` plots) + CLI `--fft` SVG;

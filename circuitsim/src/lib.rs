@@ -39,7 +39,7 @@ pub use circuit::{AbmForm, AbmMeasure, BehavioralKind, BehavioralSource, Circuit
 pub use error::{Result, SimError};
 pub use netlist::{Netlist, parse_with_overrides};
 pub use rawwave::{RawDataset, RawFile, RawFlavor, RawVariable};
-pub use runs::{run, StepRun};
+pub use runs::{default_threads, run, run_with_threads, StepRun};
 
 /// Parse a netlist string and run all requested analyses.
 ///

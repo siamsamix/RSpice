@@ -131,6 +131,10 @@ deepening that has not landed yet.
   and that run's analyses; `SimulationResult.runs` holds them all, with the first mirrored into
   the top-level fields for single-run consumers. The `.mc` driver's Monte Carlo runs ride this
   same shape.
+- **Run plan / worker count** — `runs::RunPlan` is one independent run (a `.step` combination or a
+  Monte Carlo index); `execute_plans` deals plans to `default_threads()` scoped workers
+  (`RSPICE_THREADS`, CLI `-j`) and collects them in plan order, so thread count never changes
+  results or which error surfaces (always the lowest-indexed failing plan).
 - **MC draw seed** — the 64-bit `ParamEnv.mc_seed` every keyed draw mixes in: the sweep
   overrides hashed by `seed_from_overrides`, optionally raised by `.options seed=<n>`
   (`mix64(overrides ⊕ literal)`, lifted before element lines expand). 0 stays the constant of

@@ -159,6 +159,12 @@ struct Args {
     /// Suppress import warnings
     #[arg(long)]
     no_warnings: bool,
+
+    /// Worker threads for the independent runs of a .step / .mc / .temp
+    /// sweep (default: RSPICE_THREADS, else every core; 1 = serial). Results
+    /// are identical for any value.
+    #[arg(short = 'j', long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
+    jobs: Option<u32>,
 }
 
 fn main() {
@@ -256,7 +262,10 @@ fn run_cli() -> Result<(), CliError> {
         );
     }
 
-    let result = run(&netlist)?;
+    let result = match args.jobs {
+        Some(jobs) => circuitsim::run_with_threads(&netlist, jobs as usize)?,
+        None => run(&netlist)?,
+    };
     // One plot set for --waves/--image/--fft, expression columns appended.
     let plots = |title: &str| -> Result<circuitsim::RawFile, SimError> {
         let mut raw = circuitsim::rawwave::build(title, &netlist, &result);

@@ -465,8 +465,17 @@ Neither LTspice nor PSpice does these today; RSpice targets them for its "advanc
   and accuracy compared element-for-element against LTspice `.raw` results; "fast" must be measured,
   not asserted. *(Harness with canonical suite, throughput, and analytic accuracy landed at
   `circuitsim/examples/benchmark.rs`; LTspice `.raw` comparison awaits the raw reader.)*
-- [ ] **[P1] (spot)** Parallel parametric sweeps: distribute `.step`/Monte-Carlo/MC-style runs across
-  cores — neither tool parallelizes over runs.
+- [x] **[P1] (spot)** Parallel parametric sweeps: distribute `.step`/Monte-Carlo/MC-style runs across
+  cores — neither tool parallelizes over runs. *(done: `runs::run_plans` hands the independent run
+  plans (`.step` combinations, `.temp` lists, `.mc` runs) to scoped worker threads — one atomic
+  counter deals indices in order, results land in plan order, the calling thread works too, and a
+  failure stops later claims so the error returned is always the lowest-indexed one, exactly the one
+  a serial loop stops at. Results are bit-identical for any worker count (tests compare the full
+  `Debug` dump of a stepped transient and a Monte Carlo deck at 1/2/3/8/64 workers; the first-error
+  test uses two differently-failing plans so a "first to finish" driver would show). Knobs:
+  `circuitsim::run_with_threads(netlist, n)`, `RSPICE_THREADS`, CLI `-j/--jobs N`; default = all
+  cores. Measured: 32-run RC `.tran` sweep, 7.75 s → 4.31 s on 2 cores (1.8×), byte-identical
+  output. Across-run parallelism only — threading inside one solve is §3's open item.)*
 - [ ] **[P2] (spot)** GPU-accelerated linear solve (wgpu) as an optional backend for very large designs.
 - [ ] **[P2] (spot)** Steady-state detection and automatic quality presets ("fast" / "accurate" solver
   profiles).

@@ -165,6 +165,17 @@ struct Args {
     /// are identical for any value.
     #[arg(short = 'j', long, value_name = "N", value_parser = clap::value_parser!(u32).range(1..))]
     jobs: Option<u32>,
+
+    /// Compare the simulation against a reference .raw file (e.g. LTspice's
+    /// run of the same deck): print per-trace error figures and exit 1 when
+    /// any trace exceeds --compare-tol
+    #[arg(long, value_name = "FILE")]
+    compare_raw: Option<PathBuf>,
+
+    /// Largest allowed max|error| / reference-peak per trace for --compare-raw
+    /// (LTspice stores f32 values: expect ~1e-6 at best)
+    #[arg(long, requires = "compare_raw", default_value_t = 1e-3, value_name = "TOL")]
+    compare_tol: f64,
 }
 
 fn main() {
@@ -332,16 +343,41 @@ fn run_cli() -> Result<(), CliError> {
         fs::write(path, circuitsim::export::svg_document(&spectra, &[]))?;
     }
 
-    let body = if args.csv {
+    // The reference comparison (TODO §11): per-trace error figures ride at the
+    // end of whatever body is printed; a trace beyond the tolerance (or a
+    // missing reference plot) makes the run exit non-zero *after* the output.
+    let mut comparison = String::new();
+    let mut comparison_failure = None;
+    if let Some(path) = &args.compare_raw {
+        let reference = circuitsim::rawwave::read(&fs::read(path)?)?;
+        let raw = plots(&format!("* {}", args.netlist.display()))?;
+        let cmp = circuitsim::compare_raw(&reference, &raw);
+        let _ = writeln!(comparison, "\nComparison against {}:", path.display());
+        comparison.push_str(&cmp.report(args.compare_tol));
+        if !cmp.is_within(args.compare_tol) {
+            comparison_failure = Some(format!(
+                "waveforms differ from {} (worst max/peak {:.3e}, tolerance {:.1e})",
+                path.display(),
+                cmp.worst_norm(),
+                args.compare_tol
+            ));
+        }
+    }
+
+    let mut body = if args.csv {
         csv_body(&netlist, &result)
     } else {
         report
     };
+    body.push_str(&comparison);
     match &args.output {
         Some(path) => fs::write(path, body)?,
         None => print!("{body}"),
     }
-    Ok(())
+    match comparison_failure {
+        Some(message) => Err(SimError::Analysis(message).into()),
+        None => Ok(()),
+    }
 }
 
 /// Candidate directories for the app's bundled model libraries.

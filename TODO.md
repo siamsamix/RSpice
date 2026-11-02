@@ -461,10 +461,24 @@ below is written against that state.
 
 Neither LTspice nor PSpice does these today; RSpice targets them for its "advanced and fast" claim.
 
-- [ ] **[P1] (spot)** Benchmark harness: canonical circuit suite with throughput (node·iterations/s)
+- [x] **[P1] (spot)** Benchmark harness: canonical circuit suite with throughput (node·iterations/s)
   and accuracy compared element-for-element against LTspice `.raw` results; "fast" must be measured,
-  not asserted. *(Harness with canonical suite, throughput, and analytic accuracy landed at
-  `circuitsim/examples/benchmark.rs`; LTspice `.raw` comparison awaits the raw reader.)*
+  not asserted. *(Harness with canonical suite, throughput, and analytic accuracy at
+  `circuitsim/examples/benchmark.rs`; the LTspice half is done as tooling: core `rawcompare.rs`
+  (`compare_raw`) pairs plots by `Plotname:` (k-th occurrence with k-th, so stepped files line up)
+  and traces by name, interpolates RSpice's trace onto each **reference** axis point (the tools pick
+  different timesteps; exact when grids coincide, as in `.ac`/`.dc`), reads a reference time axis as
+  `|t|` (LTspice flags stored points with negative stamps), compares single-point `.op` plots by
+  name (LTspice's file has no axis variable), takes complex `.ac` traces by phasor distance, and
+  reports `max|err|`, `rms` and `max|err|/peak` per trace — scale-free through zero crossings; a NaN
+  or a missing reference plot never passes, reference-only traces and RSpice-only plots are listed not
+  failed. Entry points: CLI `--compare-raw <file>` (+ `--compare-tol`, default 1e-3; table appended
+  to the output, exit 1 past the tolerance) and the benchmark's `--write-decks DIR` (emit every case
+  as `<case>.cir` to run in LTspice) → `--reference-dir DIR` (a `vs LTspice` column per case, exit 1
+  past `--tol`). Verified against RSpice's own binary `.raw` round trip (f32 quantisation reads
+  ~5e-8), a coarse analytic grid, injected errors and hand-built LTspice-shaped plots.
+  **Not yet done:** no LTspice run happened in this environment, so there are no real LTspice
+  numbers — generate `<case>.raw` with the author's Wine install and run the flow above.)*
 - [x] **[P1] (spot)** Parallel parametric sweeps: distribute `.step`/Monte-Carlo/MC-style runs across
   cores — neither tool parallelizes over runs. *(done: `runs::run_plans` hands the independent run
   plans (`.step` combinations, `.temp` lists, `.mc` runs) to scoped worker threads — one atomic

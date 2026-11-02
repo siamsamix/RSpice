@@ -18,6 +18,7 @@ pub mod mna;
 pub mod model;
 pub mod netlist;
 pub mod params;
+pub mod rawcompare;
 pub mod rawwave;
 pub mod runs;
 pub mod sparse;
@@ -38,6 +39,7 @@ pub use circuit::{AbmForm, AbmMeasure, BehavioralKind, BehavioralSource, Circuit
                   OpAmpModel, Switch, SwitchControl, SwitchModel, Tline, Waveform};
 pub use error::{Result, SimError};
 pub use netlist::{Netlist, parse_with_overrides};
+pub use rawcompare::{compare as compare_raw, RawComparison, TraceDelta};
 pub use rawwave::{RawDataset, RawFile, RawFlavor, RawVariable};
 pub use runs::{default_threads, run, run_with_threads, StepRun};
 

@@ -116,6 +116,12 @@ deepening that has not landed yet.
   `.log` sidecar), and operating points keep a synthetic `time = 0` axis so real plots stay
   axis-first (documented interpretation). Bit-for-bit LTspice parity is not the goal —
   reading its files and writing files its readers accept is.
+- **Raw comparison** — `rawcompare::compare(reference, ours)`, TODO §11: per-trace
+  `max|err|`, `rms`, and `max|err|/peak` of RSpice's traces against a reference `.raw` (usually
+  LTspice's), RSpice interpolated onto the reference axis. Plots pair by plotname occurrence,
+  traces by name; a missing reference plot, a NaN, or nothing compared fails `is_within`.
+  Reference-only traces / RSpice-only plots are informational. CLI `--compare-raw`, benchmark
+  `--reference-dir`.
 - **Expression trace (waveform arithmetic)** — a derived plot column named by the expression
   that made it (`V(out)*I(V1)`), TODO §6. `arith.rs`: `TraceExpr::parse` once, `evaluate` per
   `RawDataset` over whole columns (so `d()` sees the axis), `add_expression_traces` appends the

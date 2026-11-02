@@ -149,7 +149,7 @@ const TOOLS: [(Tool, Icon, &str); 7] = [
 
 use crate::theme::{
     self, bar_frame, card_frame, code_frame, section_heading, ACCENT, ACCENT_DIM, LT_STRIP,
-    LT_WHITE, LT_WORKSPACE, STATUS_ERROR, STATUS_OK, TEXT_SECONDARY,
+    LT_WHITE, LT_WORKSPACE, STATUS_ERROR, STATUS_OK, TEXT_DISABLED, TEXT_SECONDARY,
 };
 
 const DEFAULT_NETLIST: &str = r#"* RC charging — edit and press Run (F5)
@@ -2465,8 +2465,8 @@ impl CircuitSimApp {
                     ui.label(egui::RichText::new(error).color(STATUS_ERROR));
                 }
 
-                let names = self.expressions.names();
-                if names.is_empty() {
+                let entries = self.expressions.entries();
+                if entries.is_empty() {
                     ui.label(
                         egui::RichText::new(
                             "Plot arithmetic over the traces: V(out)*I(V1) (power), 2*V(out)+1, \
@@ -2477,8 +2477,19 @@ impl CircuitSimApp {
                 } else {
                     let mut remove = None;
                     ui.horizontal_wrapped(|ui| {
-                        for (i, name) in names.iter().enumerate() {
-                            if ui.small_button(format!("{name} ×")).clicked() {
+                        for (i, (name, live)) in entries.iter().enumerate() {
+                            // A dormant expression (the current run has no
+                            // data for it) stays listed, dimmed, and draws
+                            // again when a run can compute it.
+                            let label = egui::RichText::new(format!("{name} ×"));
+                            let label = if *live { label } else { label.color(TEXT_DISABLED) };
+                            let chip = ui.add(egui::Button::new(label).small());
+                            let chip = if *live {
+                                chip
+                            } else {
+                                chip.on_hover_text("No data for this expression in the current run")
+                            };
+                            if chip.clicked() {
                                 remove = Some(i);
                             }
                         }

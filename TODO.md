@@ -283,12 +283,16 @@ below is written against that state.
   `abs mag ph arg re im db sgn sqrt exp ln log log10`, trig/hyperbolic, `floor ceil int round`,
   `pow pwr pwrs atan2 hypot min max`, and `d()` against the axis); real plots compute in `f64`
   (domain errors are NaN), `.ac` plots in complex arithmetic, so `V(out)/V(in)` is the transfer
-  phasor. `add_expression_traces` appends the results as ordinary columns named by their
-  expression, so the CSV/SVG exporters, FFT and `.raw` writer take them with no second path; a
+  phasor; `frequency`/`time` name the plot's axis by kind (an AC axis column is `freq`), and
+  expressions are bounded (256 operations, 64 nesting levels) so a runaway chain is a parse error,
+  never a stack overflow. `add_expression_traces` appends the results as ordinary columns named
+  by their expression minus whitespace (a `.raw` name cannot carry spaces; the CSV header quotes
+  comma names like `V(a,b)`), so the exporters, FFT and `.raw` writer take them with no second path; a
   plot lacking a probe is skipped, an expression no plot can evaluate or a syntax error is a loud
   error. CLI `--expr` (repeatable) feeds `--waves/--image/--fft`; GUI Waveforms tab gains an
-  **Expression** sub-tab (type, Add/Enter, per-trace ×, Clear; re-evaluated on every run) over the
-  first run's transient plot. Function list written from memory of LTspice's help, not checked
+  **Expression** sub-tab (type, Add/Enter, per-trace ×, Clear; re-evaluated on every run, and
+  kept dormant — dimmed, undrawn — through runs that cannot compute them) over the first run's
+  transient plot. Function list written from memory of LTspice's help, not checked
   against the reference install; `.ac`/`.dc` plots in the GUI and LTspice's `x`/`y` axis-stat
   functions (`integ`, `avg`, `rms`, `Mag`-over-window, …) are not covered.)*
 - [x] **[P1] (both)** FFT of transient traces with configurable windowing (LTspice Blackman-Harris et

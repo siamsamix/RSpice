@@ -34,7 +34,13 @@ pub fn csv_document(raw: &RawFile, measurements: &[MeasureResult], traces: &[Str
         out.push_str(&format!("# {}\n", ds.plotname));
         let keep = selected_variables(ds, traces);
         let complex = is_complex(ds);
-        out.push_str(&header_cells(ds, &keep, complex).join(","));
+        // Names may carry commas (`V(a,b)` expression traces): quote every
+        // header cell so the header keeps one field per column.
+        let header: Vec<String> = header_cells(ds, &keep, complex)
+            .iter()
+            .map(|cell| csv_cell(cell))
+            .collect();
+        out.push_str(&header.join(","));
         out.push('\n');
         for row in &ds.values {
             out.push_str(&row_cells(row, &keep, complex).join(","));

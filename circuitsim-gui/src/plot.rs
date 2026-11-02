@@ -623,19 +623,28 @@ pub fn dc_sweep_series(
 pub struct ExpressionTraces {
     base: Option<RawDataset>,
     env: ParamEnv,
-    traces: Vec<(TraceExpr, Vec<f64>)>,
+    entries: Vec<Entry>,
+}
+
+/// One configured expression: its canonical text always, its computed
+/// values only while the current data can supply them. An entry the data
+/// cannot evaluate (no transient plot after a failed run, a probe the
+/// edited deck no longer has) stays dormant — the user's configuration —
+/// and comes back the next time a run can evaluate it.
+struct Entry {
+    text: String,
+    values: Option<Vec<f64>>,
 }
 
 impl ExpressionTraces {
-    /// A new run's data: expressions already on screen re-evaluate against
-    /// it; one the new deck cannot evaluate (a probe it no longer has)
-    /// drops out quietly.
+    /// A new run's data (or `None` when the run failed or has no transient
+    /// plot): every configured expression re-evaluates against it; the ones
+    /// it cannot evaluate go dormant instead of being dropped.
     pub fn rebase(&mut self, base: Option<RawDataset>, env: ParamEnv) {
         self.base = base;
         self.env = env;
-        let texts: Vec<String> = self.traces.drain(..).map(|(e, _)| e.text().to_string()).collect();
-        for text in texts {
-            let _ = self.add(&text);
+        for entry in &mut self.entries {
+            entry.values = Self::compute(&self.base, &self.env, &entry.text).ok();
         }
     }
 
@@ -644,58 +653,79 @@ impl ExpressionTraces {
         self.base.is_some()
     }
 
-    /// Add one expression; a repeat (case-insensitive) is a no-op. Errors
-    /// are display text: the syntax problem, or the probe the plot lacks.
-    pub fn add(&mut self, text: &str) -> Result<(), String> {
-        let Some(base) = &self.base else {
+    /// `text` evaluated over `base`; errors are display text — the syntax
+    /// problem, or the trace the plot lacks.
+    fn compute(base: &Option<RawDataset>, env: &ParamEnv, text: &str) -> Result<Vec<f64>, String> {
+        let Some(base) = base else {
             return Err("no transient plot to compute against — run a .tran first".to_string());
         };
-        let text = text.trim();
-        if text.is_empty() {
-            return Ok(());
-        }
-        let expr = TraceExpr::parse(text, &self.env).map_err(|e| e.to_string())?;
-        if self
-            .traces
-            .iter()
-            .any(|(t, _)| t.text().eq_ignore_ascii_case(expr.text()))
-        {
-            return Ok(());
-        }
+        let expr = TraceExpr::parse(text, env).map_err(|e| e.to_string())?;
         let values = expr
             .evaluate(base)
             .ok_or_else(|| format!("'{}' names a trace this plot does not have", expr.text()))?;
-        self.traces
-            .push((expr, values.into_iter().map(|z| z.re).collect()));
+        Ok(values.into_iter().map(|z| z.re).collect())
+    }
+
+    /// Add one expression; a repeat (case-insensitive, whitespace aside) is
+    /// a no-op. Only an expression the current data can evaluate is added —
+    /// a typo or a missing probe returns its error and changes nothing.
+    pub fn add(&mut self, text: &str) -> Result<(), String> {
+        if text.trim().is_empty() {
+            return Ok(());
+        }
+        let expr = TraceExpr::parse(text, &self.env).map_err(|e| e.to_string())?;
+        let values = Self::compute(&self.base, &self.env, text)?;
+        if !self
+            .entries
+            .iter()
+            .any(|e| e.text.eq_ignore_ascii_case(expr.text()))
+        {
+            self.entries.push(Entry {
+                text: expr.text().to_string(),
+                values: Some(values),
+            });
+        }
         Ok(())
     }
 
     pub fn remove(&mut self, index: usize) {
-        if index < self.traces.len() {
-            self.traces.remove(index);
+        if index < self.entries.len() {
+            self.entries.remove(index);
         }
     }
 
     pub fn clear(&mut self) {
-        self.traces.clear();
+        self.entries.clear();
     }
 
-    /// The expressions as typed, in the order they were added.
+    /// The configured expressions in the order added, each with whether the
+    /// current data can plot it.
+    pub fn entries(&self) -> Vec<(String, bool)> {
+        self.entries
+            .iter()
+            .map(|e| (e.text.clone(), e.values.is_some()))
+            .collect()
+    }
+
+    /// The configured expression texts, in the order added.
     pub fn names(&self) -> Vec<String> {
-        self.traces.iter().map(|(e, _)| e.text().to_string()).collect()
+        self.entries.iter().map(|e| e.text.clone()).collect()
     }
 
-    /// One series per expression, colored by order added (first is green).
+    /// One series per plottable expression, colored by order added among
+    /// the configured ones (the first is green); dormant ones draw nothing
+    /// but keep their slot, so colors do not shuffle when one wakes up.
     pub fn series(&self, x_mult: f64, y_mult: f64) -> Vec<PlotSeries> {
         let Some(base) = &self.base else {
             return Vec::new();
         };
         let axis = base.axis();
-        self.traces
+        self.entries
             .iter()
             .enumerate()
-            .map(|(slot, (expr, values))| PlotSeries {
-                name: expr.text().to_string(),
+            .filter_map(|(slot, entry)| Some((slot, &entry.text, entry.values.as_ref()?)))
+            .map(|(slot, text, values)| PlotSeries {
+                name: text.clone(),
                 color: PLOT_COLORS[slot % PLOT_COLORS.len()],
                 points: axis
                     .iter()
@@ -740,7 +770,10 @@ mod tests {
         let series = traces.series(1.0, 1.0);
         assert_eq!(series.len(), 2);
         assert_eq!(series[0].name, "V(out)*I(V1)");
-        assert!((series[0].points[3][1].abs() - 4.6875e-3).abs() < 1e-8);
+        // Signed, as the core computes it: I(V1) is negative for a source
+        // delivering power (SPICE convention), so the power reads −4.6875 mW.
+        assert!((series[0].points[3][1] - (-4.6875e-3)).abs() < 1e-8, "{:?}", series[0].points[3]);
+        assert!(series[0].points[3][1] < 0.0);
         assert!((series[1].points[3][1] - 8.5).abs() < 1e-9);
         assert_eq!(series[0].color, PLOT_COLORS[0]);
         assert_eq!(series[1].color, PLOT_COLORS[1]);
@@ -762,17 +795,70 @@ mod tests {
         assert_eq!(traces.names().len(), 1);
     }
 
+    fn plot_of(deck: &str) -> (Option<RawDataset>, ParamEnv) {
+        let netlist = parse(deck).expect("deck parses");
+        let result = run(&netlist).expect("deck runs");
+        let raw = circuitsim::rawwave::build("t", &netlist, &result);
+        (first_transient_plot(raw), netlist.param_env())
+    }
+
+    /// A new run re-evaluates every configured expression; one the new deck
+    /// cannot compute (a probe it lacks) goes dormant — still configured,
+    /// not drawn — and draws again once a deck can supply it.
     #[test]
-    fn a_new_run_re_evaluates_and_drops_what_it_can_no_longer_compute() {
+    fn a_new_run_re_evaluates_and_keeps_what_it_cannot_compute_yet() {
         let mut traces = divider_traces();
         traces.add("V(out)*2").unwrap();
         traces.add("V(in)*3").unwrap();
-        let other = parse("V1 a 0 dc 2\nR1 a out 1k\nR2 out 0 1k\n.tran 10u 100u\n.end\n").unwrap();
-        let result = run(&other).unwrap();
-        let raw = circuitsim::rawwave::build("t", &other, &result);
-        traces.rebase(first_transient_plot(raw), other.param_env());
-        assert_eq!(traces.names(), vec!["V(out)*2".to_string()]);
-        assert!((traces.series(1.0, 1.0)[0].points[2][1] - 2.0).abs() < 1e-9);
+        let (plot, env) = plot_of("V1 a 0 dc 2\nR1 a out 1k\nR2 out 0 1k\n.tran 10u 100u\n.end\n");
+        traces.rebase(plot, env);
+        assert_eq!(
+            traces.entries(),
+            vec![("V(out)*2".to_string(), true), ("V(in)*3".to_string(), false)]
+        );
+        let series = traces.series(1.0, 1.0);
+        assert_eq!(series.len(), 1);
+        assert!((series[0].points[2][1] - 2.0).abs() < 1e-9);
+
+        // The original deck wakes the dormant one, in its original slot.
+        let (plot, env) = plot_of(DIVIDER);
+        traces.rebase(plot, env);
+        let series = traces.series(1.0, 1.0);
+        assert_eq!(series.len(), 2);
+        assert_eq!(series[1].name, "V(in)*3");
+        assert_eq!(series[1].color, PLOT_COLORS[1]);
+    }
+
+    /// A failed run (parse or solver error) or an AC-only deck leaves no
+    /// transient plot; the configured expressions must survive that and
+    /// compute again with the next run that has one.
+    #[test]
+    fn expressions_survive_runs_without_a_transient_plot() {
+        let mut traces = divider_traces();
+        traces.add("V(out)*I(V1)").unwrap();
+        traces.add("2*V(out)+1").unwrap();
+
+        traces.rebase(None, ParamEnv::default());
+        assert!(!traces.has_data());
+        assert_eq!(
+            traces.entries(),
+            vec![("V(out)*I(V1)".to_string(), false), ("2*V(out)+1".to_string(), false)]
+        );
+        assert!(traces.series(1.0, 1.0).is_empty());
+        assert!(traces.add("V(in)").is_err(), "nothing new adds without data");
+        assert_eq!(traces.names().len(), 2);
+
+        let (ac_only, env) = plot_of("V1 in 0 ac 1\nR1 in out 1k\nC1 out 0 1u\n.ac dec 2 1k 10k\n.end\n");
+        assert!(ac_only.is_none());
+        traces.rebase(ac_only, env);
+        assert_eq!(traces.names().len(), 2);
+
+        let (plot, env) = plot_of(DIVIDER);
+        traces.rebase(plot, env);
+        assert!(traces.entries().iter().all(|(_, live)| *live));
+        let series = traces.series(1.0, 1.0);
+        assert_eq!(series.len(), 2);
+        assert!((series[1].points[3][1] - 8.5).abs() < 1e-9);
     }
 
     #[test]

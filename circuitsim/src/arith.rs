@@ -16,9 +16,11 @@
 //! - **probes** — `V(node)`, `I(device)`, and any `Name(text)` spelled like a
 //!   column of the plot (`Id(M1)`); `V(a,b)` is `V(a) - V(b)`; `V(0)` and
 //!   `V(gnd)` are zero. Matching is case-insensitive.
-//! - **bare names** — the axis (`time`, `frequency`) or any other column by
-//!   name (a step column such as `r`), else a numeric deck parameter
-//!   (the column wins, so a stepped `r` is the run's value), else `pi`.
+//! - **bare names** — any column by name (a step column such as `r`, or an
+//!   axis named `time`/`freq`), the axis by its kind word (`time`,
+//!   `frequency` — an AC plot's axis column is spelled `freq`), else a
+//!   numeric deck parameter (the column wins, so a stepped `r` is the run's
+//!   value), else `pi`.
 //! - **functions** — `abs mag ph arg re real im imag db sgn sqrt exp ln log
 //!   log10 sin cos tan asin acos atan sinh cosh tanh floor ceil int round d
 //!   pow pwr pwrs atan2 hypot min max`. `log` is base 10 like the deck
@@ -31,10 +33,19 @@
 //!
 //! Complex plots (`.ac`) evaluate in complex arithmetic, so `V(out)/V(in)`
 //! is the transfer phasor; real plots evaluate in `f64` (`sqrt(-1)` is NaN,
-//! never an imaginary value). A plot that lacks a column an expression
-//! names is skipped silently — like `--traces`, requests no plot carries
-//! are quiet — but an expression no plot can evaluate is an error, and a
-//! malformed expression is an error before any plot is touched.
+//! never an imaginary value; a zero base under a negative power is
+//! infinite). A plot that lacks a column an expression names is skipped
+//! silently — like `--traces`, requests no plot carries are quiet — but an
+//! expression no plot can evaluate is an error, and a malformed expression
+//! is an error before any plot is touched.
+//!
+//! The new column is named by the expression with its whitespace removed
+//! (`V(out) * 2` → `V(out)*2`): a `.raw` variable name cannot carry spaces,
+//! so the name survives a write and read of the file, and spelling
+//! variants of one expression are one trace. Expressions are bounded
+//! ([`MAX_OPERATIONS`] operators, calls and signs; [`MAX_DEPTH`] levels of
+//! nesting) so a hostile or runaway chain is a parse error, never a stack
+//! overflow in the evaluator.
 
 use crate::error::{Result, SimError};
 use crate::params::ParamEnv;
@@ -85,7 +96,15 @@ const FUNCTIONS: &[(&str, usize)] = &[
     ("max", 2),
 ];
 
+/// Nesting levels (parentheses, call arguments, chained signs) one
+/// expression may open.
 const MAX_DEPTH: u32 = 64;
+
+/// Operators, calls and unary signs one expression may hold. A flat chain
+/// (`a+b+c+…`) builds a left-deep tree whose height is its operator count,
+/// and the evaluator and the tree's drop both recurse over that height, so
+/// the count bounds the stack the same way [`MAX_DEPTH`] bounds nesting.
+const MAX_OPERATIONS: u32 = 256;
 
 fn arity(name: &str) -> Option<usize> {
     FUNCTIONS.iter().find(|(n, _)| *n == name).map(|(_, a)| *a)
@@ -107,8 +126,8 @@ enum Node {
     Call(String, Vec<Node>),
 }
 
-/// A parsed waveform expression: the text it was typed as (which also names
-/// the column it produces) and its tree.
+/// A parsed waveform expression: its canonical text (the typed text without
+/// whitespace, which also names the column it produces) and its tree.
 #[derive(Debug, Clone)]
 pub struct TraceExpr {
     text: String,
@@ -129,18 +148,19 @@ impl TraceExpr {
             pos: 0,
             env,
             depth: 0,
+            operations: 0,
         };
         let root = parser.expression().map_err(&fail)?;
         if let Some(extra) = parser.peek() {
             return Err(fail(format!("unexpected '{extra}' after the expression")));
         }
         Ok(TraceExpr {
-            text: text.to_string(),
+            text: text.chars().filter(|c| !c.is_whitespace()).collect(),
             root,
         })
     }
 
-    /// The expression as typed (trimmed) — the new column's name.
+    /// The expression with its whitespace removed — the new column's name.
     pub fn text(&self) -> &str {
         &self.text
     }
@@ -224,11 +244,25 @@ struct ExprParser<'a> {
     pos: usize,
     env: &'a ParamEnv,
     depth: u32,
+    /// Operator, call and sign nodes built so far ([`MAX_OPERATIONS`]).
+    operations: u32,
 }
 
 type ParseResult = std::result::Result<Node, String>;
 
 impl ExprParser<'_> {
+    /// Count one more operator, call or sign against the expression's
+    /// budget — the flat-chain counterpart of [`Self::nested`].
+    fn spend(&mut self) -> std::result::Result<(), String> {
+        self.operations += 1;
+        if self.operations > MAX_OPERATIONS {
+            return Err(format!(
+                "the expression is too long (more than {MAX_OPERATIONS} operations)"
+            ));
+        }
+        Ok(())
+    }
+
     fn peek(&mut self) -> Option<char> {
         while self.pos < self.chars.len() && self.chars[self.pos].is_whitespace() {
             self.pos += 1;
@@ -262,6 +296,7 @@ impl ExprParser<'_> {
         let mut left = self.term()?;
         while let Some(op @ ('+' | '-')) = self.peek() {
             self.pos += 1;
+            self.spend()?;
             let right = self.term()?;
             left = Node::Binary(op, Box::new(left), Box::new(right));
         }
@@ -272,6 +307,7 @@ impl ExprParser<'_> {
         let mut left = self.unary()?;
         while let Some(op @ ('*' | '/')) = self.peek() {
             self.pos += 1;
+            self.spend()?;
             let right = self.unary()?;
             left = Node::Binary(op, Box::new(left), Box::new(right));
         }
@@ -282,6 +318,7 @@ impl ExprParser<'_> {
         match self.peek() {
             Some('-') => {
                 self.pos += 1;
+                self.spend()?;
                 Ok(Node::Neg(Box::new(self.nested(Self::unary)?)))
             }
             Some('+') => {
@@ -295,6 +332,7 @@ impl ExprParser<'_> {
     fn power(&mut self) -> ParseResult {
         let base = self.primary()?;
         if self.eat('^') {
+            self.spend()?;
             let exponent = self.nested(Self::unary)?;
             Ok(Node::Binary('^', Box::new(base), Box::new(exponent)))
         } else {
@@ -370,6 +408,7 @@ impl ExprParser<'_> {
         }
 
         if let Some(wanted) = arity(&lower) {
+            self.spend()?;
             let mut args = Vec::new();
             if self.peek() != Some(')') {
                 loop {
@@ -477,6 +516,15 @@ fn voltage(node: &str, f: &Frame) -> Option<Vec<Complex64>> {
     }
 }
 
+/// The plot's axis addressed by its kind word: `time` on a transient plot,
+/// `frequency` on an AC one (whose axis column is spelled `freq`).
+fn axis_by_kind(name: &str, f: &Frame) -> Option<Vec<Complex64>> {
+    let axis = f.ds.variables.first()?;
+    axis.kind
+        .eq_ignore_ascii_case(name)
+        .then(|| f.ds.values.iter().map(|row| row[0]).collect())
+}
+
 fn eval(node: &Node, f: &Frame) -> Option<Vec<Complex64>> {
     let rows = f.axis.len();
     match node {
@@ -484,6 +532,7 @@ fn eval(node: &Node, f: &Frame) -> Option<Vec<Complex64>> {
         Node::Name(name, fallback) => f
             .ds
             .trace(name)
+            .or_else(|| axis_by_kind(name, f))
             .or_else(|| fallback.map(|v| vec![real_value(v); rows])),
         Node::Probe(name) => {
             let inner = name
@@ -534,7 +583,18 @@ fn power(a: Complex64, b: Complex64, real: bool) -> Complex64 {
     if real {
         real_value(a.re.powf(b.re))
     } else if a == Complex64::new(0.0, 0.0) {
-        real_value(if b == Complex64::new(0.0, 0.0) { 1.0 } else { 0.0 })
+        // 0^b by the sign of Re b: 1 at b = 0, 0 for a positive real part,
+        // infinite (the singular reading, like 1/0) for a negative one,
+        // undefined for a purely imaginary exponent.
+        real_value(if b == Complex64::new(0.0, 0.0) {
+            1.0
+        } else if b.re > 0.0 {
+            0.0
+        } else if b.re < 0.0 {
+            f64::INFINITY
+        } else {
+            f64::NAN
+        })
     } else {
         a.powc(b)
     }
@@ -720,7 +780,10 @@ R2 out 0 3k
         for ((p, v), i) in power.iter().zip(&v).zip(&i) {
             assert_relative_eq!(p.re, v.re * i.re, max_relative = 1e-12);
         }
-        assert_relative_eq!(power[3].re.abs(), 4.6875e-3, max_relative = 1e-6);
+        // I(V1) flows into the source's + terminal, so the source delivers
+        // negative current and the product carries the SPICE sign: −4.6875 mW.
+        assert_relative_eq!(power[3].re, -4.6875e-3, max_relative = 1e-6);
+        assert!(power[3].re < 0.0);
         assert_eq!(ds.variables.last().unwrap().kind, EXPRESSION_KIND);
     }
 
@@ -787,6 +850,13 @@ R2 out 0 3k
         assert_relative_eq!(constant("pwrs(-2,2)"), -4.0);
         assert_relative_eq!(constant("hypot(3,4)"), 5.0);
         assert_relative_eq!(constant("atan2(1,1)"), std::f64::consts::FRAC_PI_4);
+        // Unequal arguments pin the order: atan2(y, x) with y first.
+        assert_relative_eq!(constant("atan2(1,2)"), 1f64.atan2(2.0), max_relative = 1e-12);
+        assert_relative_eq!(constant("atan2(2,1)"), 2f64.atan2(1.0), max_relative = 1e-12);
+        assert_relative_eq!(constant("atan2(-1,-1)"), -3.0 * std::f64::consts::FRAC_PI_4);
+        assert_ne!(constant("atan2(1,2)"), constant("atan2(2,1)"));
+        assert_eq!(constant("pow(2,3)"), 8.0);
+        assert_eq!(constant("pow(3,2)"), 9.0);
         assert_eq!(constant("min(3,2)"), 2.0);
         assert_eq!(constant("max(3,2)"), 3.0);
         assert_eq!(constant("sgn(-7)"), -1.0);
@@ -988,12 +1058,133 @@ R2 out 0 3k
         assert_relative_eq!(peak.1, 1.0, max_relative = 0.05);
     }
 
+    /// Both `.raw` flavors give the column back under its name with its
+    /// samples intact (the binary flavor stores values as `f32`, so the
+    /// comparison is to single precision). A spaced spelling is named
+    /// without its whitespace, which the file format could not carry.
     #[test]
     fn the_expression_columns_survive_a_raw_round_trip() {
+        use crate::rawwave::{read, to_bytes, RawFlavor};
         let mut raw = raw_of(TRAN_DECK);
-        add_expression_traces(&mut raw, &texts(&["V(out)*I(V1)"]), &env()).unwrap();
-        let bytes = crate::rawwave::to_bytes(&raw, crate::rawwave::RawFlavor::Ascii);
-        let back = crate::rawwave::read(&bytes).unwrap();
-        assert!(back.datasets[0].trace("V(out)*I(V1)").is_some());
+        add_expression_traces(&mut raw, &texts(&["V(out)*I(V1)", "V(out) * 2 + 1"]), &env())
+            .unwrap();
+        let original = &raw.datasets[0];
+        assert!(original.trace("V(out)*2+1").is_some(), "named without spaces");
+        for flavor in [RawFlavor::Ascii, RawFlavor::Binary] {
+            let back = read(&to_bytes(&raw, flavor)).unwrap();
+            for name in ["V(out)*I(V1)", "V(out)*2+1"] {
+                let want = original.trace(name).unwrap();
+                let got = back.datasets[0]
+                    .trace(name)
+                    .unwrap_or_else(|| panic!("{flavor:?}: {name} lost"));
+                assert_eq!(got.len(), want.len(), "{flavor:?} {name}");
+                assert!(want.iter().any(|z| z.re != 0.0), "{name} carries real data");
+                for (g, w) in got.iter().zip(&want) {
+                    assert_relative_eq!(g.re, w.re, max_relative = 1e-6, epsilon = 1e-12);
+                }
+            }
+        }
+    }
+
+    /// A flat chain builds a left-deep tree; the operation budget turns a
+    /// runaway one into a parse error instead of a stack overflow while a
+    /// long but reasonable sum still evaluates.
+    #[test]
+    fn long_flat_chains_are_bounded_not_fatal() {
+        let ok = vec!["1"; 200].join("+");
+        assert_eq!(constant(&ok), 200.0);
+        for op in ["+", "*", "-", "/"] {
+            let huge = vec!["1"; 100_000].join(op);
+            let err = TraceExpr::parse(&huge, &env()).unwrap_err();
+            assert!(err.to_string().contains("too long"), "{op}: {err}");
+        }
+        let calls = format!("{}1{}", "abs(".repeat(50), ")".repeat(50));
+        assert_eq!(constant(&calls), 1.0);
+        let many_calls = vec!["abs(1)"; 5000].join("+");
+        assert!(TraceExpr::parse(&many_calls, &env()).is_err());
+        let powers = vec!["1"; 5000].join("^");
+        assert!(TraceExpr::parse(&powers, &env()).is_err());
+    }
+
+    /// `frequency` names an AC plot's axis even though the column is spelled
+    /// `freq`; `time` still names a transient axis, and a plot without that
+    /// axis kind skips the expression.
+    #[test]
+    fn the_documented_axis_names_resolve_by_kind() {
+        let mut raw = raw_of(AC_DECK);
+        assert_eq!(raw.datasets[0].variables[0].name, "freq");
+        add_expression_traces(&mut raw, &texts(&["frequency/1k", "freq*2", "FREQUENCY"]), &env())
+            .unwrap();
+        let ds = &raw.datasets[0];
+        let axis = ds.axis();
+        let scaled = ds.trace("frequency/1k").unwrap();
+        for (a, s) in axis.iter().zip(&scaled) {
+            assert_relative_eq!(s.re, a / 1e3, max_relative = 1e-12);
+        }
+        assert_relative_eq!(ds.trace("freq*2").unwrap()[0].re, 2e3);
+        assert_relative_eq!(ds.trace("FREQUENCY").unwrap()[1].re, axis[1]);
+
+        let mut tran = raw_of(TRAN_DECK);
+        let err = add_expression_traces(&mut tran, &texts(&["frequency"]), &env()).unwrap_err();
+        assert!(err.to_string().contains("frequency"), "{err}");
+        add_expression_traces(&mut tran, &texts(&["time", "time*2"]), &env()).unwrap();
+        assert!(tran.datasets[0].trace("time*2").is_some());
+    }
+
+    /// 0 raised to a negative power is singular on complex plots as it is
+    /// on real ones — never the quiet zero a positive power gives.
+    #[test]
+    fn zero_to_a_negative_power_is_singular() {
+        let zero = Complex64::new(0.0, 0.0);
+        let at = |exponent: f64| power(zero, real_value(exponent), false);
+        assert_eq!(at(0.0).re, 1.0);
+        assert_eq!(at(2.0).re, 0.0);
+        assert_eq!(at(-1.0).re, f64::INFINITY);
+        assert_eq!(at(-0.5).re, f64::INFINITY);
+        assert!(power(zero, Complex64::new(0.0, 1.0), false).re.is_nan());
+        assert_eq!(power(zero, real_value(-1.0), true).re, f64::INFINITY);
+
+        // End to end on an AC plot: the ground probe is an exact zero
+        // phasor, so `^-1` reads infinite and `^2` reads zero.
+        let mut raw = raw_of(AC_DECK);
+        add_expression_traces(&mut raw, &texts(&["V(0)^-1", "V(0)^2", "V(gnd)"]), &env()).unwrap();
+        let ds = &raw.datasets[0];
+        assert!(ds.trace("V(gnd)").unwrap().iter().all(|z| z.norm() == 0.0));
+        assert!(ds.trace("V(0)^-1").unwrap().iter().all(|z| z.re == f64::INFINITY));
+        assert!(ds.trace("V(0)^2").unwrap().iter().all(|z| z.re == 0.0));
+    }
+
+    /// A comma in the expression name (`V(a,b)`) must not add a CSV field:
+    /// the header cell is quoted and every row keeps the header's width.
+    #[test]
+    fn comma_names_keep_the_csv_table_aligned() {
+        let mut raw = raw_of(TRAN_DECK);
+        add_expression_traces(&mut raw, &texts(&["V(in,out)*2"]), &env()).unwrap();
+        let csv = csv_document(&raw, &[], &texts(&["V(in,out)*2"]));
+        let mut lines = csv.lines().skip(1);
+        let header = lines.next().unwrap();
+        assert_eq!(header, "time,\"V(in,out)*2\"");
+        let first = lines.next().unwrap();
+        assert_eq!(first.split(',').count(), 2, "{first}");
+        // The default column set stays unquoted where nothing needs it.
+        let plain = csv_document(&raw, &[], &[]);
+        let header = plain.lines().nth(1).unwrap();
+        assert!(header.starts_with("time,V(0),V(in),V(out),"), "{header}");
+        assert!(header.ends_with(",\"V(in,out)*2\""), "{header}");
+    }
+
+    /// Whitespace is not part of a trace's name: spelling variants are one
+    /// trace, and `2 3` stays a syntax error rather than becoming `23`.
+    #[test]
+    fn whitespace_is_dropped_from_names_but_never_changes_the_parse() {
+        let expr = TraceExpr::parse("  V( out ) *  2 ", &env()).unwrap();
+        assert_eq!(expr.text(), "V(out)*2");
+        assert!(TraceExpr::parse("2 3", &env()).is_err());
+        assert!(TraceExpr::parse("1 k", &env()).is_err());
+        let mut raw = raw_of(TRAN_DECK);
+        let before = raw.datasets[0].variables.len();
+        add_expression_traces(&mut raw, &texts(&["V(out) * 2", "V(out)*2", "v(OUT)* 2"]), &env())
+            .unwrap();
+        assert_eq!(raw.datasets[0].variables.len(), before + 1);
     }
 }

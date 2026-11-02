@@ -260,7 +260,7 @@ below is written against that state.
   model cards (on/off resistance thresholds, hysteresis).
 - [x] **[P1] (both)** Mutual inductance `K` and ideal transformers; `[P2] (PS)` nonlinear magnetic core
   models (XFRM_NONLINEAR/RM); `[P2] (LT)` behavioral inductor via `flux=` control equation.
-- [ ] **[P1] (both)** Transmission lines: lossless `T` and lossy `O` (LTRA with RLCG parameterization).
+- [x] **[P1] (both)** Transmission lines: lossless `T` and lossy `O` (LTRA with RLCG parameterization).
   *(the lossless `T` landed: `T<name> n1 n2 n3 n4 Z0=<Ω> TD=<s>` — `F=<Hz>` with `NL=<wavelengths>`
   (default 1) spells TD = NL/F and present `TD=` wins over them with a warning, `Z0 > 0`/`TD > 0`
   validated; no branch rows — one `I(T…)` report value per line, the port-A (`n1↔n2`) current.
@@ -273,6 +273,22 @@ below is written against that state.
   and extraction. `.model …TLINE(…)` cards import as silent `GenericModel`s (kept, unused).
   Integration tests pin the open-end TDR staircase (10/3 → 20/3 → 50/9 → 5 V), a
   matched-termination flat line, straight-through DC, and the frequency-flat matched AC transfer.)*
+  *The lossy `O` landed as a **lumped ladder**, a documented interpretation of the reference tools' exact
+  LTRA convolution:* `O<name> n1 n2 n3 n4 <model> [N=<sections>]` with `.model <model> LTRA(R= L= G=
+  C= LEN= [N=])` (per-length RLGC, any order in the deck) expands after the card walk into `N` π-sections
+  (default 20, max 1000; element `N=` beats the model's): series `R·LEN/N` then `L·LEN/N` along the signal
+  conductor, `C·LEN/N` and `G·LEN/N` from each node to the return net with half weights at the two
+  ports. Plain R/L/C arms mean DC, transient, AC and noise work with no new stamp, and the ladder is
+  exact at DC (`R·LEN`, `G·LEN` sum exactly — pinned to 1e-8/1e-9) and low frequency (the open-line
+  RC low-pass matches `C·LEN` to 1e-8), band-limited near `f ≈ N/(π·TD)`. Ports must share a return net
+  (`n2 = n4`) or the card is a loud error; `R=0` (LC), `L=0` (RC) and `G` are all accepted;
+  other LTRA knobs (`REL`, `ABS`, …) warn as inapplicable. Against the exact method-of-characteristics
+  `T` element a 50 Ω/1 ns open line gives RMS 0.013 V at N=30 (0.109 V at N=3 — the test fails there on
+  purpose); series loss lowers the matched level toward the DC divider. Subcircuit instance paths mangle
+  the arms (`X1.RO1_s3`) so `element_letter` still reads plain passives.
+- [ ] **[P2] (both)** Exact LTRA lossy line (impulse-response convolution, REL/ABS/compaction knobs,
+  floating-return two-port semantics) beside the lumped `O` ladder — the ladder needs `N` raised for
+  fast edges and long lines.
 - [x] **[P1] (both)** Passive model cards: `.model R/L/C` with temperature coefficients `TC1/TC2`;
   LTspice-style intrinsic parasitics on every R/L/C (`rser`, `cpar`, `lser`, `rpar`). *(Model cards and
   TC1/TC2 plus the parasitic split were done: nonzero slots materialize into real series/parallel arms

@@ -192,6 +192,32 @@ pub struct Tline {
     pub delay: f64,
 }
 
+/// A lossy transmission line card (`O`), waiting for expansion: the parser
+/// records the card, and once every `.model` is known
+/// [`Circuit::expand_lossy_lines`] replaces it with a ladder of ordinary
+/// `R`/`L`/`C` elements. It never survives a parse — `Circuit` consumers see
+/// only the expansion.
+#[derive(Debug, Clone)]
+pub(crate) struct LossyLine {
+    pub name: String,
+    pub n1: NodeId,
+    pub n2: NodeId,
+    pub n3: NodeId,
+    pub n4: NodeId,
+    /// The `.model … LTRA(…)` card's (lowercased) name.
+    pub model: String,
+    /// `N=` on the element card; wins over the model's `N=`.
+    pub sections: Option<usize>,
+    /// 1-based source line, for diagnostics.
+    pub line_no: usize,
+}
+
+/// Sections a lossy line expands into when neither card says `N=`.
+pub const LTRA_DEFAULT_SECTIONS: usize = 20;
+/// Ceiling on `N=`: each section is up to four elements and a node pair, so a
+/// fat-fingered count must not build a million-row matrix.
+pub const LTRA_MAX_SECTIONS: usize = 1000;
+
 // ─── Controlled sources (E/F/G/H) ───────────────────────────────────────────
 
 /// What one term of a controlled source reads: a differential node voltage
@@ -1054,6 +1080,9 @@ pub struct Circuit {
     /// Lossless transmission lines (`T` cards), no branch rows and no
     /// `.model` reference in this cut.
     pub tlines: Vec<Tline>,
+    /// `O` cards between the card walk and [`Circuit::expand_lossy_lines`];
+    /// always empty once a parse has finished.
+    pub(crate) lossy_pending: Vec<LossyLine>,
     /// Voltage-controlled voltage sources (`E`), one branch row each.
     pub(crate) vcvs: Vec<ControlledSource>,
     /// Voltage-controlled current sources (`G`), no branch row.
@@ -1312,6 +1341,188 @@ impl Circuit {
             }
         }
         self.resistors.extend(additions);
+    }
+
+    /// Expand every pending `O` card into a ladder of π-sections (TODO §5
+    /// lossy transmission line).
+    ///
+    /// **Documented interpretation.** The reference tools solve the lossy
+    /// line exactly (LTRA convolution); RSpice instead *lumps* it:
+    /// `.model <name> LTRA(R= L= G= C= LEN= [N=])` gives the per-length
+    /// series resistance/inductance and shunt conductance/capacitance, and
+    /// the line becomes `N` sections (default [`LTRA_DEFAULT_SECTIONS`]) of
+    /// series `R·LEN/N` then `L·LEN/N` along the signal conductor, with
+    /// `C·LEN/N` and `G·LEN/N` from each node to the return node (half-values
+    /// at the two ports — a π ladder, second-order accurate in `1/N`). Being
+    /// ordinary elements, the ladder serves DC/transient/AC/noise with no new
+    /// stamp. It is exact at DC (the series arms sum to `R·LEN`, the shunts to
+    /// `G·LEN`, `C·LEN`) and low frequency; the sampled line is band-limited
+    /// near `f ≈ N/(π·TD)` with `TD = LEN·√(L·C)`, so raise `N` for fast
+    /// edges. Both ports must share one return net (`n2 = n4`, in practice
+    /// ground): a floating-return line would need the reference tools'
+    /// two-port semantics and is a loud error rather than a quiet
+    /// approximation. Runs before node compaction, so the internal nodes
+    /// (`<line>.m<k>` between R and L, `<line>.s<k>` at section boundaries)
+    /// join the hole-free renumbering; arm names keep the family letter after
+    /// the last `.` (`RO1_s3`, `X1.CO1_c2`) so subcircuit mangling and
+    /// `element_letter` read them as plain passives.
+    pub(crate) fn expand_lossy_lines(&mut self, warnings: &mut Vec<String>) -> Result<()> {
+        let lines = std::mem::take(&mut self.lossy_pending);
+        for line in lines {
+            let model = self
+                .generic_models
+                .get(&line.model)
+                .filter(|m| m.spice_type == "ltra")
+                .cloned()
+                .ok_or_else(|| {
+                    SimError::Circuit(format!(
+                        "line {}: lossy line {} references unknown LTRA model '{}'",
+                        line.line_no, line.name, line.model
+                    ))
+                })?;
+            let get = |key: &str| {
+                model.params.iter().rev().find(|(k, _)| k == key).map(|(_, v)| *v)
+            };
+            let (r, l, g, c) = (
+                get("r").unwrap_or(0.0),
+                get("l").unwrap_or(0.0),
+                get("g").unwrap_or(0.0),
+                get("c").unwrap_or(0.0),
+            );
+            let len = get("len").ok_or_else(|| {
+                SimError::Circuit(format!(
+                    "line {}: LTRA model '{}' is missing LEN=",
+                    line.line_no, line.model
+                ))
+            })?;
+            let bad = |what: &str| {
+                SimError::Circuit(format!(
+                    "line {}: lossy line {} (model '{}'): {what}",
+                    line.line_no, line.name, line.model
+                ))
+            };
+            if !(len.is_finite() && len > 0.0) {
+                return Err(bad("LEN must be positive"));
+            }
+            if [r, l, g, c].iter().any(|v| !v.is_finite() || *v < 0.0) {
+                return Err(bad("R, L, G and C cannot be negative"));
+            }
+            if c <= 0.0 {
+                return Err(bad("C must be positive"));
+            }
+            if l <= 0.0 && r <= 0.0 {
+                return Err(bad("needs L > 0 (an LC line) or R > 0 (an RC line)"));
+            }
+            if line.n2 != line.n4 {
+                return Err(bad(
+                    "ports must share one return node (n2 = n4); a floating-return line is not modelled",
+                ));
+            }
+            let sections = match line.sections.or_else(|| get("n").map(|n| n as usize)) {
+                Some(n) if (1..=LTRA_MAX_SECTIONS).contains(&n) => n,
+                Some(n) => {
+                    return Err(bad(&format!(
+                        "N={n} sections is outside 1..={LTRA_MAX_SECTIONS}"
+                    )))
+                }
+                None => LTRA_DEFAULT_SECTIONS,
+            };
+            let ignored: Vec<&str> = model
+                .params
+                .iter()
+                .map(|(k, _)| k.as_str())
+                .filter(|k| !matches!(*k, "r" | "l" | "g" | "c" | "len" | "n"))
+                .collect();
+            if !ignored.is_empty() {
+                warnings.push(format!(
+                    "line {}: LTRA model '{}': {} do not apply to RSpice's lumped ladder — ignored",
+                    line.line_no,
+                    line.model,
+                    ignored.join(", ").to_ascii_uppercase()
+                ));
+            }
+
+            // Arm names: family letter first after the last dot.
+            let (path, local) = match line.name.rsplit_once('.') {
+                Some((path, local)) => (format!("{path}."), local.to_string()),
+                None => (String::new(), line.name.clone()),
+            };
+            let arm = |letter: char, tag: &str, k: usize| format!("{path}{letter}{local}_{tag}{k}");
+
+            let n = sections as f64;
+            let (rs, ls) = (r * len / n, l * len / n);
+            let (cs, gs) = (c * len / n, g * len / n);
+            // Section boundary nodes: s_0 = n1 … s_N = n3, fresh in between.
+            let mut boundary = vec![line.n1];
+            for k in 1..sections {
+                boundary.push(self.new_line_node(&line.name, "s", k));
+            }
+            boundary.push(line.n3);
+            for k in 1..=sections {
+                let (a, b) = (boundary[k - 1], boundary[k]);
+                if rs > 0.0 && ls > 0.0 {
+                    let mid = self.new_line_node(&line.name, "m", k);
+                    self.resistors.push(Resistor {
+                        name: arm('R', "s", k),
+                        n1: a,
+                        n2: mid,
+                        resistance: rs,
+                        model: None,
+                    });
+                    self.inductors.push(Inductor {
+                        name: arm('L', "s", k),
+                        n1: mid,
+                        n2: b,
+                        inductance: ls,
+                        model: None,
+                    });
+                } else if rs > 0.0 {
+                    self.resistors.push(Resistor {
+                        name: arm('R', "s", k),
+                        n1: a,
+                        n2: b,
+                        resistance: rs,
+                        model: None,
+                    });
+                } else {
+                    self.inductors.push(Inductor {
+                        name: arm('L', "s", k),
+                        n1: a,
+                        n2: b,
+                        inductance: ls,
+                        model: None,
+                    });
+                }
+            }
+            for (k, &node) in boundary.iter().enumerate() {
+                let weight = if k == 0 || k == sections { 0.5 } else { 1.0 };
+                self.capacitors.push(Capacitor {
+                    name: arm('C', "c", k),
+                    n1: node,
+                    n2: line.n2,
+                    capacitance: cs * weight,
+                    model: None,
+                });
+                if gs > 0.0 {
+                    self.resistors.push(Resistor {
+                        name: arm('R', "g", k),
+                        n1: node,
+                        n2: line.n2,
+                        resistance: 1.0 / (gs * weight),
+                        model: None,
+                    });
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// A fresh internal node of a lossy line: `<line>.<tag><k>`.
+    fn new_line_node(&mut self, line_name: &str, tag: &str, k: usize) -> NodeId {
+        let internal = self.nodes;
+        self.ensure_node(internal);
+        self.set_node_name(internal, &format!("{line_name}.{tag}{k}"));
+        NodeId(internal)
     }
 
     /// Split passive-model parasitics (TODO §5): a nonzero `RSER`/`LSER` on a

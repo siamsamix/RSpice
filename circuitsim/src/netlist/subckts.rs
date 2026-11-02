@@ -164,7 +164,7 @@ pub(super) fn node_slot_indices(kind: char) -> Option<&'static [usize]> {
     match kind.to_ascii_uppercase() {
         'M' => Some(&[1, 2, 3, 4]),
         'J' => Some(&[1, 2, 3]),
-        'E' | 'G' | 'S' | 'T' | 'U' => Some(&[1, 2, 3, 4]),
+        'E' | 'G' | 'S' | 'T' | 'U' | 'O' => Some(&[1, 2, 3, 4]),
         'R' | 'C' | 'L' | 'V' | 'I' | 'D' | 'F' | 'H' | 'W' | 'B' => Some(&[1, 2]),
         'K' => Some(&[]),
         _ => None,

@@ -21,7 +21,8 @@ use self::models::parse_model_card;
 use self::elements::{
     parse_behavioral_source, parse_bjt, parse_capacitor, parse_controlled_source,
     parse_current_source, parse_diode, parse_inductor, parse_jfet, parse_mosfet,
-    parse_mutual_inductance, parse_opamp, parse_resistor, parse_switch, parse_tline,
+    parse_lossy_line, parse_mutual_inductance, parse_opamp, parse_resistor, parse_switch,
+    parse_tline,
     parse_voltage_source,
 };
 use self::imports::splice_libraries;
@@ -623,6 +624,7 @@ fn parse_featured(
             'Q' => parse_bjt(&tokens, &mut circuit, &plan, &mut warnings, line_no)?,
             'J' => parse_jfet(&tokens, &mut circuit, &plan, &mut warnings, line_no)?,
             'T' => parse_tline(&tokens, &mut circuit, &plan, &mut warnings, line_no)?,
+            'O' => parse_lossy_line(&tokens, &mut circuit, &plan, line_no)?,
             'S' | 'W' => parse_switch(&tokens, &mut circuit, &plan, line_no)?,
             'K' => parse_mutual_inductance(&tokens, &mut circuit, line_no)?,
             'B' => parse_behavioral_source(&tokens, &mut circuit, &plan, line_no, &env.params)?,
@@ -637,6 +639,9 @@ fn parse_featured(
         }
     }
 
+    // Lossy transmission lines ladder out into plain R/L/C arms once every
+    // `.model … LTRA` is known (a card may precede its model in the deck).
+    circuit.expand_lossy_lines(&mut warnings)?;
     // Series resistances need the final model table, so they split after the
     // card walk; the internal nodes then join compaction below.
     circuit.expand_diode_series_resistance();

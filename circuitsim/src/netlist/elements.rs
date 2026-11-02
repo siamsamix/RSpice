@@ -1227,6 +1227,61 @@ pub(super) fn parse_tline(
     Ok(())
 }
 
+/// Parse a lossy transmission line: `O<name> n1 n2 n3 n4 <model> [N=<sections>]`.
+///
+/// The card only records the line; `.model <model> LTRA(R= L= G= C= LEN=)` may
+/// appear anywhere in the deck, so the ladder expansion
+/// ([`Circuit::expand_lossy_lines`]) runs after the whole card walk.
+pub(super) fn parse_lossy_line(
+    tokens: &[&str],
+    circuit: &mut Circuit,
+    plan: &HashMap<String, usize>,
+    line_no: usize,
+) -> Result<()> {
+    if tokens.len() < 6 {
+        return Err(SimError::Parse(format!(
+            "line {line_no}: O requires: Oname n1 n2 n3 n4 model [N=<sections>]"
+        )));
+    }
+    let n1 = parse_node(tokens[1], circuit, plan)?;
+    let n2 = parse_node(tokens[2], circuit, plan)?;
+    let n3 = parse_node(tokens[3], circuit, plan)?;
+    let n4 = parse_node(tokens[4], circuit, plan)?;
+    let model = tokens[5].to_ascii_lowercase();
+    let mut sections = None;
+    for tok in &tokens[6..] {
+        match tok.split_once('=') {
+            Some((key, value)) if key.eq_ignore_ascii_case("n") => {
+                let n = parse_value(value).map_err(SimError::Parse)?;
+                if n.fract() != 0.0 || n < 1.0 {
+                    return Err(SimError::Parse(format!(
+                        "line {line_no}: O '{}': N= must be a whole number of sections ≥ 1",
+                        tokens[0]
+                    )));
+                }
+                sections = Some(n as usize);
+            }
+            _ => {
+                return Err(SimError::Parse(format!(
+                    "line {line_no}: O '{}': unexpected token '{tok}' (only N=<sections> follows the model)",
+                    tokens[0]
+                )))
+            }
+        }
+    }
+    circuit.lossy_pending.push(crate::circuit::LossyLine {
+        name: tokens[0].to_string(),
+        n1,
+        n2,
+        n3,
+        n4,
+        model,
+        sections,
+        line_no,
+    });
+    Ok(())
+}
+
 /// Parse a voltage-controlled (`S`) or current-controlled (`W`) switch.
 ///
 /// `Sname n+ n- ctrl+ ctrl- model [ON|OFF]`

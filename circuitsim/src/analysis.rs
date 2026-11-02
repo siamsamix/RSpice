@@ -2106,8 +2106,7 @@ fn noise_psd_at(
         let vg = sign * node_voltage(bias, m.ng);
         let vs = sign * node_voltage(bias, m.ns);
         let vb = sign * node_voltage(bias, m.nb);
-        let beta = model.kp * (m.w / m.l);
-        let gm = model.eval_at(beta, vg - vs, vd - vs, vb - vs, circuit.temperature).gm;
+        let gm = model.eval_sized(m.w, m.l, vg - vs, vd - vs, vb - vs, circuit.temperature).gm;
         let h = transfer(m.nd, m.ns).norm_sqr();
         // Long-channel channel thermal noise (the 2/3 factor).
         psd += h * 4.0 * kt * (2.0 / 3.0) * gm.max(0.0);

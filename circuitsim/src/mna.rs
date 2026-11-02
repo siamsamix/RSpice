@@ -1869,8 +1869,7 @@ fn stamp_mosfets<T: Field>(
         // β = KP·(W/L). The DC/transient stamp linearizes at Vds ≥ 0 — the
         // clamp belongs to this stamp's companion-model convention, not to the
         // model itself.
-        let beta = model.kp * (m.w / m.l);
-        let ev = model.eval_at(beta, vg - vs, (vd - vs).max(0.0), vb - vs, circuit.temperature);
+        let ev = model.eval_sized(m.w, m.l, vg - vs, (vd - vs).max(0.0), vb - vs, circuit.temperature);
 
         // ── Linearised companion model (Newton-Raphson stamp) ─────────────
         //

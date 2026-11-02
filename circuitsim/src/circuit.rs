@@ -1902,9 +1902,9 @@ impl Circuit {
                 )));
             }
             let level = self.mosfet_models[&m.model].level;
-            if level != 1 {
+            if !(1..=3).contains(&level) {
                 return Err(SimError::Circuit(format!(
-                    "MOSFET {} references model '{}' on level {level}; only level 1 is supported",
+                    "MOSFET {} references model '{}' on level {level}; only levels 1, 2 and 3 are supported",
                     m.name, m.model
                 )));
             }

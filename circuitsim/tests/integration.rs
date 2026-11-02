@@ -2856,3 +2856,105 @@ R2 out 0 1k
         );
     }
 }
+
+/// MOSFET levels 2 and 3 through the whole stack (parse → NR → report). The
+/// drain voltage is pinned by an independent hand-computed saturation current
+/// (Python reference, see the `model.rs` level-2/3 tests): `Vd = VDD − Id·RD`.
+#[test]
+fn mosfet_level_two_solves_to_the_grove_frohman_current() {
+    let n = parse(
+        r#"
+.model nm NMOS(LEVEL=2 KP=2e-4 VTO=0.7 GAMMA=0.4 PHI=0.6)
+Vdd vdd 0 DC 3
+Vg g 0 DC 2
+Vb b 0 DC -1
+RD vdd d 1k
+M1 d g 0 b nm W=1u L=1u
+.op
+.end
+"#,
+    )
+    .unwrap();
+    let r = run(&n).unwrap();
+    let d = node_index(&n.circuit.node_names, "d");
+    let op = r.dc.unwrap();
+    // Id(Vgs = 2, Vsb = 1) = 1.0642337326472922e-4 A in saturation.
+    let expected = 3.0 - 1.0642337326472922e-4 * 1e3;
+    assert!((op.node_voltages[d] - expected).abs() < 1e-6, "Vd {}", op.node_voltages[d]);
+}
+
+#[test]
+fn mosfet_level_three_solves_to_the_semi_empirical_current() {
+    let n = parse(
+        r#"
+.model nm NMOS(LEVEL=3 KP=2e-4 VTO=0.7 GAMMA=0.4 PHI=0.6 THETA=0.1 TOX=20n)
+Vdd vdd 0 DC 3
+Vg g 0 DC 2
+Vb b 0 DC -1
+RD vdd d 100
+M1 d g 0 b nm W=10u L=1u
+.op
+.end
+"#,
+    )
+    .unwrap();
+    let r = run(&n).unwrap();
+    let d = node_index(&n.circuit.node_names, "d");
+    let op = r.dc.unwrap();
+    // Id = 1.0169984752362528e-3 A (θ-degraded β, body-shifted threshold).
+    let expected = 3.0 - 1.0169984752362528e-3 * 100.0;
+    assert!((op.node_voltages[d] - expected).abs() < 1e-6, "Vd {}", op.node_voltages[d]);
+}
+
+/// A level-2 PMOS is the exact mirror image of its NMOS twin.
+#[test]
+fn mosfet_level_two_pmos_mirrors_nmos() {
+    let n = parse(
+        r#"
+.model pm PMOS(LEVEL=2 KP=2e-4 VTO=-0.7 GAMMA=0.4 PHI=0.6)
+Vdd vdd 0 DC 3
+Vg g 0 DC 1
+Vb b 0 DC 4
+RD d 0 1k
+M1 d g vdd b pm W=1u L=1u
+.op
+.end
+"#,
+    )
+    .unwrap();
+    let r = run(&n).unwrap();
+    let d = node_index(&n.circuit.node_names, "d");
+    let op = r.dc.unwrap();
+    let expected = 1.0642337326472922e-4 * 1e3;
+    assert!((op.node_voltages[d] - expected).abs() < 1e-6, "Vd {}", op.node_voltages[d]);
+}
+
+/// The gate sweep of a level-2 device carries the body-effect threshold
+/// shift: with the bulk 1 V below the source the curve turns on later.
+#[test]
+fn mosfet_level_two_dc_sweep_shows_the_body_effect() {
+    let sweep = |vb: f64| {
+        let n = parse(&format!(
+            r#"
+.model nm NMOS(LEVEL=2 KP=2e-4 VTO=0.7 GAMMA=0.4 PHI=0.6)
+Vdd vdd 0 DC 3
+Vg g 0 DC 0
+Vb b 0 DC {vb}
+RD vdd d 1k
+M1 d g 0 b nm W=1u L=1u
+.dc Vg 0 2 0.5
+.end
+"#
+        ))
+        .unwrap();
+        let d = node_index(&n.circuit.node_names, "d");
+        let pts = run(&n).unwrap().dc_sweep.unwrap().points;
+        pts.iter().map(|p| p.node_voltages[d]).collect::<Vec<_>>()
+    };
+    let flat = sweep(0.0);
+    let biased = sweep(-1.0);
+    // Both start off (Vd = 3 V). At Vg = 1 V the flat device conducts harder,
+    // pulling the drain lower than the back-biased one.
+    assert!((flat[0] - 3.0).abs() < 1e-6 && (biased[0] - 3.0).abs() < 1e-6);
+    assert!(flat[2] < biased[2] - 1e-3, "flat {} biased {}", flat[2], biased[2]);
+}

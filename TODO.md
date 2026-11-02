@@ -219,8 +219,23 @@ below is written against that state.
   analytic operating-point tests for the stiff forward-active corner, IKF knee, XTB warmth and all
   three series slots.
 - [ ] **[P2] (LT)** Advanced BJT models: VBIC and Mextram (level/type naming per LTspice's help).
-- [ ] **[P1] (both)** MOSFET levels 2 and 3; BSIM3/BSIM4 families per tool coverage (level numbering
-  differs between LTspice and PSpice — verify per target).
+- [x] **[P1] (both)** MOSFET levels 2 and 3 — done: `MosfetModel::eval_sized(w, l, …)` dispatches on
+  `LEVEL` (level 1 stays `eval_at` bit for bit). *Level 2* is Grove–Frohman: the exact bulk-charge
+  integral `(Vgs−Vfb−φ−Vde/2)·Vde − ⅔γ((φ+Vsb+Vde)^1.5 − (φ+Vsb)^1.5)` with the closed-form `Vdsat`
+  root, `UCRIT/UEXP/UTRA` transverse-field mobility reduction (needs `TOX`), `λ` as the level-1
+  multiplier; with `γ = 0` it *is* the level-1 square law (pinned in tests). *Level 3* is the
+  semi-empirical model: `θ` mobility modulation, `ETA` drain-induced threshold lowering, `DELTA`
+  narrow-width term, `VMAX` velocity-saturation `Vdsat` + `1/(1+Vde/Vc)`, and `KAPPA`/`NSUB`
+  saturation-field length shortening (`LAMBDA` does not act on level 3, as in the reference SPICE;
+  the `√` knee is smoothed over 10 µV so the finite-difference `gds` stays finite). `LD/WD` give the
+  effective geometry. Missing `KP/GAMMA/PHI` derive from `UO·Cox`, `NSUB`+`TOX` (card values win);
+  parameters a level ignores, and slots lacking `TOX`/`NSUB`/`UO`, warn instead of vanishing. Unmodelled
+  and loudly warned: the short-channel `XJ` factor, `NFS` weak inversion, `NEFF`, level-2 `VMAX`. Level
+  2/3 `gm/gds/gbs` are central differences of the one analytic current (1 µV step). Equations are written
+  from the public SPICE2/3 model descriptions and pinned against independent Python references, **not**
+  checked against the shipped LTspice/PSpice (see footnote). Levels above 3 are still a loud parse error.
+- [ ] **[P1] (both)** BSIM3/BSIM4 families per tool coverage (level numbering differs between LTspice
+  and PSpice — verify per target); `LEVEL=8/49/54` cards are rejected loudly today.
 - [x] **[P1] (both)** MOSFET capacitance/charge model: gate overlap (CGDO/CGSO/CGBO), junction caps
   (CJ/CJSW/MJSW/PB), so switching transients carry realistic charge — done: overlap and zero-bias
   junction capacitances are stamped in transient (companion history) and AC; grading parameters are

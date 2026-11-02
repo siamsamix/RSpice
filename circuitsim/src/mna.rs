@@ -63,6 +63,14 @@ pub trait Field: nalgebra::Scalar + nalgebra::ComplexField + Copy {
     /// meaningless, but never exercised: the simulator builds `Mode::Ac`
     /// exclusively over `Complex64`.
     fn imag(v: f64) -> Self;
+
+    /// Bitwise equality (`-0.0 ≠ 0.0`, a NaN equals itself when its bits do):
+    /// the key test of the sparse factorization cache, strict enough that a
+    /// cache hit reproduces a fresh factorization exactly.
+    fn bits_equal(a: &Self, b: &Self) -> bool;
+
+    /// The plan's factorization cache for this field.
+    fn factor_cache(plan: &crate::sparse::SparsePlan) -> &crate::sparse::FactorCache<Self>;
 }
 
 impl Field for f64 {
@@ -73,6 +81,14 @@ impl Field for f64 {
     fn imag(_v: f64) -> Self {
         0.0
     }
+
+    fn bits_equal(a: &Self, b: &Self) -> bool {
+        a.to_bits() == b.to_bits()
+    }
+
+    fn factor_cache(plan: &crate::sparse::SparsePlan) -> &crate::sparse::FactorCache<Self> {
+        plan.real_cache()
+    }
 }
 
 impl Field for Complex64 {
@@ -82,6 +98,14 @@ impl Field for Complex64 {
 
     fn imag(v: f64) -> Self {
         Complex64::new(0.0, v)
+    }
+
+    fn bits_equal(a: &Self, b: &Self) -> bool {
+        a.re.to_bits() == b.re.to_bits() && a.im.to_bits() == b.im.to_bits()
+    }
+
+    fn factor_cache(plan: &crate::sparse::SparsePlan) -> &crate::sparse::FactorCache<Self> {
+        plan.complex_cache()
     }
 }
 

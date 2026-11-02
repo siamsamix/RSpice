@@ -12,6 +12,7 @@
 //! report (`--tol X` flags cases past it, default 1e-3; any failure exits 1).
 //! Cases without a `.raw` simply report `—`.
 
+use circuitsim::sparse::factor_stats;
 use circuitsim::{compare_raw, parse, rawwave, run};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -89,8 +90,8 @@ fn main() {
 
     if !json {
         println!(
-            "{:<16} {:>8} {:>8} {:>12} {:>14} {:>12} {:>12}",
-            "case", "nodes", "steps", "wall ms", "node·steps/s", "accuracy", "vs LTspice"
+            "{:<16} {:>8} {:>8} {:>12} {:>14} {:>12} {:>12} {:>12}",
+            "case", "nodes", "steps", "wall ms", "node·steps/s", "accuracy", "vs LTspice", "reuse"
         );
     }
     for case in cases {
@@ -104,6 +105,7 @@ fn main() {
         };
         let parse_ms = parse_start.elapsed().as_secs_f64() * 1e3;
 
+        let (factors_before, reuses_before) = factor_stats();
         let start = Instant::now();
         let result = match run(&netlist) {
             Ok(r) => r,
@@ -113,6 +115,15 @@ fn main() {
             }
         };
         let wall = start.elapsed().as_secs_f64();
+        // Sparse solves served from a cached factorization vs freshly factored
+        // (small decks ride the dense kernel and count neither).
+        let (factors_after, reuses_after) = factor_stats();
+        let (factored, reused) = (factors_after - factors_before, reuses_after - reuses_before);
+        let reuse = if factored + reused > 0 {
+            format!("{}/{}", reused, factored + reused)
+        } else {
+            "—".to_string()
+        };
         let steps = result.tran.as_ref().map(|t| t.points.len()).unwrap_or(0);
         let nodes = netlist.circuit.nodes;
         let throughput = if wall > 0.0 {
@@ -163,7 +174,7 @@ fn main() {
 
         if json {
             println!(
-                "{{\"case\":\"{}\",\"nodes\":{},\"steps\":{},\"parse_ms\":{:.3},\"wall_ms\":{:.3},\"throughput\":{:.1},\"abs_error\":\"{}\",\"ltspice_max_norm\":\"{}\"}}",
+                "{{\"case\":\"{}\",\"nodes\":{},\"steps\":{},\"parse_ms\":{:.3},\"wall_ms\":{:.3},\"throughput\":{:.1},\"abs_error\":\"{}\",\"ltspice_max_norm\":\"{}\",\"factor_reuse\":\"{}\"}}",
                 case.name,
                 nodes,
                 steps,
@@ -171,18 +182,20 @@ fn main() {
                 wall * 1e3,
                 throughput,
                 accuracy,
-                vs_ltspice
+                vs_ltspice,
+                reuse
             );
         } else {
             println!(
-                "{:<16} {:>8} {:>8} {:>12.2} {:>14.0} {:>12} {:>12}",
+                "{:<16} {:>8} {:>8} {:>12.2} {:>14.0} {:>12} {:>12} {:>12}",
                 case.name,
                 nodes,
                 steps,
                 wall * 1e3,
                 throughput,
                 accuracy,
-                vs_ltspice
+                vs_ltspice,
+                reuse
             );
         }
     }

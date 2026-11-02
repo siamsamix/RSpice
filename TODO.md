@@ -93,16 +93,23 @@ below is written against that state.
   ladder-200 ~4× faster (778→191 ms), ladder-50 ~1.3×, tiny decks gated back to the dense kernel (`SMALL_SYSTEM`
   = 16). Remaining open, smaller: mark incremental the O(n·nnz) Markowitz scan, pool the per-solve factor
   workspace (retires the small-n gate), factor-once/solve-many across NR iterates and timesteps.)*
-- [ ] **[P1] (both)** LU factorization reuse across NR iterations and timesteps when the matrix changes
+- [x] **[P1] (both)** LU factorization reuse across NR iterations and timesteps when the matrix changes
   only by values, not topology — today the matrix is rebuilt and cloned per iterate. *(Dense-buffer
   restamp reuse was prototyped against the NR loop and is a measured loss on the dense path: a reused
   `a` forces a full `n²` `fill(0.0)` per rebuild, while fresh `DMatrix::zeros` rides calloc's lazy
   zero pages (probe: reuse-fill 76.2 µs vs fresh-zeros 10.9 µs at n=210; ladder-200 regressed
-  702→815 ms). Per-iterate allocation churn is the cheaper cost here. The sparse solver (line 86
-  slice 2) already eats part of this on the sparse path: `factor_solve` reads values straight off
-  the stamped dense matrix — no clone, no `n²` restamp — and re-factors per solve at sparse cost.
-  Still open on top: factor-once/solve-many when only the RHS changes between calls, and the
-  linear-only-per-iterate companion stamps riding the same symbolic pattern.)*
+  702→815 ms). The sparse solver (line 86 slice 2) eats part of this on the sparse path: `factor_solve`
+  reads values straight off the stamped dense matrix — no clone, no `n²` restamp. **Done now:
+  factor-once/solve-many** — `SparsePlan` keeps the four most recent numeric factorizations per
+  field, keyed on the *bit-exact* pattern values, so an unchanged matrix (every Newton iterate of a
+  linear circuit, constant-`dt` steps, the `dt`/`dt/2` pair of step doubling, an AC re-solve) skips
+  the factor and runs the triangular solves only, with the identical factors a fresh factorization
+  produces: results cannot change (all `examples/*.cir` decks byte-identical to the previous CLI over
+  op/tran/ac). Measured against the previous commit: ladder-50 `.tran` 11.3→7.0 ms, ladder-200
+  85→60 ms; 593/609 sparse solves reused (benchmark `reuse` column, `sparse::factor_stats`). ADR 0004.
+  **Still open:** nonlinear decks refactor every iterate (a new Jacobian each time); modified Newton or a
+  partial refactor of only the nonlinear rows would change iterate paths and needs its own decision;
+  `touched.compress()` still re-runs per solve.)*
 - [ ] **[P1] (LT baseline)** Multithreaded matrix assembly/factorization and time-stepping loop;
   LTspice is threaded today, PSpice multithreading is unclear on this baseline.
 - [x] **[P1] (both)** Trapezoidal integration as the default companion model with `.options

@@ -49,6 +49,11 @@ deepening that has not landed yet.
   discovery frontier ascending (topological for free — all feeds come from smaller rows), store
   no exact-zero factor entries, and a numerically zero pivot returns `None` (the caller's dense
   fallback). Fixed order, no magnitude reselection; NaNs propagate like values.
+- **Factor cache** — per `SparsePlan` and field, the four most recent numeric LU factorizations
+  keyed on the *bit-exact* pattern values (`Field::bits_equal`). A repeat matrix (linear Newton
+  iterate, constant-`dt` step, the `dt`/`dt/2` half-steps) skips the factor and only runs the
+  triangular solves with the identical factors, so reuse changes cost, never results. Counters:
+  `sparse::factor_stats()`. `docs/adr/0004`.
 - **Dense-kernel crossover (`SMALL_SYSTEM`)** — `MnaSystem::solve` skips the sparse attempt below
   16 unknowns: measured A/B on the benchmark suite showed tiny decks (n ≤ 9) paying ~30% wall for
   shape/workspace setup while the 200-node ladder wins ~4×. Pooling the factor workspace inside

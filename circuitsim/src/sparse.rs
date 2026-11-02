@@ -24,11 +24,14 @@
 //! update arriving at that slot) but exact-zero factor entries are simply
 //! not stored — a stored zero could only ever contribute zero.
 
-use std::collections::{BTreeSet, HashMap};
+use std::cell::{Cell, RefCell};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::hash::Hasher;
+use std::rc::Rc;
 use std::sync::Arc;
 
 use nalgebra::{DMatrix, DVector};
+use num_complex::Complex64;
 
 use crate::mna::Field;
 
@@ -264,7 +267,8 @@ pub fn markowitz_ordering(pattern: &CompressedPattern) -> Option<SymbolicOrder> 
 /// into elimination index space and the column-compile the scatter needs —
 /// so one solve after another pays only for values and arithmetic. Plans are
 /// immutable and pooled per thread (see [`sparse_plan`]).
-pub(crate) struct SparsePlan {
+#[doc(hidden)]
+pub struct SparsePlan {
     /// The exact pattern this plan was compiled from: a memo hit is only
     /// used after a full pattern match, so a fingerprint collision can slow
     /// the lookup but never hand back a wrong plan.
@@ -280,9 +284,63 @@ pub(crate) struct SparsePlan {
     /// lists the original rows with an entry in original column `c`.
     col_ptr: Vec<usize>,
     col_rows: Vec<usize>,
+    /// Recent numeric factorizations of this pattern, per field, newest
+    /// first (see [`FactorCache`]).
+    real_cache: FactorCache<f64>,
+    complex_cache: FactorCache<Complex64>,
+}
+
+/// The numeric LU of one matrix: U by rows, L by columns (unit diagonal
+/// implied), and the diagonal — everything a solve needs besides the plan's
+/// permutations.
+#[doc(hidden)]
+pub struct Factors<T> {
+    urow: Vec<Vec<(usize, T)>>,
+    lcol: Vec<Vec<(usize, T)>>,
+    diag: Vec<T>,
+}
+
+/// One cache entry: the exact matrix values (read along the pattern, CSR
+/// order) a factorization was computed from, and that factorization.
+#[doc(hidden)]
+pub struct CachedFactors<T> {
+    values: Vec<T>,
+    factors: Rc<Factors<T>>,
+}
+
+/// Most recently used factorizations of one plan: a transient with step
+/// doubling alternates between the matrices of `dt` and `dt/2`, and a linear
+/// Newton loop re-solves one matrix per iterate, so a few ways catch nearly
+/// every repeat while a nonlinear circuit (a new matrix every iterate) just
+/// cycles through them.
+#[doc(hidden)]
+pub type FactorCache<T> = RefCell<VecDeque<CachedFactors<T>>>;
+
+/// Ways kept per plan and field.
+const FACTOR_CACHE_WAYS: usize = 4;
+
+thread_local! {
+    static FACTORIZATIONS: Cell<u64> = const { Cell::new(0) };
+    static FACTOR_REUSES: Cell<u64> = const { Cell::new(0) };
+}
+
+/// `(numeric factorizations done, solves served from a cached factorization)`
+/// on this thread since it started — the measurement behind the reuse claim,
+/// read by the benchmark and the tests.
+#[doc(hidden)]
+pub fn factor_stats() -> (u64, u64) {
+    (FACTORIZATIONS.with(Cell::get), FACTOR_REUSES.with(Cell::get))
 }
 
 impl SparsePlan {
+    pub(crate) fn real_cache(&self) -> &FactorCache<f64> {
+        &self.real_cache
+    }
+
+    pub(crate) fn complex_cache(&self) -> &FactorCache<Complex64> {
+        &self.complex_cache
+    }
+
     /// Compile a plan for `pattern`, or `None` when no Markowitz order
     /// exists (structurally stuck shapes keep solving densely).
     fn compile(pattern: &CompressedPattern) -> Option<Self> {
@@ -325,10 +383,31 @@ impl SparsePlan {
             elim_cols,
             col_ptr,
             col_rows,
+            real_cache: RefCell::new(VecDeque::new()),
+            complex_cache: RefCell::new(VecDeque::new()),
         })
     }
 
-    /// Factor the live matrix values and solve A·x = rhs.
+    /// The live matrix values at the pattern's slots, CSR order — the key a
+    /// cached factorization is matched on. Exact: slots outside the pattern
+    /// are structural zeros by the record's invariant, so equal pattern
+    /// values mean an equal matrix.
+    fn pattern_values<T: Field>(&self, a: &DMatrix<T>) -> Vec<T> {
+        let mut values = Vec::with_capacity(self.pattern.nnz());
+        for row in 0..self.pattern.n() {
+            for &col in self.pattern.columns_of(row) {
+                values.push(a[(row, col)]);
+            }
+        }
+        values
+    }
+
+    /// Factor the live matrix values and solve A·x = rhs, reusing the
+    /// factorization of an earlier solve whose matrix was *bit for bit* the
+    /// same (TODO §3 factor reuse). A hit skips the whole left-looking
+    /// factor and runs only the triangular solves, with the very factors a
+    /// fresh factorization would produce — so reuse changes cost, never
+    /// results.
     ///
     /// The pivot sequence is the compiled Markowitz order, fixed at plan
     /// compile time — no magnitude reselection happens at factor time. A
@@ -342,6 +421,45 @@ impl SparsePlan {
         a: &DMatrix<T>,
         rhs: &DVector<T>,
     ) -> Option<DVector<T>> {
+        let values = self.pattern_values(a);
+        let cache = T::factor_cache(self);
+        let hit = {
+            let mut ways = cache.borrow_mut();
+            let found = ways.iter().position(|entry| {
+                entry.values.len() == values.len()
+                    && entry
+                        .values
+                        .iter()
+                        .zip(&values)
+                        .all(|(x, y)| T::bits_equal(x, y))
+            });
+            found.map(|at| {
+                // Most recently used first.
+                let entry = ways.remove(at).expect("position is in range");
+                let factors = Rc::clone(&entry.factors);
+                ways.push_front(entry);
+                factors
+            })
+        };
+        let factors = match hit {
+            Some(factors) => {
+                FACTOR_REUSES.with(|c| c.set(c.get() + 1));
+                factors
+            }
+            None => {
+                let factors = Rc::new(self.factor(a)?);
+                FACTORIZATIONS.with(|c| c.set(c.get() + 1));
+                let mut ways = cache.borrow_mut();
+                ways.push_front(CachedFactors { values, factors: Rc::clone(&factors) });
+                ways.truncate(FACTOR_CACHE_WAYS);
+                factors
+            }
+        };
+        Some(self.solve_factored(&factors, rhs))
+    }
+
+    /// The numeric factorization alone: `None` on a numerically zero pivot.
+    fn factor<T: Field>(&self, a: &DMatrix<T>) -> Option<Factors<T>> {
         let n = self.pattern.n();
         // Permutation-space workspace for the column being factored. `x[i]`
         // is live when `stamp[i] == gen`, with `touched` naming every live
@@ -425,10 +543,16 @@ impl SparsePlan {
             }
         }
 
-        // Solve the permuted system: y = P·rhs, the unit-L forward pass, the
-        // U back pass over the same buffer (entries above each pivot are the
-        // factor values already solved), then unpermute into the caller's
-        // column order.
+        Some(Factors { urow, lcol, diag })
+    }
+
+    /// Solve against a factorization: y = P·rhs, the unit-L forward pass, the
+    /// U back pass over the same buffer (entries above each pivot are the
+    /// factor values already solved), then unpermute into the caller's
+    /// column order.
+    fn solve_factored<T: Field>(&self, factors: &Factors<T>, rhs: &DVector<T>) -> DVector<T> {
+        let n = self.pattern.n();
+        let Factors { urow, lcol, diag } = factors;
         let mut y: Vec<T> = vec![T::lift(0.0); n];
         for k in 0..n {
             y[k] = rhs[self.elim_rows[k]];
@@ -453,7 +577,7 @@ impl SparsePlan {
         for (k, &v) in y.iter().enumerate() {
             out[self.elim_cols[k]] = v;
         }
-        Some(DVector::from_vec(out))
+        DVector::from_vec(out)
     }
 }
 
@@ -738,5 +862,133 @@ mod tests {
         bits.visit(0, 1);
         let richer = sparse_plan(&bits.compress()).expect("the richer pattern orders too");
         assert!(!Arc::ptr_eq(&first, &richer));
+    }
+
+    // ─── Factorization reuse ────────────────────────────────────────────────
+
+    /// A diagonally dominant tridiagonal system with `scale`d off-diagonals:
+    /// pattern fixed, values steered by the caller.
+    fn tridiagonal(n: usize, scale: f64) -> (StampBits, DMatrix<f64>) {
+        let mut bits = StampBits::zeros(n);
+        let mut a = DMatrix::zeros(n, n);
+        for i in 0..n {
+            bits.visit(i, i);
+            a[(i, i)] = 4.0 + scale;
+            if i + 1 < n {
+                bits.visit(i, i + 1);
+                bits.visit(i + 1, i);
+                a[(i, i + 1)] = -1.0 * scale;
+                a[(i + 1, i)] = -1.0;
+            }
+        }
+        (bits, a)
+    }
+
+    fn rhs(n: usize, k: f64) -> DVector<f64> {
+        DVector::from_fn(n, |i, _| 1.0 + k * (i as f64 + 1.0))
+    }
+
+    fn dense(a: &DMatrix<f64>, z: &DVector<f64>) -> DVector<f64> {
+        a.clone().lu().solve(z).expect("nonsingular")
+    }
+
+    /// The same matrix solved again — with a *different* right-hand side —
+    /// factors once; the answers are bit-identical to a first-time solve and
+    /// match the dense LU.
+    #[test]
+    fn identical_matrix_reuses_the_factorization() {
+        let n = 24;
+        let (bits, a) = tridiagonal(n, 1.5);
+        let plan = sparse_plan(&bits.compress()).expect("orders");
+        let (f0, r0) = factor_stats();
+        let first = plan.factor_solve(&a, &rhs(n, 0.0)).unwrap();
+        let again = plan.factor_solve(&a, &rhs(n, 0.0)).unwrap();
+        let other_rhs = plan.factor_solve(&a, &rhs(n, 2.0)).unwrap();
+        let (f1, r1) = factor_stats();
+        assert_eq!((f1 - f0, r1 - r0), (1, 2), "one factorization, two reuses");
+        assert_eq!(first, again, "a cached solve reproduces the fresh one bit for bit");
+        for (got, want) in other_rhs.iter().zip(dense(&a, &rhs(n, 2.0)).iter()) {
+            assert!((got - want).abs() < 1e-12, "{got} vs {want}");
+        }
+    }
+
+    /// One changed value anywhere in the pattern is a miss: reusing the old
+    /// factors would answer for a different matrix.
+    #[test]
+    fn a_changed_value_refactors_and_stays_correct() {
+        let n = 24;
+        let (bits, mut a) = tridiagonal(n, 1.5);
+        let plan = sparse_plan(&bits.compress()).expect("orders");
+        plan.factor_solve(&a, &rhs(n, 0.0)).unwrap();
+        let (f0, _) = factor_stats();
+        a[(n - 1, n - 2)] += 1e-9; // the very last slot, smallest possible nudge
+        let x = plan.factor_solve(&a, &rhs(n, 0.0)).unwrap();
+        let (f1, _) = factor_stats();
+        assert_eq!(f1 - f0, 1);
+        for (got, want) in x.iter().zip(dense(&a, &rhs(n, 0.0)).iter()) {
+            assert!((got - want).abs() < 1e-12);
+        }
+    }
+
+    /// The cache key is bitwise: `-0.0` and `0.0` are different matrices, a
+    /// NaN equals itself when its bits do (so NaN input still reproduces the
+    /// fresh factorization's NaN output).
+    #[test]
+    fn cache_key_is_bitwise() {
+        assert!(!<f64 as Field>::bits_equal(&0.0, &-0.0));
+        assert!(<f64 as Field>::bits_equal(&f64::NAN, &f64::NAN));
+        assert!(!<f64 as Field>::bits_equal(&1.0, &(1.0 + f64::EPSILON)));
+        let z = Complex64::new(0.0, 1.0);
+        assert!(<Complex64 as Field>::bits_equal(&z, &z));
+        assert!(!<Complex64 as Field>::bits_equal(&z, &Complex64::new(-0.0, 1.0)));
+    }
+
+    /// Step doubling alternates two matrices (dt and dt/2); four ways keep
+    /// both warm, so only the first sighting of each factors.
+    #[test]
+    fn alternating_matrices_stay_cached() {
+        let n = 20;
+        let (bits, a1) = tridiagonal(n, 1.0);
+        let (_, a2) = tridiagonal(n, 2.0);
+        let plan = sparse_plan(&bits.compress()).expect("orders");
+        let (f0, r0) = factor_stats();
+        for _ in 0..10 {
+            plan.factor_solve(&a1, &rhs(n, 0.0)).unwrap();
+            plan.factor_solve(&a2, &rhs(n, 0.0)).unwrap();
+        }
+        let (f1, r1) = factor_stats();
+        assert_eq!((f1 - f0, r1 - r0), (2, 18));
+        // More distinct matrices than ways: the oldest is evicted (and
+        // simply re-factors when it comes back) — never a wrong answer.
+        for k in 0..(FACTOR_CACHE_WAYS + 2) {
+            let (_, a) = tridiagonal(n, 3.0 + k as f64);
+            let x = plan.factor_solve(&a, &rhs(n, 1.0)).unwrap();
+            for (got, want) in x.iter().zip(dense(&a, &rhs(n, 1.0)).iter()) {
+                assert!((got - want).abs() < 1e-12);
+            }
+        }
+        let (f2, _) = factor_stats();
+        plan.factor_solve(&a1, &rhs(n, 0.0)).unwrap();
+        assert_eq!(factor_stats().0 - f2, 1, "a1 was evicted by the newer ones");
+    }
+
+    /// The complex field has its own cache on the same plan.
+    #[test]
+    fn complex_systems_cache_separately() {
+        let n = 12;
+        let (bits, a) = tridiagonal(n, 1.0);
+        let plan = sparse_plan(&bits.compress()).expect("orders");
+        let ac = DMatrix::from_fn(n, n, |i, j| Complex64::new(a[(i, j)], 0.1 * a[(i, j)]));
+        let z = DVector::from_fn(n, |i, _| Complex64::new(1.0, i as f64));
+        let (f0, r0) = factor_stats();
+        let x1 = plan.factor_solve(&ac, &z).unwrap();
+        let x2 = plan.factor_solve(&ac, &z).unwrap();
+        let (f1, r1) = factor_stats();
+        assert_eq!((f1 - f0, r1 - r0), (1, 1));
+        assert_eq!(x1, x2);
+        let want = ac.clone().lu().solve(&z).unwrap();
+        for (got, want) in x1.iter().zip(want.iter()) {
+            assert!((got - want).norm() < 1e-12);
+        }
     }
 }

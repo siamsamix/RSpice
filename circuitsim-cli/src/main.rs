@@ -94,6 +94,18 @@ struct Args {
     #[arg(long, value_name = "TRACES")]
     traces: Option<String>,
 
+    /// Add a waveform-arithmetic trace to --waves/--image/--fft (repeatable),
+    /// named by its expression: `V(out)*I(V1)` for power, `2*V(out)+1`,
+    /// `V(a,b)`, `db(V(out))`, `d(V(out))`. Probes, the axis (`time`,
+    /// `frequency`), deck `.param` values, `+ - * / ^`, and functions
+    /// (abs mag ph re im db sqrt exp ln log10 sin cos … d pow pwr hypot min
+    /// max) combine over each plot's columns; a plot lacking a probe is
+    /// skipped, an expression no plot can evaluate is an error. With --traces
+    /// the expressions are kept alongside the listed names; without it every
+    /// column stays, the expressions included. --raw output is unchanged
+    #[arg(long, value_name = "EXPR")]
+    expr: Vec<String>,
+
     /// Attach a crosshair cursor per --image panel (up to two per panel,
     /// like LTspice): requests within the x span snap to the nearest
     /// sample of the panel's first kept trace and read out the snapped
@@ -226,7 +238,31 @@ fn run_cli() -> Result<(), CliError> {
         cursor_xs.push(value);
     }
 
+    if !args.expr.is_empty() && args.waves.is_none() && args.image.is_none() && args.fft.is_none() {
+        return Err(SimError::Parse("--expr needs --waves, --image or --fft".into()).into());
+    }
+    // Expressions ride with an explicit --traces selection so they stay
+    // kept; an empty selection already keeps every column.
+    for text in args.expr.iter().filter(|e| !e.trim().is_empty()) {
+        circuitsim::arith::TraceExpr::parse(text, &netlist.param_env())?; // fail before simulating
+    }
+    let mut selection = trace_specs(args.traces.as_deref());
+    if !selection.is_empty() {
+        selection.extend(
+            args.expr
+                .iter()
+                .map(|e| e.trim().to_string())
+                .filter(|e| !e.is_empty()),
+        );
+    }
+
     let result = run(&netlist)?;
+    // One plot set for --waves/--image/--fft, expression columns appended.
+    let plots = |title: &str| -> Result<circuitsim::RawFile, SimError> {
+        let mut raw = circuitsim::rawwave::build(title, &netlist, &result);
+        circuitsim::arith::add_expression_traces(&mut raw, &args.expr, &netlist.param_env())?;
+        Ok(raw)
+    };
 
     let mut report = String::new();
     if !args.batch {
@@ -263,23 +299,15 @@ fn run_cli() -> Result<(), CliError> {
 
     if let Some(path) = &args.waves {
         let title = format!("* {}", args.netlist.display());
-        let raw = circuitsim::rawwave::build(&title, &netlist, &result);
-        let csv = circuitsim::export::csv_document(
-            &raw,
-            &result.measurements,
-            &trace_specs(args.traces.as_deref()),
-        );
+        let raw = plots(&title)?;
+        let csv = circuitsim::export::csv_document(&raw, &result.measurements, &selection);
         fs::write(path, csv)?;
     }
 
     if let Some(path) = &args.image {
         let title = format!("* {}", args.netlist.display());
-        let raw = circuitsim::rawwave::build(&title, &netlist, &result);
-        let svg = circuitsim::export::svg_document_with_cursors(
-            &raw,
-            &trace_specs(args.traces.as_deref()),
-            &cursor_xs,
-        );
+        let raw = plots(&title)?;
+        let svg = circuitsim::export::svg_document_with_cursors(&raw, &selection, &cursor_xs);
         fs::write(path, svg)?;
     }
 
@@ -290,12 +318,8 @@ fn run_cli() -> Result<(), CliError> {
 
     if let Some(path) = &args.fft {
         let title = format!("* {}", args.netlist.display());
-        let raw = circuitsim::rawwave::build(&title, &netlist, &result);
-        let spectra = circuitsim::fft::spectra(
-            &raw,
-            &trace_specs(args.traces.as_deref()),
-            args.window.into(),
-        );
+        let raw = plots(&title)?;
+        let spectra = circuitsim::fft::spectra(&raw, &selection, args.window.into());
         fs::write(path, circuitsim::export::svg_document(&spectra, &[]))?;
     }
 

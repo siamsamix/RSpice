@@ -188,7 +188,7 @@ LTspice `barbitrarybehavioralvoltageorcur.htm`: `R=<expr>` (behavioral resistor)
 | # | Area | LTspice behavior | RSpice status | Where to implement |
 |---|------|------------------|---------------|--------------------|
 | 9.1 | Cursors | Crosshair cursors with readouts and measured deltas (dual cursors; cursor measurements). | **Missing.** | `circuitsim-gui/src/plot.rs`/`plot_frame.rs` — cursor state + readout + delta annotations. |
-| 9.2 | Waveform arithmetic | Add arbitrary expression traces (`V(out)*I(V1)` power, scaled, offset, combined). | **Missing.** | GUI plot: expression trace type, evaluate against raw data per point. |
+| 9.2 | Waveform arithmetic | Add arbitrary expression traces (`V(out)*I(V1)` power, scaled, offset, combined). | **Done (core + CLI + GUI transient).** `arith.rs` evaluates expressions over `.raw` columns; CLI `--expr`; GUI Waveforms → Expression. | Remaining: `.ac`/`.dc` plots in the GUI, axis-statistic functions (`integ`, `avg`, `rms`). |
 | 9.3 | FFT | FFT of transient traces with configurable windowing (Blackman-Harris et al.). | **Missing.** | GUI: FFT panel + window function; reuse `.four` or a standalone FFT. |
 | 9.4 | Stepped/parametric overlays | All `.step` runs on one plot with per-run identification; PSpice performance-analysis curves (measurement vs swept parameter). | Partially (results tagged per step; GUI overlays open). | GUI `plot.rs` overlays + legend per run; measurement-vs-parameter curve from `.meas`/`.step`. |
 | 9.5 | Axis completeness | linear/log both axes, physical unit auto-detection & formatting (Hz/s/V/A/dB/°), multi-pane layouts. | Partially (log grid, dB mode, AcMagScale/AcCursor exist). | `plot.rs` axis formatting, multi-pane. |

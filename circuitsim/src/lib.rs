@@ -6,6 +6,7 @@
 //! (`.ac`) analyses over a parameter language (`.param`, `.func`, `{expr}`).
 
 pub mod analysis;
+pub mod arith;
 pub mod behavior;
 pub mod circuit;
 pub mod currents;

@@ -116,6 +116,14 @@ deepening that has not landed yet.
   `.log` sidecar), and operating points keep a synthetic `time = 0` axis so real plots stay
   axis-first (documented interpretation). Bit-for-bit LTspice parity is not the goal —
   reading its files and writing files its readers accept is.
+- **Expression trace (waveform arithmetic)** — a derived plot column named by the expression
+  that made it (`V(out)*I(V1)`), TODO §6. `arith.rs`: `TraceExpr::parse` once, `evaluate` per
+  `RawDataset` over whole columns (so `d()` sees the axis), `add_expression_traces` appends the
+  results to a `RawFile` as ordinary columns — every trace-selecting consumer (CSV, SVG, FFT,
+  `.raw`) then treats them as simulated traces. Real plots compute in `f64`, complex (`.ac`) plots
+  in complex arithmetic; a plot lacking a probe skips the expression quietly, an expression no
+  plot takes is an error. The GUI's `ExpressionTraces` (`plot.rs`) holds the first run's transient
+  plot and re-evaluates the typed expressions on each run.
 - **Temperature system** — `Circuit.temperature` (°C) plus model `TNOM`/`EG`/`XTI`/`TCV`/`BEX`
   and passive `TC1`/`TC2`; `.temp` with several values and `.step temp` produce one run per
   temperature. Device equations recompute `Vt = kT/q` and the bandgap law per evaluation.

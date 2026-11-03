@@ -15,7 +15,7 @@ use circuitsim::circuit::{Circuit, ElementFamily, CURRENT_FAMILIES};
 use circuitsim::params::ParamEnv;
 use circuitsim::rawwave::RawDataset;
 use egui::{Stroke, TextStyle};
-use egui_plot::{GridMark, Legend, Line, Plot, PlotPoints, PlotUi};
+use egui_plot::{GridMark, Legend, Line, Plot, PlotPoint, PlotPoints, PlotUi};
 
 use crate::theme::{bold, LT_PLOT_BG, LT_PLOT_FRAME, PLOT_COLORS};
 
@@ -216,7 +216,11 @@ pub fn format_hz(f: f64) -> String {
 /// gestures, the one-time bounds application and the series draw were the
 /// same nine lines chained at every tab — the caller now passes only the
 /// plot's identity, height, labels, series and optional bounds.
-pub fn plot_frame(
+///
+/// Returns which drawn series the cursor is nearest (distance to the closest
+/// vertex, screen space), for cross-probing's "hover a trace, highlight its
+/// source" direction — `None` anywhere the cursor is outside the plot.
+pub fn plot_frame_hover(
     name: &str,
     height: f32,
     x_label: &str,
@@ -224,7 +228,7 @@ pub fn plot_frame(
     series: &[PlotSeries],
     apply: Option<Bounds>,
     ui: &mut egui::Ui,
-) {
+) -> Option<usize> {
     let plot = Plot::new(name)
         .height(height)
         .x_axis_label(x_label)
@@ -236,14 +240,50 @@ pub fn plot_frame(
         .allow_scroll(true)
         .allow_drag(true)
         .allow_boxed_zoom(true);
-    viewer_scope(ui, |ui| {
+    let plot_response = viewer_scope(ui, |ui| {
         plot.show(ui, |plot_ui| {
             if let Some(bounds) = apply {
                 apply_bounds(plot_ui, &bounds);
             }
             draw(plot_ui, series, 2.0);
-        });
+        })
     });
+    let Some(pointer) = plot_response.response.hover_pos() else {
+        return None;
+    };
+    let nearest_at = |s: &PlotSeries| -> Option<f32> {
+        let mut best: Option<f32> = None;
+        for p in &s.points {
+            let screen = plot_response.transform.position_from_point(&PlotPoint::new(p[0], p[1]));
+            let d = (screen - pointer).length();
+            best = Some(best.map_or(d, |b: f32| b.min(d)));
+        }
+        best
+    };
+    let mut out: Option<(usize, f32)> = None;
+    for (i, s) in series.iter().enumerate() {
+        if let Some(d) = nearest_at(s) {
+            if d <= 8.0 && out.map_or(true, |(_, bd)| d < bd) {
+                out = Some((i, d));
+            }
+        }
+    }
+    out.map(|(i, _)| i)
+}
+
+/// [`plot_frame_hover`] without the hover answer — the one-call style every
+/// non-probing tab keeps. (The two share the builder, so hover-only cost —
+/// the vertex distance scan — is paid once per frame with the cursor inside.)
+pub fn plot_frame(
+    name: &str,
+    height: f32,
+    x_label: &str,
+    y_label: &str,
+    series: &[PlotSeries],
+    apply: Option<Bounds>,
+    ui: &mut egui::Ui,
+) {
+    plot_frame_hover(name, height, x_label, y_label, series, apply, ui);
 }
 
 /// X scale of the AC panels, decided by the dB/Linear toggle.
@@ -405,7 +445,7 @@ pub fn tran_diff_series(
 
 /// Labels for one family's report slots: the deck's element names, with the
 /// family letter + index as the fallback when a report outgrows the list.
-fn family_labels(circuit: &Circuit, family: ElementFamily, count: usize) -> Vec<String> {
+pub fn family_labels(circuit: &Circuit, family: ElementFamily, count: usize) -> Vec<String> {
     let names = circuit.element_names(family);
     (0..count)
         .map(|i| {
@@ -417,28 +457,59 @@ fn family_labels(circuit: &Circuit, family: ElementFamily, count: usize) -> Vec<
         .collect()
 }
 
+/// The branch-current slots the family walk emits, in the same canonical
+/// order as [`tran_current_series`]: every family's report length as
+/// `(family, count)`, skipping the empty ones. Cross-probing needs this to
+/// map "third resistor" to its exact series position without re-walking.
+pub fn current_slots(tran: &TranResult) -> Vec<(ElementFamily, usize)> {
+    let Some(first) = tran.points.first() else {
+        return Vec::new();
+    };
+    CURRENT_FAMILIES
+        .iter()
+        .copied()
+        .map(|family| {
+            let count = first.branch_currents.slice(family).unwrap_or(&[]).len();
+            (family, count)
+        })
+        .filter(|&(_, count)| count > 0)
+        .collect()
+}
+
 /// All transient branch series in canonical family order — the one element
 /// walk every tab shares. Series are labelled from the deck's element names
 /// (`I(RLOAD)`, `Ic(Q1)`), not a positional guess.
+///
+/// `enabled` is one flag per emitted series, positionally (`slot k` = the k-th
+/// series below); a missing flag counts as on.
 pub fn tran_current_series(
     tran: &TranResult,
     circuit: &Circuit,
+    enabled: &[bool],
     x_mult: f64,
     y_mult: f64,
 ) -> Vec<PlotSeries> {
     let points = &tran.points;
     let mut out = Vec::new();
-    let mut color_idx = 0usize;
+    let mut slot = 0usize;
     if let Some(first) = points.first() {
         for family in CURRENT_FAMILIES {
             let count = first.branch_currents.slice(family).unwrap_or(&[]).len();
             if count == 0 {
                 continue;
             }
-            for (i, label) in family_labels(circuit, family, count).into_iter().enumerate() {
+            for (i, label) in family_labels(circuit, family, count)
+                .into_iter()
+                .enumerate()
+            {
+                let on = enabled.get(slot).copied().unwrap_or(true);
+                slot += 1;
+                if !on {
+                    continue;
+                }
                 out.push(PlotSeries {
                     name: format!("{}({label})", family.probe_prefix()),
-                    color: PLOT_COLORS[color_idx % PLOT_COLORS.len()],
+                    color: PLOT_COLORS[out.len() % PLOT_COLORS.len()],
                     points: points
                         .iter()
                         .map(|p| {
@@ -451,7 +522,6 @@ pub fn tran_current_series(
                         })
                         .collect(),
                 });
-                color_idx += 1;
             }
         }
     }

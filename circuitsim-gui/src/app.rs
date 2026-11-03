@@ -9,14 +9,14 @@ use egui::{Color32, Pos2, Rect, Stroke, Vec2};
 
 use crate::chrome;
 use crate::icons::{icon_button, Icon};
+use crate::plot::{
+    ac_current_series, ac_plot_frame, ac_voltage_series, current_slots, dc_sweep_series, draw,
+    first_transient_plot, plot_frame, plot_frame_hover, tran_current_series, tran_diff_series,
+    tran_voltage_series, AcCursor, AcMagScale, AcQuantity, ExpressionTraces, PlotState,
+};
 use crate::schematic::{
     instance_names, AnalysisType, CompKind, GridPt, NodeAssignment, Note, SchematicState, Tool,
     GRID_SIZE,
-};
-use crate::plot::{
-    ac_current_series, ac_plot_frame, ac_voltage_series, dc_sweep_series, draw,
-    first_transient_plot, plot_frame, tran_current_series, tran_diff_series,
-    tran_voltage_series, AcCursor, AcMagScale, AcQuantity, ExpressionTraces, PlotState,
 };
 
 /// Deck-spelling label for a node (`in`, `out`), falling back to its id.
@@ -261,6 +261,61 @@ struct NoteDialog {
     fresh: bool,
 }
 
+/// What the schematic panel highlights because a Waveforms hover reached it
+/// across the probe plumbing ("hover a trace, see its source"): a node from a
+/// `V(...)` trace, or a family's element slot from an `I(...)` trace.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProbeFlash {
+    Node(usize),
+    Element(ElementFamily, usize),
+}
+
+/// The schematic object a cross-probe click or hover preview landed on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProbeTarget {
+    /// Index into the schematic's component list (two-terminal parts only).
+    Part(usize),
+    /// Index into the schematic's wire list.
+    Wire(usize),
+}
+
+/// The printed family a canvas part kind reports its current under; `Ground`
+/// carries none.
+fn canvas_family(kind: CompKind) -> Option<ElementFamily> {
+    match kind {
+        CompKind::Resistor => Some(ElementFamily::Resistors),
+        CompKind::Capacitor => Some(ElementFamily::Capacitors),
+        CompKind::Inductor => Some(ElementFamily::Inductors),
+        CompKind::Voltage => Some(ElementFamily::VoltageSources),
+        CompKind::Ground => None,
+    }
+}
+
+/// The emitted order of the branch-current walk, expanded to one entry per
+/// series: slot k → (family, index within the family). One owner of that
+/// mapping instead of the Current tab and the probe clicks each re-deriving
+/// it from [`current_slots`].
+fn current_slot_targets(tran: &TranResult) -> Vec<(ElementFamily, usize)> {
+    let mut out = Vec::new();
+    for (family, count) in current_slots(tran) {
+        out.extend(
+            std::iter::repeat_n(family, count)
+                .enumerate()
+                .map(|(i, f)| (f, i)),
+        );
+    }
+    out
+}
+
+/// How the deck spells schematic net `node`: its label when it has one, else
+/// its number — the same rule the netlist writer follows. The schematic's
+/// node numbers are *not* the run's node ids once a net is labeled (the
+/// parser gives numeric nodes their own number and named nodes ids above
+/// them), so probes and highlights compare spellings, never raw numbers.
+fn net_spelling(assignment: &NodeAssignment, node: usize) -> String {
+    assignment.name_of(node).map_or_else(|| node.to_string(), str::to_string)
+}
+
 pub struct CircuitSimApp {
     netlist: String,
     file_label: String,
@@ -278,6 +333,10 @@ pub struct CircuitSimApp {
     plot_nodes: Vec<bool>,
     dc_plot_nodes: Vec<bool>,
     ac_plot_nodes: Vec<bool>,
+    /// One flag per emitted branch-current series (slot k = series k, the
+    /// [`current_slots`] order); the Current tab renders only the slots that
+    /// are on, so the probe clicks can address the same position.
+    plot_currents: Vec<bool>,
     ac_mag_scale: AcMagScale,
     result_tab: ResultTab,
     tran_sub_tab: TranSubTab,
@@ -311,10 +370,21 @@ pub struct CircuitSimApp {
     note_dialog: Option<NoteDialog>,
     /// The popup's edit buffer for the selected annotation (which one, text).
     note_edit: Option<(Note, String)>,
-    /// The deck text the shown results were simulated from. Cross-probing
+    /// The deck text the shown results were simulated from. Wire probing
     /// trusts the schematic's nets only while the schematic still generates
     /// exactly this text.
     run_text: Option<String>,
+
+    // Cross-probing: the Waveforms hover writes this highlight target and the
+    // schematic panel draws it. No frame bookkeeping needed — the plot and
+    // the schematic paint inside the same synchronous frame, so the only
+    // question is whether a Waveforms plot is even on screen (see
+    // [`Self::waveforms_plot_visible`]).
+    probe_flash: Option<ProbeFlash>,
+    /// The schematic object the previous probe click landed on: clicking the
+    /// same probe twice erases the other traces (the reference's "plotted by
+    /// itself"), so the second click must know it repeats the first.
+    last_probe_click: Option<ProbeTarget>,
 }
 
 impl Default for CircuitSimApp {
@@ -333,6 +403,7 @@ impl Default for CircuitSimApp {
             plot_nodes: vec![false; 16],
             dc_plot_nodes: vec![false; 16],
             ac_plot_nodes: vec![false; 16],
+            plot_currents: Vec::new(),
             ac_mag_scale: AcMagScale::default(),
             result_tab: ResultTab::Overview,
             tran_sub_tab: TranSubTab::default(),
@@ -356,6 +427,9 @@ impl Default for CircuitSimApp {
             note_dialog: None,
             note_edit: None,
             run_text: None,
+
+            probe_flash: None,
+            last_probe_click: None,
         }
     }
 }
@@ -478,6 +552,18 @@ impl CircuitSimApp {
         for i in 1..max_nodes.min(self.ac_plot_nodes.len()) {
             self.ac_plot_nodes[i] = i <= 3;
         }
+
+        // Both Voltage and Current traces show the first few slots on a
+        // fresh run; LTspice puts nothing up and lets the probe add them.
+        // With nothing flagged the plot still draws every series (the
+        // Voltage pass treats a missing/none flag as off only by position),
+        // so keep the historical behavior here.
+        self.plot_currents = match &self.tran {
+            Some(tran) => vec![true; current_slots(tran).len()],
+            None => Vec::new(),
+        };
+        self.last_probe_click = None;
+
         self.result_tab = self.tab_for_new_results();
     }
 
@@ -510,6 +596,9 @@ impl CircuitSimApp {
         self.tran = None;
         self.ac = None;
         self.node_names = vec!["0".to_string()];
+        self.plot_currents = Vec::new();
+        self.probe_flash = None;
+        self.last_probe_click = None;
         self.expressions.rebase(None, Default::default());
         self.expr_error = None;
     }
@@ -697,7 +786,7 @@ impl CircuitSimApp {
     /// longer say which trace is which, and a wrong trace is worse than none.
     fn probe_target(&self, wire: usize) -> Result<usize, String> {
         let Some(run_text) = self.run_text.as_deref() else {
-            return Err("Run a simulation first, then Shift+click a wire to plot its voltage".into());
+            return Err("Run a simulation first, then click a wire to plot its voltage".into());
         };
         let w = self.schematic.wires.get(wire).ok_or("no such wire")?;
         let deck = self.schematic.deck_text()?;
@@ -713,7 +802,7 @@ impl CircuitSimApp {
         if node == 0 {
             return Err("Ground is 0 V — nothing to plot".into());
         }
-        let spelling = a.name_of(node).map_or_else(|| node.to_string(), str::to_string);
+        let spelling = net_spelling(&a, node);
         self.node_names
             .iter()
             .position(|n| n.eq_ignore_ascii_case(&spelling))
@@ -826,6 +915,18 @@ impl CircuitSimApp {
         self.dc.is_some() || self.dc_sweep.is_some() || self.tran.is_some() || self.ac.is_some()
     }
 
+    /// Whether a Waveforms plot is painted on screen right now, derived from
+    /// state alone. The schematic paints before or after the results pane
+    /// depending on the tiling, so its cross-probe highlight can't ask the
+    /// plot "did you just paint a hover?" — it asks this instead, and the
+    /// Waveforms branches clear/replace [`Self::probe_flash`] every frame,
+    /// making the highlight expire the instant the plot is not shown.
+    fn waveforms_plot_visible(&self) -> bool {
+        self.tran.is_some()
+            && self.result_tab == ResultTab::Waveforms
+            && (self.tiling != Tiling::Single || self.active_pane == Pane::Results)
+    }
+
     /// The open document's name without its extension (`untitled`, `rc_charge`).
     fn doc_stem(&self) -> String {
         std::path::Path::new(&self.file_label)
@@ -901,6 +1002,9 @@ impl CircuitSimApp {
     fn delete_selection(&mut self) {
         if self.schematic_active() {
             self.schematic.delete_selection();
+            // Renumbering invalidates "clicked the same probe twice": the
+            // deck's slot identities moved.
+            self.last_probe_click = None;
         }
     }
 
@@ -918,6 +1022,132 @@ impl CircuitSimApp {
             }
             self.active_pane = Pane::Results;
         }
+    }
+
+    // ── Cross-probing ───────────────────────────────────────────────────────
+
+    /// The probe click target at a screen position on the schematic canvas:
+    /// two-terminal parts first (a Ground body stays a selection click), then
+    /// wires. Answers `None` anywhere else, which the caller reads as plain
+    /// canvas — the ordinary selection click.
+    fn probe_target_at(
+        &self,
+        pos: Pos2,
+        to_screen: impl Fn(GridPt) -> Pos2,
+        z: f32,
+    ) -> Option<ProbeTarget> {
+        for (i, c) in self.schematic.components.iter().enumerate() {
+            if canvas_family(c.kind).is_none() {
+                continue;
+            }
+            let p1 = to_screen(c.p1);
+            let p2 = to_screen(c.p2);
+            let center = p1 + (p2 - p1) / 2.0;
+            let is_horizontal = c.p1.1 == c.p2.1;
+            let box_size = if is_horizontal {
+                Vec2::new(24.0, 16.0)
+            } else {
+                Vec2::new(16.0, 24.0)
+            };
+            let click_rect = Rect::from_center_size(center, box_size + Vec2::new(12.0, 12.0));
+            if click_rect.contains(pos) {
+                return Some(ProbeTarget::Part(i));
+            }
+        }
+        for (wi, w) in self.schematic.wires.iter().enumerate() {
+            let a = to_screen(w.p1);
+            let b = to_screen(w.p2);
+            let ab = b - a;
+            let ap = pos - a;
+            let ab_len_sq = ab.x * ab.x + ab.y * ab.y;
+            let dist_sq = if ab_len_sq < 1.0 {
+                ap.x * ap.x + ap.y * ap.y
+            } else {
+                let t = ((ap.x * ab.x + ap.y * ab.y) / ab_len_sq).clamp(0.0, 1.0);
+                let closest = a + ab * t;
+                let d = pos - closest;
+                d.x * d.x + d.y * d.y
+            };
+            if dist_sq < (36.0 * z * z) {
+                return Some(ProbeTarget::Wire(wi));
+            }
+        }
+        None
+    }
+
+    /// Probe a part — the canvas component at `ci` — as the reference does:
+    /// clicking the body adds its branch current. `isolate` is the
+    /// double-click: the trace alone replaces whatever else was plotted.
+    /// Returns whether a trace was added, so the caller falls back to the
+    /// ordinary selection click when the family carries no report.
+    fn probe_part_for(&mut self, ci: usize, isolate: bool) -> bool {
+        // The (family, family-index) pair each plotted slot carries, taken
+        // while `tran` still borrows.
+        let slot_targets = match self.tran.as_ref() {
+            Some(tran) => current_slot_targets(tran),
+            None => return false,
+        };
+        let Some(c) = self.schematic.components.get(ci).cloned() else {
+            return false;
+        };
+        let Some(family) = canvas_family(c.kind) else {
+            return false;
+        };
+        // Family order on canvas == deck order == report order (`R1` is the
+        // first reported resistor), because the netlist writer numbers the
+        // same component walk these labels come from.
+        let within = self.schematic.components[..ci]
+            .iter()
+            .filter(|o| o.kind == c.kind)
+            .count();
+        let Some(slot) = slot_targets
+            .iter()
+            .position(|&(f, i)| f == family && i == within)
+        else {
+            return false;
+        };
+        if isolate {
+            self.plot_currents = vec![false; self.plot_currents.len()];
+        }
+        if let Some(flag) = self.plot_currents.get_mut(slot) {
+            *flag = true;
+        }
+        self.result_tab = ResultTab::Waveforms;
+        self.tran_sub_tab = TranSubTab::Current;
+        self.show_results_after_run();
+        true
+    }
+
+    /// Probe a wire — the wire at `wi` — by adding the voltage of the node it
+    /// carries. `isolate` takes the double-click role from
+    /// [`Self::probe_part_for`] / [`Self::probe_wire_for`]. Returns whether a
+    /// trace was added: node 0 is ground (always 0 V), and a node without a
+    /// slot (import mismatch) probes nothing.
+    fn probe_wire_for(&mut self, wi: usize, isolate: bool) -> bool {
+        // The run's node id for the wire's net, by deck spelling and only
+        // while the schematic still generates the deck the traces came from
+        // ([`Self::probe_target`]); a refusal says why and the click falls
+        // back to selection.
+        let node = match self.probe_target(wi) {
+            Ok(id) => id,
+            Err(e) => {
+                self.status = Some((false, e));
+                return false;
+            }
+        };
+        if node == 0 || node >= self.plot_nodes.len() {
+            return false;
+        }
+        if isolate {
+            self.plot_nodes = vec![false; self.plot_nodes.len()];
+        }
+        if let Some(flag) = self.plot_nodes.get_mut(node) {
+            *flag = true;
+        }
+        self.result_tab = ResultTab::Waveforms;
+        self.tran_sub_tab = TranSubTab::Voltage;
+        self.show_results_after_run();
+        true
     }
 
     // ── View ────────────────────────────────────────────────────────────────
@@ -1802,6 +2032,73 @@ impl CircuitSimApp {
                     text_color,
                 );
             }
+
+            // ── Cross-probe highlight: a hover in the Waveforms plot marks
+            //    its owning object here — the wire(s) its node runs through,
+            //    or the part body its branch current comes from. The
+            //    Waveforms branch refreshes `probe_flash` on every painted
+            //    frame; with no Waveforms plot showing, it expires at once.
+            let flash = if self.waveforms_plot_visible() {
+                self.probe_flash
+            } else {
+                None
+            };
+            match flash {
+                Some(ProbeFlash::Node(node)) => {
+                    let stroke = Stroke::new(3.0 * z, Color32::from_rgb(230, 80, 40));
+                    // `node` is a run node id; wires are matched by the
+                    // deck spelling of their net (a labeled net's id is not
+                    // its schematic number).
+                    let spelling = node_label(&self.node_names, node);
+                    for w in &self.schematic.wires {
+                        let wire_net = net_spelling(&assignment, assignment.node_of(w.p1));
+                        if wire_net.eq_ignore_ascii_case(&spelling) {
+                            painter.line_segment([to_screen(w.p1), to_screen(w.p2)], stroke);
+                        }
+                    }
+                }
+                Some(ProbeFlash::Element(family, within)) => {
+                    // Only the R/C/L/V families exist on canvas; a Current
+                    // tab series from another family keeps its trace but
+                    // gets no schematic flash.
+                    let kind = match family {
+                        ElementFamily::Resistors => Some(CompKind::Resistor),
+                        ElementFamily::Capacitors => Some(CompKind::Capacitor),
+                        ElementFamily::Inductors => Some(CompKind::Inductor),
+                        ElementFamily::VoltageSources => Some(CompKind::Voltage),
+                        _ => None,
+                    };
+                    if let Some(kind) = kind {
+                        let mut seen = 0usize;
+                        for c in &self.schematic.components {
+                            if c.kind == kind {
+                                if seen == within {
+                                    let p1 = to_screen(c.p1);
+                                    let p2 = to_screen(c.p2);
+                                    let center = p1 + (p2 - p1) / 2.0;
+                                    let horizontal = c.p1.1 == c.p2.1;
+                                    let rect = Rect::from_center_size(
+                                        center,
+                                        if horizontal {
+                                            Vec2::new(40.0, 22.0)
+                                        } else {
+                                            Vec2::new(22.0, 40.0)
+                                        } * z,
+                                    );
+                                    painter.rect_stroke(
+                                        rect,
+                                        2.0,
+                                        Stroke::new(2.0_f32, Color32::from_rgb(230, 80, 40)),
+                                    );
+                                    break;
+                                }
+                                seen += 1;
+                            }
+                        }
+                    }
+                }
+                None => {}
+            }
         }
         // ── End node labels ──────────────────────────────────────────────
 
@@ -1988,12 +2285,47 @@ impl CircuitSimApp {
                                 }
                             }
                         }
-                        match hit_note {
-                            Some(note) => self.schematic.select_note(Some(note)),
-                            None => self.schematic.select(selected, hit_wire),
-                        }
-                        if let (Some(wi), true) = (hit_wire, ui.input(|i| i.modifiers.shift)) {
-                            self.probe_wire(wi);
+                        // With a transient run to apply it to, a plain click
+                        // probes: a part adds its branch current, a wire adds
+                        // the voltage its node carries, and the click skips
+                        // selection entirely — the reference's probe
+                        // semantics. Ground bodies and empty canvas still
+                        // behave as ordinary selection clicks. Clicking the
+                        // same probe again erases the rest ("plotted by
+                        // itself"). A click on an annotation's text selects
+                        // it instead, so a label sitting on a wire stays
+                        // pickable.
+                        let probed = if self.tran.is_some() && hit_note.is_none() {
+                            match self.probe_target_at(interact_pos, to_screen, z) {
+                                Some(target) => {
+                                    let isolate = self.last_probe_click == Some(target);
+                                    let probed = match target {
+                                        ProbeTarget::Part(ci) => self.probe_part_for(ci, isolate),
+                                        ProbeTarget::Wire(wi) => self.probe_wire_for(wi, isolate),
+                                    };
+                                    self.last_probe_click = probed.then_some(target);
+                                    probed
+                                }
+                                None => {
+                                    self.last_probe_click = None;
+                                    false
+                                }
+                            }
+                        } else {
+                            self.last_probe_click = None;
+                            false
+                        };
+                        if !probed {
+                            match hit_note {
+                                Some(note) => self.schematic.select_note(Some(note)),
+                                None => self.schematic.select(selected, hit_wire),
+                            }
+                            // Shift+click probes a wire's voltage after any
+                            // analysis (plain click covers transient runs
+                            // above); same freshness rule, same spelling.
+                            if let (Some(wi), true) = (hit_wire, ui.input(|i| i.modifiers.shift)) {
+                                self.probe_wire(wi);
+                            }
                         }
                     }
                 }
@@ -2008,6 +2340,75 @@ impl CircuitSimApp {
         // Cancel wire dragging on Right Click
         if response.secondary_clicked() {
             self.schematic.cancel_gesture();
+        }
+
+        // ── Cross-probe preview: the LTspice dot reads the probe at the
+        //    cursor — hovering a part shows `I(R1)`-style, a wire `V(node)`-.
+        //    Only when a click would actually land a trace; otherwise the
+        //    pointer behaves (and reads) as a selection cursor.
+        if self.tran.is_some()
+            && self.schematic.tool == Tool::Select
+            && response.hovered()
+            && !response.dragged()
+        {
+            if let Some(hover_pos) = response.hover_pos() {
+                let preview = match self.probe_target_at(hover_pos, to_screen, z) {
+                    Some(ProbeTarget::Wire(wi)) => self
+                        .probe_target(wi)
+                        .ok()
+                        .filter(|&node| node > 0 && node < self.plot_nodes.len())
+                        .map(|node| format!("V({})", node_label(&self.node_names, node))),
+                    Some(ProbeTarget::Part(ci)) => self
+                        .schematic
+                        .components
+                        .get(ci)
+                        .and_then(|c| canvas_family(c.kind).map(|family| (family, ci)))
+                        .map(|(family, ci)| {
+                            let within = self.schematic.components[..ci]
+                                .iter()
+                                .filter(|o| o.kind == self.schematic.components[ci].kind)
+                                .count();
+                            (
+                                family,
+                                current_slot_targets(self.tran.as_ref().unwrap())
+                                    .iter()
+                                    .any(|&(f, i)| f == family && i == within),
+                                within,
+                            )
+                        })
+                        .and_then(|(family, has_slot, within)| {
+                            if !has_slot {
+                                return None;
+                            }
+                            let name = self
+                                .circuit
+                                .as_ref()
+                                .and_then(|c| c.element_names(family).get(within).cloned())
+                                .unwrap_or_else(|| format!("{}{}", family.letter(), within + 1));
+                            Some(format!("I({name})"))
+                        }),
+                    None => None,
+                };
+                if let Some(text) = preview {
+                    let galley = painter.layout_no_wrap(
+                        text,
+                        theme::bold(11.0),
+                        Color32::from_rgb(200, 30, 30),
+                    );
+                    let pad = Vec2::new(5.0, 3.0);
+                    let pill = Rect::from_min_size(
+                        hover_pos + Vec2::new(14.0, 10.0) - pad,
+                        galley.size() + pad * 2.0,
+                    );
+                    painter.rect_filled(pill, 3.0, Color32::WHITE);
+                    painter.rect_stroke(
+                        pill,
+                        3.0,
+                        Stroke::new(1.0_f32, Color32::from_rgb(200, 30, 30)),
+                    );
+                    painter.galley(pill.min + pad, galley, Color32::from_rgb(200, 30, 30));
+                }
+            }
         }
 
         // Delete key removes selected wire or component
@@ -2665,13 +3066,37 @@ impl CircuitSimApp {
 
                 code_frame().show(ui, |ui| {
                     let adjusted_height = ui.available_height();
-                    let series = tran_voltage_series(tran, &self.plot_nodes, &self.node_names, x_mult, y_mult);
+                    let series = tran_voltage_series(
+                        tran,
+                        &self.plot_nodes,
+                        &self.node_names,
+                        x_mult,
+                        y_mult,
+                    );
                     let apply = self.plot.tran_apply.then(|| self.plot.tran_bounds);
                     self.plot.tran_apply = false;
-                    plot_frame(
-                        "waveforms", adjusted_height, "time (s)", "Voltage (V)",
-                        &series, apply, ui,
+                    // Emitted order: enabled nodes above ground —
+                    // `tran_voltage_series` skips node 0 and any flag off —
+                    // so the hover index maps back to its node.
+                    let visible_nodes: Vec<usize> = self
+                        .plot_nodes
+                        .iter()
+                        .enumerate()
+                        .filter(|&(node, &on)| node > 0 && on)
+                        .map(|(node, _)| node)
+                        .collect();
+                    let hover = plot_frame_hover(
+                        "waveforms",
+                        adjusted_height,
+                        "time (s)",
+                        "Voltage (V)",
+                        &series,
+                        apply,
+                        ui,
                     );
+                    self.probe_flash = hover
+                        .and_then(|slot| visible_nodes.get(slot).copied())
+                        .map(ProbeFlash::Node);
                 });
             }
 
@@ -2685,22 +3110,35 @@ impl CircuitSimApp {
                 ui.add_space(8.0);
                 code_frame().show(ui, |ui| {
                     let adjusted_height = ui.available_height();
+                    let slot_targets = current_slot_targets(tran);
                     let series = tran_current_series(
                         tran,
                         self.circuit.as_ref().unwrap_or(&CsCircuit::default()),
+                        &self.plot_currents,
                         x_mult,
                         y_mult,
                     );
                     let apply = self.plot.tran_apply.then(|| self.plot.tran_bounds);
                     self.plot.tran_apply = false;
-                    plot_frame(
-                        "waveforms_current", adjusted_height, "time (s)", "Current (A)",
-                        &series, apply, ui,
+                    let hover = plot_frame_hover(
+                        "waveforms_current",
+                        adjusted_height,
+                        "time (s)",
+                        "Current (A)",
+                        &series,
+                        apply,
+                        ui,
                     );
+                    self.probe_flash = hover
+                        .and_then(|k| slot_targets.get(k).copied())
+                        .map(|(family, at)| ProbeFlash::Element(family, at));
                 });
             }
 
             TranSubTab::Differential => {
+                // The differential readout is plotted explicitly — no owning
+                // wire, so nothing on the schematic can answer the hover.
+                self.probe_flash = None;
                 // ── Node selector controls ────────────────────────────────────
                 let n_nodes = self.node_names.len();
 
@@ -2762,6 +3200,9 @@ impl CircuitSimApp {
             }
 
             TranSubTab::Expression => {
+                // Typed expressions have no single owning object; no hover
+                // highlight either.
+                self.probe_flash = None;
                 // ── Waveform arithmetic: type an expression, plot the result ──
                 let mut submit = false;
                 ui.horizontal_wrapped(|ui| {
@@ -3263,5 +3704,36 @@ mod tests {
         app.run_simulation();
         let err = app.probe_target(2).unwrap_err();
         assert!(err.contains("Ground"), "{err}");
+    }
+
+    /// The plain-click probe finds a labeled net by its deck name: the run's
+    /// id for `mid` is not the schematic's node number for it.
+    #[test]
+    fn click_probe_plots_the_labeled_net_by_its_deck_name() {
+        let mut app = probe_app();
+        app.run_simulation();
+        assert!(app.tran.is_some(), "{:?}", app.status);
+        let id = app.probe_target(1).expect("wire 1 is the mid net");
+        assert_eq!(app.node_names[id], "mid");
+        app.plot_nodes.iter_mut().for_each(|b| *b = false);
+        assert!(app.probe_wire_for(1, false));
+        assert!(app.plot_nodes[id]);
+        assert_eq!(app.plot_nodes.iter().filter(|b| **b).count(), 1);
+        assert!(app.tran_sub_tab == TranSubTab::Voltage);
+        // Probing the same net again isolates it.
+        assert!(app.probe_wire_for(1, true));
+        assert_eq!(app.plot_nodes.iter().filter(|b| **b).count(), 1);
+    }
+
+    #[test]
+    fn click_probe_refuses_a_drifted_schematic_and_says_why() {
+        let mut app = probe_app();
+        app.run_simulation();
+        app.schematic.components[1].val = "2k".into();
+        assert!(!app.probe_wire_for(1, false));
+        match &app.status {
+            Some((false, msg)) => assert!(msg.contains("changed since the last run"), "{msg}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
     }
 }

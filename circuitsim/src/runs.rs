@@ -13,6 +13,7 @@
 //! it).
 
 use std::collections::HashMap;
+use std::thread;
 
 use crate::analysis::{
     run_single, sweep_values, AcResult, DcResult, DcSweepResult, FourResult, MeasureResult,
@@ -220,28 +221,44 @@ fn mint_inner(netlist: &Netlist, plan: &RunPlan) -> Result<Netlist> {
 
 /// The protocol, owned once: per plan, mint the inner deck, run it once,
 /// land one `StepRun`; then mirror the first run into the top level.
+///
+/// Plans are independent by construction — each mints its own deck off the
+/// caller's untouched one — so the mint/run pairs spread across cores in
+/// contiguous chunks ([`MIN_RUNS_PER_THREAD`] keeps a one-run sweep off the
+/// spawn path). Workers are joined in spawn order, which is plan order, so
+/// the caller still sees the sequential loop's semantics: the sweep's run
+/// row order, and the *first* failing plan in plan order aborting the sweep.
 fn run_plans(
     netlist: &Netlist,
     plans: Vec<RunPlan>,
     targets: Vec<String>,
     no_runs: &str,
 ) -> Result<SimulationResult> {
-    let mut runs = Vec::with_capacity(plans.len());
-    for plan in &plans {
-        let inner = mint_inner(netlist, plan)?;
-        let single = run_single(&inner)?;
-        runs.push(StepRun {
-            values: plan.values(),
-            dc: single.dc,
-            dc_sweep: single.dc_sweep,
-            tran: single.tran,
-            ac: single.ac,
-            tf: single.tf,
-            measurements: single.measurements,
-            four: single.four,
-            noise: single.noise,
-        });
-    }
+    let workers = thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(plans.len().div_ceil(MIN_RUNS_PER_THREAD));
+    let chunk_len = plans.len().div_ceil(workers.max(1)).max(1);
+    let runs: Vec<Result<StepRun>> = thread::scope(|scope| {
+        let handles: Vec<_> = plans
+            .chunks(chunk_len)
+            .map(|chunk| {
+                scope.spawn(move || {
+                    chunk
+                        .iter()
+                        .map(|plan| mint_and_run(netlist, plan))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().unwrap())
+            .collect()
+    });
+    // First-in-plan-order failure aborts the sweep, as the sequential loop
+    // it replaced did.
+    let runs = runs.into_iter().collect::<Result<Vec<_>>>()?;
     let first = runs
         .first()
         .cloned()
@@ -260,11 +277,34 @@ fn run_plans(
     })
 }
 
+/// One plan's mint-ded-run: the per-plan body [`run_plans`] spreads, kept
+/// whole so a thread sees the same choreography the sequential loop did.
+fn mint_and_run(netlist: &Netlist, plan: &RunPlan) -> Result<StepRun> {
+    let inner = mint_inner(netlist, plan)?;
+    let single = run_single(&inner)?;
+    Ok(StepRun {
+        values: plan.values(),
+        dc: single.dc,
+        dc_sweep: single.dc_sweep,
+        tran: single.tran,
+        ac: single.ac,
+        tf: single.tf,
+        measurements: single.measurements,
+        four: single.four,
+        noise: single.noise,
+    })
+}
+
 // ─── Value lists ─────────────────────────────────────────────────────────────
 
 /// Hard ceiling on the number of `.step` combinations (each is a full
 /// analysis), so a fat-fingered sweep cannot run for days.
 const MAX_STEP_RUNS: usize = 10_000;
+
+/// The spread stops below this: fewer than two runs a piece and the
+/// spawn/join (plus a per-thread plan-pool rebuild) is the cost, nothing
+/// is the win.
+const MIN_RUNS_PER_THREAD: usize = 2;
 
 /// The cartesian product of every `.step` value list, outer spec first.
 fn step_combinations(specs: &[StepSpec]) -> Result<Vec<Vec<f64>>> {
@@ -323,6 +363,7 @@ fn step_values(spec: &StepSpec) -> Result<Vec<f64>> {
 #[cfg(test)]
 mod tests {
     use super::{mint_inner, run, run_plans, RunPlan};
+    use approx::assert_relative_eq;
     use crate::error::SimError;
     use crate::mc;
     use crate::parse;
@@ -373,6 +414,61 @@ mod tests {
         assert!(result.runs.is_empty());
         assert!(result.step_targets.is_empty());
         assert!(result.dc.is_some());
+    }
+
+    /// The spread (thread workers joined in plan order) preserves the
+    /// sequential loop's row order: each run's recorded value row and its
+    /// own resolved deck. How many workers run is machine-dependent — the
+    /// assertions hold on either the threaded path or the single-chunk one.
+    #[test]
+    fn spread_preserves_plan_order_and_each_runs_own_deck() {
+        let netlist = parse(
+            "* spread, then read out\n\
+             .param r=1k\n\
+             V1 in 0 DC 1\n\
+             R1 in out {r}\n\
+             R2 out 0 1k\n\
+             .step param r list 1k 2k 3k 4k 5k 6k\n\
+             .op\n\
+             .end\n",
+        )
+        .unwrap();
+        let result = run(&netlist).unwrap();
+        assert_eq!(result.runs.len(), 6);
+        for (i, step) in result.runs.iter().enumerate() {
+            // The value row is the plan's, in plan order.
+            assert_eq!(step.values, vec![(i + 1) as f64 * 1000.0]);
+            // …and the deck behind the row is that run's: the out node rides
+            // its own r (1 / (1 + r/1k) of the 1 V drive).
+            let out = step.dc.as_ref().unwrap().node_voltages[2];
+            assert_relative_eq!(out, 1.0 / (1.0 + (i + 1) as f64), epsilon = 1e-9);
+        }
+    }
+
+    /// With workers spread across cores the sweep still aborts on the
+    /// *first-in-plan-order* failure — a later run is not the one the
+    /// caller hears about, and the error is the sequential loop's byte
+    /// for byte.
+    #[test]
+    fn spread_sweeps_still_abort_on_the_first_failing_run() {
+        let netlist = parse(
+            "* zero resistance wins the error race\n\
+             .param r=1k\n\
+             V1 in 0 DC 1\n\
+             R1 in out {r}\n\
+             R2 out 0 1k\n\
+             .step param r list 0 1k 2k\n\
+             .op\n\
+             .end\n",
+        )
+        .unwrap();
+        let err = run(&netlist).unwrap_err();
+        match err {
+            SimError::Circuit(message) => {
+                assert_eq!(message, "resistor R1 must have R > 0 (card or model)");
+            }
+            other => panic!("unexpected error shape: {other}"),
+        }
     }
 
     /// The empty-plan error speaks in the deck's own words, byte for byte.

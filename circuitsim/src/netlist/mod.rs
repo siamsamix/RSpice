@@ -21,7 +21,8 @@ use self::models::parse_model_card;
 use self::elements::{
     parse_behavioral_source, parse_bjt, parse_capacitor, parse_controlled_source,
     parse_current_source, parse_diode, parse_inductor, parse_jfet, parse_mosfet,
-    parse_mutual_inductance, parse_opamp, parse_resistor, parse_switch, parse_tline,
+    parse_lossy_line, parse_mutual_inductance, parse_opamp, parse_resistor, parse_switch,
+    parse_tline,
     parse_voltage_source,
 };
 use self::imports::splice_libraries;
@@ -623,6 +624,7 @@ fn parse_featured(
             'Q' => parse_bjt(&tokens, &mut circuit, &plan, &mut warnings, line_no)?,
             'J' => parse_jfet(&tokens, &mut circuit, &plan, &mut warnings, line_no)?,
             'T' => parse_tline(&tokens, &mut circuit, &plan, &mut warnings, line_no)?,
+            'O' => parse_lossy_line(&tokens, &mut circuit, &plan, line_no)?,
             'S' | 'W' => parse_switch(&tokens, &mut circuit, &plan, line_no)?,
             'K' => parse_mutual_inductance(&tokens, &mut circuit, line_no)?,
             'B' => parse_behavioral_source(&tokens, &mut circuit, &plan, line_no, &env.params)?,
@@ -637,6 +639,9 @@ fn parse_featured(
         }
     }
 
+    // Lossy transmission lines ladder out into plain R/L/C arms once every
+    // `.model … LTRA` is known (a card may precede its model in the deck).
+    circuit.expand_lossy_lines(&mut warnings)?;
     // Series resistances need the final model table, so they split after the
     // card walk; the internal nodes then join compaction below.
     circuit.expand_diode_series_resistance();
@@ -750,6 +755,58 @@ fn logical_lines(source: &str) -> Result<Vec<(usize, String)>> {
         }
 
         out.push((line_no, text.to_string()));
+    }
+    Ok(out)
+}
+
+/// The deck's *directives*: every dot card, as the logical line it forms
+/// (comments stripped, `+` continuations joined), in file order — the text a
+/// front-end can carry verbatim when it cannot draw the card. A `.subckt …
+/// .ends` block (nested ones included) is one directive, its element lines
+/// riding along on `\n`-separated rows, since the body is meaningless without
+/// its header. Element cards outside a subckt are not directives; `.end` stops
+/// the walk and is not returned (a writer adds its own).
+///
+/// The cards are returned unjudged: a front-end that models `.tran`/`.ac`
+/// itself filters those by first word.
+pub fn deck_directives(source: &str) -> Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    // The open `.subckt` block, if any, and its nesting depth.
+    let mut block: Vec<String> = Vec::new();
+    let mut depth = 0usize;
+    for (_, raw) in logical_lines(source)? {
+        // A stripped `;` comment leaves its leading blanks behind.
+        let line = raw.trim().to_string();
+        let word = line
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if depth == 0 && word == ".end" {
+            break;
+        }
+        match word.as_str() {
+            ".subckt" => {
+                depth += 1;
+                block.push(line);
+            }
+            ".ends" if depth > 0 => {
+                block.push(line);
+                depth -= 1;
+                if depth == 0 {
+                    out.push(block.join("\n"));
+                    block.clear();
+                }
+            }
+            _ if depth > 0 => block.push(line),
+            _ if word.starts_with('.') => out.push(line),
+            _ => {}
+        }
+    }
+    if depth > 0 {
+        return Err(SimError::Parse(
+            ".subckt block is never closed by .ends".into(),
+        ));
     }
     Ok(out)
 }

@@ -13,7 +13,8 @@
 //! it).
 
 use std::collections::HashMap;
-use std::thread;
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 use crate::analysis::{
     run_single, sweep_values, AcResult, DcResult, DcSweepResult, FourResult, MeasureResult,
@@ -49,9 +50,35 @@ pub struct StepRun {
 /// the deck has no `.step` cards. A `.mc` deck instead runs once per seeded
 /// Monte Carlo run ([`mc::apply_model_draws`] and the re-parse's draw seed do
 /// the worrying — TODO §8).
+///
+/// The runs of a stepped / Monte Carlo deck are independent decks, so they
+/// are distributed over [`default_threads`] worker threads (TODO §11 "parallel
+/// parametric sweeps"); results land in plan order and are bit-identical to a
+/// serial run. [`run_with_threads`] pins the worker count.
 pub fn run(netlist: &Netlist) -> Result<SimulationResult> {
+    run_with_threads(netlist, default_threads())
+}
+
+/// Worker threads used for the independent runs of one deck: the
+/// `RSPICE_THREADS` environment variable when it holds a positive integer,
+/// else the machine's available parallelism.
+pub fn default_threads() -> usize {
+    std::env::var("RSPICE_THREADS")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .filter(|n| *n > 0)
+        .unwrap_or_else(|| {
+            std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1)
+        })
+}
+
+/// [`run`] with an explicit worker count (`1` = fully serial). The count only
+/// changes wall time: runs are minted and solved independently and collected
+/// in plan order, so the result — and which error surfaces first — never
+/// depends on it.
+pub fn run_with_threads(netlist: &Netlist, threads: usize) -> Result<SimulationResult> {
     if netlist.analysis.mc.is_some() {
-        return run_mc(netlist);
+        return run_mc(netlist, threads);
     }
     let mut specs = netlist.analysis.steps.clone();
     if specs.is_empty() {
@@ -97,7 +124,7 @@ pub fn run(netlist: &Netlist) -> Result<SimulationResult> {
             }
         })
         .collect();
-    run_plans(netlist, plans, targets, ".step produced no runs")
+    run_plans(netlist, plans, targets, ".step produced no runs", threads)
 }
 
 /// The Monte Carlo driver: `.mc <runs> …` re-runs the deck `runs` times, once
@@ -108,7 +135,7 @@ pub fn run(netlist: &Netlist) -> Result<SimulationResult> {
 /// solved as-is. Runs land in the same `runs` vector `.step` fills, tagged
 /// with their run index (`step_targets: ["mc"]`), so the CLI statistics and
 /// overlays read them like step runs.
-fn run_mc(netlist: &Netlist) -> Result<SimulationResult> {
+fn run_mc(netlist: &Netlist, threads: usize) -> Result<SimulationResult> {
     if !netlist.analysis.steps.is_empty() || netlist.analysis.temperatures.len() > 1 {
         return Err(SimError::Analysis(
             "RSpice runs .mc on an unstepped deck; .step and .mc are separate run \
@@ -139,6 +166,7 @@ fn run_mc(netlist: &Netlist) -> Result<SimulationResult> {
         plans,
         vec!["mc".to_string()],
         ".mc produced no runs",
+        threads,
     )
 }
 
@@ -223,42 +251,19 @@ fn mint_inner(netlist: &Netlist, plan: &RunPlan) -> Result<Netlist> {
 /// land one `StepRun`; then mirror the first run into the top level.
 ///
 /// Plans are independent by construction — each mints its own deck off the
-/// caller's untouched one — so the mint/run pairs spread across cores in
-/// contiguous chunks ([`MIN_RUNS_PER_THREAD`] keeps a one-run sweep off the
-/// spawn path). Workers are joined in spawn order, which is plan order, so
-/// the caller still sees the sequential loop's semantics: the sweep's run
-/// row order, and the *first* failing plan in plan order aborting the sweep.
+/// caller's untouched one — so the mint/run pairs spread across `threads`
+/// workers ([`execute_plans`]; a one-run sweep stays serial). Results land in
+/// plan order, so the caller still sees the sequential loop's semantics: the
+/// sweep's run row order, and the *first* failing plan in plan order aborting
+/// the sweep.
 fn run_plans(
     netlist: &Netlist,
     plans: Vec<RunPlan>,
     targets: Vec<String>,
     no_runs: &str,
+    threads: usize,
 ) -> Result<SimulationResult> {
-    let workers = thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1)
-        .min(plans.len().div_ceil(MIN_RUNS_PER_THREAD));
-    let chunk_len = plans.len().div_ceil(workers.max(1)).max(1);
-    let runs: Vec<Result<StepRun>> = thread::scope(|scope| {
-        let handles: Vec<_> = plans
-            .chunks(chunk_len)
-            .map(|chunk| {
-                scope.spawn(move || {
-                    chunk
-                        .iter()
-                        .map(|plan| mint_and_run(netlist, plan))
-                        .collect::<Vec<_>>()
-                })
-            })
-            .collect();
-        handles
-            .into_iter()
-            .flat_map(|h| h.join().unwrap())
-            .collect()
-    });
-    // First-in-plan-order failure aborts the sweep, as the sequential loop
-    // it replaced did.
-    let runs = runs.into_iter().collect::<Result<Vec<_>>>()?;
+    let runs = execute_plans(netlist, &plans, threads)?;
     let first = runs
         .first()
         .cloned()
@@ -277,9 +282,10 @@ fn run_plans(
     })
 }
 
-/// One plan's mint-ded-run: the per-plan body [`run_plans`] spreads, kept
-/// whole so a thread sees the same choreography the sequential loop did.
-fn mint_and_run(netlist: &Netlist, plan: &RunPlan) -> Result<StepRun> {
+/// One plan: mint its deck, run it, land the `StepRun` — the per-plan body
+/// [`execute_plans`] spreads, kept whole so a worker sees the same
+/// choreography the sequential loop did.
+fn execute_plan(netlist: &Netlist, plan: &RunPlan) -> Result<StepRun> {
     let inner = mint_inner(netlist, plan)?;
     let single = run_single(&inner)?;
     Ok(StepRun {
@@ -295,16 +301,69 @@ fn mint_and_run(netlist: &Netlist, plan: &RunPlan) -> Result<StepRun> {
     })
 }
 
+/// Stack for a spawned worker: a run is a whole analysis (parser recursion,
+/// expression trees), so give it the headroom a main thread has.
+const WORKER_STACK: usize = 16 * 1024 * 1024;
+
+/// Run every plan, in parallel over `threads` workers, returning the runs in
+/// plan order.
+///
+/// Workers claim plan indices from one atomic counter, so indices are handed
+/// out in increasing order. When a plan fails, workers stop claiming indices
+/// past it; every lower index was claimed before it and still completes, so
+/// the error returned is always the *lowest-indexed* failure — the same one a
+/// serial loop stops at, whatever the thread count. The calling thread is a
+/// worker too: a failed `spawn` degrades to fewer workers, never to an error.
+/// A panic in a worker propagates out of the scope like a serial panic would.
+fn execute_plans(netlist: &Netlist, plans: &[RunPlan], threads: usize) -> Result<Vec<StepRun>> {
+    let workers = threads.max(1).min(plans.len());
+    if workers <= 1 {
+        return plans.iter().map(|plan| execute_plan(netlist, plan)).collect();
+    }
+
+    let next = AtomicUsize::new(0);
+    let lowest_failure = AtomicUsize::new(usize::MAX);
+    let slots: Vec<Mutex<Option<Result<StepRun>>>> =
+        plans.iter().map(|_| Mutex::new(None)).collect();
+    let work = || loop {
+        let i = next.fetch_add(1, Ordering::Relaxed);
+        if i >= plans.len() || i > lowest_failure.load(Ordering::Relaxed) {
+            break;
+        }
+        let outcome = execute_plan(netlist, &plans[i]);
+        if outcome.is_err() {
+            lowest_failure.fetch_min(i, Ordering::Relaxed);
+        }
+        *slots[i].lock().expect("run slot") = Some(outcome);
+    };
+    std::thread::scope(|scope| {
+        for _ in 1..workers {
+            let _ = std::thread::Builder::new()
+                .stack_size(WORKER_STACK)
+                .spawn_scoped(scope, &work);
+        }
+        work();
+    });
+
+    let mut runs = Vec::with_capacity(plans.len());
+    for slot in slots {
+        match slot.into_inner().expect("run slot") {
+            Some(outcome) => runs.push(outcome?),
+            None => {
+                return Err(SimError::Analysis(
+                    "internal error: a run was skipped without a preceding failure".into(),
+                ))
+            }
+        }
+    }
+    Ok(runs)
+}
+
 // ─── Value lists ─────────────────────────────────────────────────────────────
 
 /// Hard ceiling on the number of `.step` combinations (each is a full
 /// analysis), so a fat-fingered sweep cannot run for days.
 const MAX_STEP_RUNS: usize = 10_000;
-
-/// The spread stops below this: fewer than two runs a piece and the
-/// spawn/join (plus a per-thread plan-pool rebuild) is the cost, nothing
-/// is the win.
-const MIN_RUNS_PER_THREAD: usize = 2;
 
 /// The cartesian product of every `.step` value list, outer spec first.
 fn step_combinations(specs: &[StepSpec]) -> Result<Vec<Vec<f64>>> {
@@ -362,7 +421,7 @@ fn step_values(spec: &StepSpec) -> Result<Vec<f64>> {
 
 #[cfg(test)]
 mod tests {
-    use super::{mint_inner, run, run_plans, RunPlan};
+    use super::{default_threads, mint_inner, run, run_plans, run_with_threads, RunPlan};
     use approx::assert_relative_eq;
     use crate::error::SimError;
     use crate::mc;
@@ -475,12 +534,12 @@ mod tests {
     #[test]
     fn no_runs_errors_are_byte_exact() {
         let netlist = parse("* empty: nothing to run\n.op\n.end\n").unwrap();
-        let err = run_plans(&netlist, Vec::new(), vec![], ".step produced no runs").unwrap_err();
+        let err = run_plans(&netlist, Vec::new(), vec![], ".step produced no runs", 1).unwrap_err();
         match err {
             SimError::Analysis(message) => assert_eq!(message, ".step produced no runs"),
             other => panic!("unexpected error shape: {other}"),
         }
-        let err = run_plans(&netlist, Vec::new(), vec![], ".mc produced no runs").unwrap_err();
+        let err = run_plans(&netlist, Vec::new(), vec![], ".mc produced no runs", 1).unwrap_err();
         match err {
             SimError::Analysis(message) => assert_eq!(message, ".mc produced no runs"),
             other => panic!("unexpected error shape: {other}"),
@@ -541,5 +600,90 @@ mod tests {
         assert!(inner.analysis.mc.is_none());
         assert_eq!(inner.mc_seed, mc::run_mix(7, 3));
         assert!(netlist.analysis.mc.is_some());
+    }
+
+    /// The worker count only changes wall time: a stepped transient deck and a
+    /// Monte Carlo deck produce bit-identical results serial and parallel,
+    /// down to every sample of every run.
+    #[test]
+    fn parallel_runs_are_bit_identical_to_serial() {
+        let stepped = parse(
+            "* stepped RC step\n\
+             .param r=1k\n\
+             V1 in 0 PULSE(0 5 0 1n 1n 1 2)\n\
+             R1 in out {r}\n\
+             C1 out 0 1u\n\
+             .step param r list 100 220 470 1k 2.2k 4.7k 10k 22k\n\
+             .tran 10u 2m\n\
+             .meas tran vmax MAX V(out)\n\
+             .end\n",
+        )
+        .unwrap();
+        let serial = format!("{:?}", run_with_threads(&stepped, 1).unwrap());
+        for threads in [2, 3, 8, 64] {
+            let parallel = format!("{:?}", run_with_threads(&stepped, threads).unwrap());
+            assert_eq!(serial, parallel, "{threads} threads changed a stepped result");
+        }
+
+        let monte = parse(
+            "* monte carlo divider\n\
+             .model rm R(R=1k DEV=5%)\n\
+             V1 in 0 DC 1\n\
+             R1 in out rm 1k\n\
+             R2 out 0 rm 1k\n\
+             .mc 24 seed=5\n\
+             .op\n\
+             .end\n",
+        )
+        .unwrap();
+        let serial = format!("{:?}", run_with_threads(&monte, 1).unwrap());
+        let parallel = format!("{:?}", run_with_threads(&monte, 6).unwrap());
+        assert_eq!(serial, parallel, "threads changed a Monte Carlo result");
+    }
+
+    /// A failing run surfaces the same error a serial loop stops at: the
+    /// lowest-indexed one, however many workers race past it. The two failing
+    /// plans name different resistors, so a "first to finish" driver would
+    /// show.
+    #[test]
+    fn parallel_failure_is_the_lowest_indexed_one() {
+        // Plan order (outer r, inner s): index 2 = (1k, 0) breaks R2; index 4 =
+        // (0, 1k) breaks R1, as do 5 and 6.
+        let deck = "* failing sweep\n\
+                    .param r=1k s=1k\n\
+                    V1 in 0 DC 1\n\
+                    R1 in out {r}\n\
+                    R2 out 0 {s}\n\
+                    .step param r list 1k 0\n\
+                    .step param s list 1k 1k 0 1k\n\
+                    .op\n\
+                    .end\n";
+        let netlist = parse(deck).expect("the deck parses; the failure is per run");
+        let serial = run_with_threads(&netlist, 1).map(|_| ()).unwrap_err().to_string();
+        assert!(serial.contains("R2"), "serial stops at plan 2: {serial}");
+        for threads in [2, 3, 4, 16] {
+            for _ in 0..20 {
+                let parallel = run_with_threads(&netlist, threads)
+                    .map(|_| ())
+                    .unwrap_err()
+                    .to_string();
+                assert_eq!(serial, parallel, "{threads} threads");
+            }
+        }
+    }
+
+    #[test]
+    fn default_threads_is_at_least_one() {
+        assert!(default_threads() >= 1);
+        // `run` (default workers) agrees with the pinned-serial run.
+        let netlist = parse(
+            "* tiny sweep\n.param r=1k\nV1 in 0 DC 1\nR1 in out {r}\nR2 out 0 1k\n\
+             .step param r list 1k 2k\n.op\n.end\n",
+        )
+        .unwrap();
+        assert_eq!(
+            format!("{:?}", run(&netlist).unwrap()),
+            format!("{:?}", run_with_threads(&netlist, 1).unwrap())
+        );
     }
 }

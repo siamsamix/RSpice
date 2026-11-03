@@ -1124,17 +1124,92 @@
         );
     }
 
-    /// A model card on a level the engine cannot stamp is accepted, but its
-    /// *use* is rejected at parse time (validation runs inside `parse`).
+    /// A model card on a level the engine cannot stamp (BSIM and friends) is
+    /// accepted, but its *use* is rejected at parse time (validation runs
+    /// inside `parse`). Levels 1–3 stamp.
     #[test]
-    fn referenced_level_above_one_is_rejected() {
-        let deck = ".model m NMOS(KP=1u LEVEL=3)\n\
-                    V1 a 0 1\n\
-                    M1 a 0 0 0 m\n\
-                    .op\n\
-                    .end\n";
-        let err = parse(deck).unwrap_err().to_string();
-        assert!(err.contains("only level 1 is supported"));
+    fn referenced_level_above_three_is_rejected() {
+        for level in [0, 4, 8, 49] {
+            let deck = format!(
+                ".model m NMOS(KP=1u LEVEL={level})\nV1 a 0 1\nM1 a 0 0 0 m\n.op\n.end\n"
+            );
+            let err = parse(&deck).unwrap_err().to_string();
+            assert!(err.contains("only levels 1, 2 and 3 are supported"), "{level}: {err}");
+        }
+        for level in [1, 2, 3] {
+            let deck = format!(
+                ".model m NMOS(KP=1u LEVEL={level})\nV1 a 0 1\nM1 a 0 0 0 m\n.op\n.end\n"
+            );
+            assert!(parse(&deck).is_ok(), "level {level} must be accepted");
+        }
+    }
+
+    /// A level-2/3 card that omits KP/GAMMA/PHI derives them from the process
+    /// terms (UO·Cox, NSUB with TOX), and an explicit value always wins.
+    #[test]
+    fn level_two_three_cards_derive_process_parameters() {
+        let netlist = parse(
+            ".model derived NMOS(LEVEL=2 UO=600 TOX=20n NSUB=1e16)\n\
+             .model pinned NMOS(LEVEL=2 UO=600 TOX=20n NSUB=1e16 KP=5e-5 GAMMA=0.1 PHI=0.8)\n\
+             V1 a 0 1\nM1 a 0 0 0 derived\nM2 a 0 0 0 pinned\n.op\n.end\n",
+        )
+        .unwrap();
+        let d = &netlist.circuit.mosfet_models["derived"];
+        // Cox = 3.9·ε0 / 20 nm; KP = UO[cm²/Vs]·1e-4·Cox.
+        assert!((d.kp - 1.035939974589e-4).abs() < 1e-14, "kp {}", d.kp);
+        // γ = √(2·q·ε_si·NSUB)/Cox, φ = 2·Vt·ln(NSUB/ni) at TNOM = 27 °C.
+        assert!((d.gamma - 0.3336984190842834).abs() < 1e-9, "gamma {}", d.gamma);
+        assert!((d.phi - 0.6954533829399134).abs() < 1e-9, "phi {}", d.phi);
+        let p = &netlist.circuit.mosfet_models["pinned"];
+        assert_eq!((p.kp, p.gamma, p.phi), (5e-5, 0.1, 0.8));
+    }
+
+    /// Parameters a level does not act on, and slots missing their
+    /// prerequisite, warn loudly instead of vanishing.
+    #[test]
+    fn level_specific_parameters_warn_when_inert() {
+        let netlist = parse(
+            ".model a NMOS(LEVEL=1 THETA=0.1 LD=1n)\n\
+             .model b NMOS(LEVEL=2 VMAX=1e5 UCRIT=1e4 UEXP=0.1 XJ=1u)\n\
+             .model c NMOS(LEVEL=3 LAMBDA=0.05 UCRIT=1e4 ETA=0.1 VMAX=1e5)\n\
+             V1 a1 0 1\nM1 a1 0 0 0 a\nM2 a1 0 0 0 b\nM3 a1 0 0 0 c\n.op\n.end\n",
+        )
+        .unwrap();
+        let all = netlist.warnings.join("\n");
+        assert!(all.contains("THETA, LD act on LEVEL 2/3 only"), "{all}");
+        assert!(all.contains("VMAX act on LEVEL 3 only"), "{all}");
+        assert!(all.contains("UCRIT/UEXP mobility degradation needs TOX"), "{all}");
+        assert!(all.contains("XJ are kept but not modelled"), "{all}");
+        assert!(all.contains("LAMBDA does not act on LEVEL 3"), "{all}");
+        assert!(all.contains("UCRIT act on LEVEL 2 only"), "{all}");
+        assert!(all.contains("ETA/DELTA need TOX"), "{all}");
+        assert!(all.contains("VMAX needs UO or TOX"), "{all}");
+    }
+
+    /// Level 2/3 slots survive `parse(emit(parse))` and level-1 decks emit
+    /// without any of them.
+    #[test]
+    fn level_two_three_cards_round_trip_through_emit() {
+        let deck = ".model m2 NMOS(LEVEL=2 KP=5e-5 VTO=0.7 GAMMA=0.3 PHI=0.65 TOX=20n UCRIT=1e4 UEXP=0.15 UTRA=0.2 LD=0.1u WD=0.05u)\n\
+                    .model m3 NMOS(LEVEL=3 KP=5e-5 VTO=0.7 TOX=20n NSUB=1e16 UO=600 THETA=0.05 ETA=0.1 KAPPA=0.4 DELTA=0.5 VMAX=1e5)\n\
+                    .model m1 NMOS(KP=5e-5)\n\
+                    V1 a 0 1\nM1 a 0 0 0 m2\nM2 a 0 0 0 m3\nM3 a 0 0 0 m1\n.op\n.end\n";
+        let first = parse(deck).unwrap();
+        let text = emit(&first);
+        let second = parse(&text).unwrap();
+        for name in ["m1", "m2", "m3"] {
+            let (a, b) = (&first.circuit.mosfet_models[name], &second.circuit.mosfet_models[name]);
+            assert_eq!(
+                format!("{a:?}"),
+                format!("{b:?}"),
+                "{name} changed across emit"
+            );
+        }
+        assert_eq!(emit(&second), text);
+        let m1_line = text.lines().find(|l| l.starts_with(".model m1")).unwrap();
+        for slot in ["UO=", "LD=", "WD=", "VMAX=", "THETA=", "KAPPA=", "UCRIT="] {
+            assert!(!m1_line.contains(slot), "level-1 card grew {slot}: {m1_line}");
+        }
     }
 
     #[test]
@@ -1502,4 +1577,63 @@ fn pwl_interpolates_between_consecutive_points() {
     let src = &down.circuit.current_sources[0];
     assert_relative_eq!(src.value_at(0.5e-6), 2.5, epsilon = 1e-9);
     assert_relative_eq!(src.value_at(2e-6), 0.0, epsilon = 1e-12);
+}
+
+// ─── deck_directives: the cards a front-end carries verbatim ────────────────
+
+#[test]
+fn directives_are_the_dot_cards_in_file_order() {
+    let src = "* title\n\
+               .param w=2u\n\
+               R1 1 0 1k\n\
+               .model dino D(IS=1e-14\n\
+               + N=1.05) ; trailing\n\
+               V1 1 0 DC 1\n\
+               .tran 1u 5m\n\
+               .end\n\
+               .after_end 1\n";
+    let cards = deck_directives(src).expect("directives");
+    assert_eq!(
+        cards,
+        vec![
+            ".param w=2u".to_string(),
+            ".model dino D(IS=1e-14 N=1.05)".to_string(),
+            ".tran 1u 5m".to_string(),
+        ],
+        "element cards, comments and anything past .end are not directives"
+    );
+}
+
+#[test]
+fn a_subckt_block_is_one_directive_with_its_body() {
+    let src = "R1 1 0 1k\n\
+               .subckt amp in out\n\
+               R1 in out 10\n\
+               .subckt inner a b\n\
+               R2 a b 1\n\
+               .ends inner\n\
+               .ends amp\n\
+               .meas tran vmax MAX V(1)\n\
+               .end\n";
+    let cards = deck_directives(src).expect("directives");
+    assert_eq!(cards.len(), 2, "block + .meas, got {cards:?}");
+    assert_eq!(
+        cards[0],
+        ".subckt amp in out\nR1 in out 10\n.subckt inner a b\nR2 a b 1\n.ends inner\n.ends amp"
+    );
+    assert_eq!(cards[1], ".meas tran vmax MAX V(1)");
+}
+
+#[test]
+fn an_unclosed_subckt_is_an_error_not_a_silent_loss() {
+    let err = deck_directives(".subckt amp in out\nR1 in out 10\n.end\n").unwrap_err();
+    assert!(err.to_string().contains(".ends"), "got: {err}");
+}
+
+#[test]
+fn directive_words_match_case_insensitively() {
+    let cards = deck_directives(".SUBCKT a b\nR1 a b 1\n.ENDS\n.OPTIONS reltol=1e-4\n.END\n")
+        .expect("directives");
+    assert_eq!(cards.len(), 2);
+    assert!(cards[1].starts_with(".OPTIONS"));
 }

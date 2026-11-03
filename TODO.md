@@ -93,16 +93,23 @@ below is written against that state.
   ladder-200 ~4× faster (778→191 ms), ladder-50 ~1.3×, tiny decks gated back to the dense kernel (`SMALL_SYSTEM`
   = 16). Remaining open, smaller: mark incremental the O(n·nnz) Markowitz scan, pool the per-solve factor
   workspace (retires the small-n gate), factor-once/solve-many across NR iterates and timesteps.)*
-- [ ] **[P1] (both)** LU factorization reuse across NR iterations and timesteps when the matrix changes
+- [x] **[P1] (both)** LU factorization reuse across NR iterations and timesteps when the matrix changes
   only by values, not topology — today the matrix is rebuilt and cloned per iterate. *(Dense-buffer
   restamp reuse was prototyped against the NR loop and is a measured loss on the dense path: a reused
   `a` forces a full `n²` `fill(0.0)` per rebuild, while fresh `DMatrix::zeros` rides calloc's lazy
   zero pages (probe: reuse-fill 76.2 µs vs fresh-zeros 10.9 µs at n=210; ladder-200 regressed
-  702→815 ms). Per-iterate allocation churn is the cheaper cost here. The sparse solver (line 86
-  slice 2) already eats part of this on the sparse path: `factor_solve` reads values straight off
-  the stamped dense matrix — no clone, no `n²` restamp — and re-factors per solve at sparse cost.
-  Still open on top: factor-once/solve-many when only the RHS changes between calls, and the
-  linear-only-per-iterate companion stamps riding the same symbolic pattern.)*
+  702→815 ms). The sparse solver (line 86 slice 2) eats part of this on the sparse path: `factor_solve`
+  reads values straight off the stamped dense matrix — no clone, no `n²` restamp. **Done now:
+  factor-once/solve-many** — `SparsePlan` keeps the four most recent numeric factorizations per
+  field, keyed on the *bit-exact* pattern values, so an unchanged matrix (every Newton iterate of a
+  linear circuit, constant-`dt` steps, the `dt`/`dt/2` pair of step doubling, an AC re-solve) skips
+  the factor and runs the triangular solves only, with the identical factors a fresh factorization
+  produces: results cannot change (all `examples/*.cir` decks byte-identical to the previous CLI over
+  op/tran/ac). Measured against the previous commit: ladder-50 `.tran` 11.3→7.0 ms, ladder-200
+  85→60 ms; 593/609 sparse solves reused (benchmark `reuse` column, `sparse::factor_stats`). ADR 0004.
+  **Still open:** nonlinear decks refactor every iterate (a new Jacobian each time); modified Newton or a
+  partial refactor of only the nonlinear rows would change iterate paths and needs its own decision;
+  `touched.compress()` still re-runs per solve.)*
 - [ ] **[P1] (LT baseline)** Multithreaded matrix assembly/factorization and time-stepping loop;
   LTspice is threaded today, PSpice multithreading is unclear on this baseline.
 - [x] **[P1] (both)** Trapezoidal integration as the default companion model with `.options
@@ -219,8 +226,23 @@ below is written against that state.
   analytic operating-point tests for the stiff forward-active corner, IKF knee, XTB warmth and all
   three series slots.
 - [ ] **[P2] (LT)** Advanced BJT models: VBIC and Mextram (level/type naming per LTspice's help).
-- [ ] **[P1] (both)** MOSFET levels 2 and 3; BSIM3/BSIM4 families per tool coverage (level numbering
-  differs between LTspice and PSpice — verify per target).
+- [x] **[P1] (both)** MOSFET levels 2 and 3 — done: `MosfetModel::eval_sized(w, l, …)` dispatches on
+  `LEVEL` (level 1 stays `eval_at` bit for bit). *Level 2* is Grove–Frohman: the exact bulk-charge
+  integral `(Vgs−Vfb−φ−Vde/2)·Vde − ⅔γ((φ+Vsb+Vde)^1.5 − (φ+Vsb)^1.5)` with the closed-form `Vdsat`
+  root, `UCRIT/UEXP/UTRA` transverse-field mobility reduction (needs `TOX`), `λ` as the level-1
+  multiplier; with `γ = 0` it *is* the level-1 square law (pinned in tests). *Level 3* is the
+  semi-empirical model: `θ` mobility modulation, `ETA` drain-induced threshold lowering, `DELTA`
+  narrow-width term, `VMAX` velocity-saturation `Vdsat` + `1/(1+Vde/Vc)`, and `KAPPA`/`NSUB`
+  saturation-field length shortening (`LAMBDA` does not act on level 3, as in the reference SPICE;
+  the `√` knee is smoothed over 10 µV so the finite-difference `gds` stays finite). `LD/WD` give the
+  effective geometry. Missing `KP/GAMMA/PHI` derive from `UO·Cox`, `NSUB`+`TOX` (card values win);
+  parameters a level ignores, and slots lacking `TOX`/`NSUB`/`UO`, warn instead of vanishing. Unmodelled
+  and loudly warned: the short-channel `XJ` factor, `NFS` weak inversion, `NEFF`, level-2 `VMAX`. Level
+  2/3 `gm/gds/gbs` are central differences of the one analytic current (1 µV step). Equations are written
+  from the public SPICE2/3 model descriptions and pinned against independent Python references, **not**
+  checked against the shipped LTspice/PSpice (see footnote). Levels above 3 are still a loud parse error.
+- [ ] **[P1] (both)** BSIM3/BSIM4 families per tool coverage (level numbering differs between LTspice
+  and PSpice — verify per target); `LEVEL=8/49/54` cards are rejected loudly today.
 - [x] **[P1] (both)** MOSFET capacitance/charge model: gate overlap (CGDO/CGSO/CGBO), junction caps
   (CJ/CJSW/MJSW/PB), so switching transients carry realistic charge — done: overlap and zero-bias
   junction capacitances are stamped in transient (companion history) and AC; grading parameters are
@@ -238,7 +260,7 @@ below is written against that state.
   model cards (on/off resistance thresholds, hysteresis).
 - [x] **[P1] (both)** Mutual inductance `K` and ideal transformers; `[P2] (PS)` nonlinear magnetic core
   models (XFRM_NONLINEAR/RM); `[P2] (LT)` behavioral inductor via `flux=` control equation.
-- [ ] **[P1] (both)** Transmission lines: lossless `T` and lossy `O` (LTRA with RLCG parameterization).
+- [x] **[P1] (both)** Transmission lines: lossless `T` and lossy `O` (LTRA with RLCG parameterization).
   *(the lossless `T` landed: `T<name> n1 n2 n3 n4 Z0=<Ω> TD=<s>` — `F=<Hz>` with `NL=<wavelengths>`
   (default 1) spells TD = NL/F and present `TD=` wins over them with a warning, `Z0 > 0`/`TD > 0`
   validated; no branch rows — one `I(T…)` report value per line, the port-A (`n1↔n2`) current.
@@ -251,6 +273,22 @@ below is written against that state.
   and extraction. `.model …TLINE(…)` cards import as silent `GenericModel`s (kept, unused).
   Integration tests pin the open-end TDR staircase (10/3 → 20/3 → 50/9 → 5 V), a
   matched-termination flat line, straight-through DC, and the frequency-flat matched AC transfer.)*
+  *The lossy `O` landed as a **lumped ladder**, a documented interpretation of the reference tools' exact
+  LTRA convolution:* `O<name> n1 n2 n3 n4 <model> [N=<sections>]` with `.model <model> LTRA(R= L= G=
+  C= LEN= [N=])` (per-length RLGC, any order in the deck) expands after the card walk into `N` π-sections
+  (default 20, max 1000; element `N=` beats the model's): series `R·LEN/N` then `L·LEN/N` along the signal
+  conductor, `C·LEN/N` and `G·LEN/N` from each node to the return net with half weights at the two
+  ports. Plain R/L/C arms mean DC, transient, AC and noise work with no new stamp, and the ladder is
+  exact at DC (`R·LEN`, `G·LEN` sum exactly — pinned to 1e-8/1e-9) and low frequency (the open-line
+  RC low-pass matches `C·LEN` to 1e-8), band-limited near `f ≈ N/(π·TD)`. Ports must share a return net
+  (`n2 = n4`) or the card is a loud error; `R=0` (LC), `L=0` (RC) and `G` are all accepted;
+  other LTRA knobs (`REL`, `ABS`, …) warn as inapplicable. Against the exact method-of-characteristics
+  `T` element a 50 Ω/1 ns open line gives RMS 0.013 V at N=30 (0.109 V at N=3 — the test fails there on
+  purpose); series loss lowers the matched level toward the DC divider. Subcircuit instance paths mangle
+  the arms (`X1.RO1_s3`) so `element_letter` still reads plain passives.
+- [ ] **[P2] (both)** Exact LTRA lossy line (impulse-response convolution, REL/ABS/compaction knobs,
+  floating-return two-port semantics) beside the lumped `O` ladder — the ladder needs `N` raised for
+  fast edges and long lines.
 - [x] **[P1] (both)** Passive model cards: `.model R/L/C` with temperature coefficients `TC1/TC2`;
   LTspice-style intrinsic parasitics on every R/L/C (`rser`, `cpar`, `lser`, `rpar`). *(Model cards and
   TC1/TC2 plus the parasitic split were done: nonzero slots materialize into real series/parallel arms
@@ -381,11 +419,25 @@ below is written against that state.
   `R C L V Gnd`-only today.
 - [ ] **[P1] (both)** Symbol library format with attached model/.subckt references and a component
   picker: placing `MM1` should be able to attach `model=...`/`spiceline` data.
-- [ ] **[P1] (both)** Net/wire labels with clean node names governing the generated netlist and plot
-  names.
-- [ ] **[P1] (both)** SPICE text directives placed as schematic annotations (`.tran`, `.step`,
+- [x] **[P1] (both)** Net/wire labels with clean node names governing the generated netlist and plot
+  names. *(done at the state level, GUI only — `NetLabel` in `schematic.rs`: Edit ▸ Label Net (F4)
+  asks for a name, the next click drops it; same-name labels (case-insensitive) are one net even
+  unwired, `0`/`gnd` ground a net, a bare number is refused (it would fight unlabeled nets'
+  numbers), a net with two different labels or a named ground makes Generate Netlist fail loudly
+  instead of guessing. The label becomes the node's deck name, so `V(name)` traces follow;
+  import turns every named net into a label; labels travel with a dragged/rotated pin. Not
+  verified visually: the flag drawing (name above a leader line) and F4 are written from memory of
+  LTspice, not checked against the shipped help.)*
+- [x] **[P1] (both)** SPICE text directives placed as schematic annotations (`.tran`, `.step`,
   `.meas`, `.include` as first-class schematic objects) — both reference tools run the whole show this
-  way.
+  way. *(done, GUI + core — `Directive` text objects (Edit ▸ SPICE Directive, `S`) are spliced into
+  the generated deck verbatim; import keeps every dot card the schematic cannot draw
+  (`circuitsim::deck_directives`; a `.subckt…​.ends` block is one object) and stacks them under the
+  circuit, so a text → schematic → netlist round trip no longer drops `.model`/`.meas`/`.step`/
+  `.param`. A `.tran`/`.ac`/`.op` directive replaces the analysis-strip command of its kind;
+  import leaves those three to the strip (extra `.tran` args such as `uic` are still lost there).
+  Not done: dragging a note, placing text without the dialog, drawn `.subckt` elements on import
+  (D/M/I/X cards are still not drawn). Same unverified-visuals caveat as labels.)*
 - [ ] **[P1] (both)** Hierarchical schematics mapping to `.subckt` definitions and instances.
 - [ ] **[P2] (both)** ERC: dangling-pin, shorted-output, floating-node diagnostics with connectivity
   highlighting; undo/redo completeness.
@@ -454,12 +506,35 @@ below is written against that state.
 
 Neither LTspice nor PSpice does these today; RSpice targets them for its "advanced and fast" claim.
 
-- [ ] **[P1] (spot)** Benchmark harness: canonical circuit suite with throughput (node·iterations/s)
+- [x] **[P1] (spot)** Benchmark harness: canonical circuit suite with throughput (node·iterations/s)
   and accuracy compared element-for-element against LTspice `.raw` results; "fast" must be measured,
-  not asserted. *(Harness with canonical suite, throughput, and analytic accuracy landed at
-  `circuitsim/examples/benchmark.rs`; LTspice `.raw` comparison awaits the raw reader.)*
-- [ ] **[P1] (spot)** Parallel parametric sweeps: distribute `.step`/Monte-Carlo/MC-style runs across
-  cores — neither tool parallelizes over runs.
+  not asserted. *(Harness with canonical suite, throughput, and analytic accuracy at
+  `circuitsim/examples/benchmark.rs`; the LTspice half is done as tooling: core `rawcompare.rs`
+  (`compare_raw`) pairs plots by `Plotname:` (k-th occurrence with k-th, so stepped files line up)
+  and traces by name, interpolates RSpice's trace onto each **reference** axis point (the tools pick
+  different timesteps; exact when grids coincide, as in `.ac`/`.dc`), reads a reference time axis as
+  `|t|` (LTspice flags stored points with negative stamps), compares single-point `.op` plots by
+  name (LTspice's file has no axis variable), takes complex `.ac` traces by phasor distance, and
+  reports `max|err|`, `rms` and `max|err|/peak` per trace — scale-free through zero crossings; a NaN
+  or a missing reference plot never passes, reference-only traces and RSpice-only plots are listed not
+  failed. Entry points: CLI `--compare-raw <file>` (+ `--compare-tol`, default 1e-3; table appended
+  to the output, exit 1 past the tolerance) and the benchmark's `--write-decks DIR` (emit every case
+  as `<case>.cir` to run in LTspice) → `--reference-dir DIR` (a `vs LTspice` column per case, exit 1
+  past `--tol`). Verified against RSpice's own binary `.raw` round trip (f32 quantisation reads
+  ~5e-8), a coarse analytic grid, injected errors and hand-built LTspice-shaped plots.
+  **Not yet done:** no LTspice run happened in this environment, so there are no real LTspice
+  numbers — generate `<case>.raw` with the author's Wine install and run the flow above.)*
+- [x] **[P1] (spot)** Parallel parametric sweeps: distribute `.step`/Monte-Carlo/MC-style runs across
+  cores — neither tool parallelizes over runs. *(done: `runs::run_plans` hands the independent run
+  plans (`.step` combinations, `.temp` lists, `.mc` runs) to scoped worker threads — one atomic
+  counter deals indices in order, results land in plan order, the calling thread works too, and a
+  failure stops later claims so the error returned is always the lowest-indexed one, exactly the one
+  a serial loop stops at. Results are bit-identical for any worker count (tests compare the full
+  `Debug` dump of a stepped transient and a Monte Carlo deck at 1/2/3/8/64 workers; the first-error
+  test uses two differently-failing plans so a "first to finish" driver would show). Knobs:
+  `circuitsim::run_with_threads(netlist, n)`, `RSPICE_THREADS`, CLI `-j/--jobs N`; default = all
+  cores. Measured: 32-run RC `.tran` sweep, 7.75 s → 4.31 s on 2 cores (1.8×), byte-identical
+  output. Across-run parallelism only — threading inside one solve is §3's open item.)*
 - [ ] **[P2] (spot)** GPU-accelerated linear solve (wgpu) as an optional backend for very large designs.
 - [ ] **[P2] (spot)** Steady-state detection and automatic quality presets ("fast" / "accurate" solver
   profiles).

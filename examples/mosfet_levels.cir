@@ -1,0 +1,12 @@
+* MOSFET levels 2 and 3: one common-source stage each, body biased 1 V below source.
+.model nm2 NMOS(LEVEL=2 KP=2e-4 VTO=0.7 GAMMA=0.4 PHI=0.6 TOX=20n UCRIT=1e4 UEXP=0.15)
+.model nm3 NMOS(LEVEL=3 KP=2e-4 VTO=0.7 GAMMA=0.4 PHI=0.6 THETA=0.1 TOX=20n VMAX=1e5 ETA=0.02)
+Vdd vdd 0 DC 3
+Vg g 0 DC 2
+Vb b 0 DC -1
+R2 vdd d2 1k
+R3 vdd d3 100
+M2 d2 g 0 b nm2 W=1u L=1u
+M3 d3 g 0 b nm3 W=10u L=1u
+.op
+.end

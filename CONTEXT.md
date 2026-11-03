@@ -9,7 +9,7 @@ deepening that has not landed yet.
 - **Netlist** — SPICE-style text: element lines, directives (`.op` `.dc` `.tran` `.ac` `.model` `.param` `.func`), ends with `.end`. `*` comments only at line start, `;` inline, `+` continues the previous line. Parsed into a `Netlist` (`Circuit` + `AnalysisCommands` + `source` + `params` + `funcs` + `mc_seed` + `options`/`overrides`) by the `netlist/` module family: `mod.rs` holds the vocabulary and the parse/emit pipeline, and every card family lives in its own module with its parse and its emit co-located (`elements`, `models`, `dotcards`, `waveforms`, `subckts`, `imports`, `nodeplan`) — a card's grammar is one file, not parse here emit there. `Netlist::param_env()` seeds the deck's parameter/function environment, so a run and its re-parses share one env; `mc_seed` travels on the deck for reproducible Monte Carlo.
 - **Source value (bridge)** — the value of a `V`/`I` card (`DC 5`, `AC 1 30`, `PULSE(…)`), typed as `netlist::SourceValue` with the round trip `parse_source_value` / `emit_source_value` at the tail of `netlist/mod.rs`. Frontends edit and display source values through this bridge, so whatever a GUI writes back is text the deck parser reads identically; the writer prints canonical decimal (no SPICE suffixes), which always re-parses to the same number.
 - **Netlist.warnings** — best-effort import diagnostics, never fatal: unknown directives (echoed with their arguments), unsupported element letters, stray `.endl` markers, unknown `.model` parameters. A third-party deck imports and simulates with warnings surfaced in both front-ends; ordering follows the parse pipeline (flatten first, card walk second).
-- **Element** — one component line. The first letter names the kind: `R` resistor, `C` capacitor, `L` inductor, `V` voltage source, `I` independent current source, `D` diode, `M` MOSFET. `X` is now also a kind: subcircuit instantiation (unmarshalled at parse time into its body's elements — `Circuit` never sees an `X`).
+- **Element** — one component line. The first letter names the kind: `R` resistor, `C` capacitor, `L` inductor, `V` voltage source, `I` independent current source, `D` diode, `M` MOSFET (`T` lossless / `O` lossy transmission lines are described below). `X` is now also a kind: subcircuit instantiation (unmarshalled at parse time into its body's elements — `Circuit` never sees an `X`).
 - **Element family** — `ElementFamily`, the *named kind* of an element; `CURRENT_FAMILIES` fixes the canonical order `R C L V D M Q J I B`. Builders and report walkers name families instead of pattern-matching raw structs, and the frontends hold the `Circuit` itself — adding a device letter means one family + its model, not edits scattered across screens and tabs.
 - **Subckt definition** — a `.subckt name p1 p2 … / … / .ends` block, collected before any card walk (`collect_subckts`) so bodies may be referenced before their text appears. The header carries default parameters after the ports (`name a b PARAMS: rr=1k` and bare `key=value` forms both accepted); the body may nest definitions and `.param`/`.func` cards.
 - **Subcircuit instance (X line)** — `XName p1 … pn defname key=value …`: the port tokens bind to the caller's nets (not mangled), the trailing assignments override the defaults and may reference the parent env, and instance keys beat a body `.param` card re-assigning the same name (the reference tools' `PARAMS=` precedence).
@@ -19,7 +19,7 @@ deepening that has not landed yet.
 - **Parameter** — a named value from `.param`: `Num` or `Str`; every element line expands `{expr}` and `'expr'` against the `ParamEnv` in deck order, so same-card references work and `.func` bodies stay unexpanded until called. The math library and user functions live in `params.rs`.
 - **ParseOptions** — where file-reading directives look: `deck_dir` (the parsed `.cir`'s own directory, set by the CLI) and `search_paths` (`RSPICE_LIB` split-paths, prepend order). `.include <file>` and `.lib <file>` (with optional section) resolve against deck_dir then the search list; a missing file or section is a loud parse error, an unresolvable `.lib <section>` *inside a library* is just a section boundary.
 - **Stamp** — writing one element's contribution into the MNA matrix/right-hand side at build time. Not a runtime mutation of results.
-- **Model card** — a `.model` line defining device physics (`DiodeModel`, `MosfetModel` level-1 Shichman–Hodges). Elements reference cards by name; `validate()` rejects unknown names.
+- **Model card** — a `.model` line defining device physics (`DiodeModel`, `MosfetModel` — Shichman–Hodges level 1, Grove–Frohman level 2, semi-empirical level 3 through `MosfetModel::eval_sized`). Elements reference cards by name; `validate()` rejects unknown names.
 - **Boundary contract** — `Circuit` is written by parsing only (element vectors stay public for the schematic editor; the element-model maps and controlled-source/switch families are crate-internal), `validate()` — run at the end of parse and again at the top of every analysis pass — is the single cross-reference gate, and matrix stamping trusts it: model lookups go through `mna.rs`'s `device_model`, never re-checked, never silent-fallback. Rationale in `docs/adr/0001`.
 - **Model card grammar** — the full card: fused-paren (`NMOS(…)`) and paren-less (`D IS=…`) forms, type-word slicing safe against names that contain the search string, keys case-normalized, LEVEL validated against the device type, values read via `parse_value` (trailing `)`/`%`/`,` tolerated), complete diode/MOSFET parameter lists, `DEV`/`LOT` slots parsed into `ModelTolerance` (staged for the Monte Carlo work, TODO §8), and unknown families kept as `GenericModel` cards for future element letters.
 - **Sizing fields** — per-instance junction geometry: diode `AREA=…` (bare trailing number also accepted) and MOSFET `W/L` plus `AD/AS/PS/PD`, carried onto element fields and consumed by the device model (`eval_for(vd, area)`), not just stored.
@@ -49,6 +49,11 @@ deepening that has not landed yet.
   discovery frontier ascending (topological for free — all feeds come from smaller rows), store
   no exact-zero factor entries, and a numerically zero pivot returns `None` (the caller's dense
   fallback). Fixed order, no magnitude reselection; NaNs propagate like values.
+- **Factor cache** — per `SparsePlan` and field, the four most recent numeric LU factorizations
+  keyed on the *bit-exact* pattern values (`Field::bits_equal`). A repeat matrix (linear Newton
+  iterate, constant-`dt` step, the `dt`/`dt/2` half-steps) skips the factor and only runs the
+  triangular solves with the identical factors, so reuse changes cost, never results. Counters:
+  `sparse::factor_stats()`. `docs/adr/0004`.
 - **Dense-kernel crossover (`SMALL_SYSTEM`)** — `MnaSystem::solve` skips the sparse attempt below
   16 unknowns: measured A/B on the benchmark suite showed tiny decks (n ≤ 9) paying ~30% wall for
   shape/workspace setup while the 200-node ladder wins ~4×. Pooling the factor workspace inside
@@ -77,6 +82,9 @@ deepening that has not landed yet.
 - **Design reference** — the GUI mirrors LTspice; for the reference install and
   RE-tooling notes see `docs/agents/ltspice.md`.
 - **Schematic** — the grid-drawn circuit in the egui app. `schematic.rs` owns the editor's state machine — `SchematicState` with its mutations (place by tool, rotate with wire re-attach, drag with wire stretch, wire open/close, select, cancel, deletes) and both deck conversions: `build_netlist` (schematic → `Netlist` through the shared value grammar) and `from_netlist` (deck → schematic through the one `parse`, drawing `R C L V` and counting the rest instead of dropping them). The canvas computes pointer geometry and asks the module to mutate. Node numbering comes from a union-find over grid connectivity — one implementation, shared by the writer and the painter.
+- **Net label** — a name the user pins to a schematic point (`NetLabel`). Labels with the same name (case-insensitive) are one net with or without wires; `0`/`gnd` ground a net; the label is the node's deck name and so the `V(name)` trace name. Two different labels on one net, or a named ground, is an error — never a silent pick.
+- **Directive (schematic)** — SPICE text placed on the canvas (`Directive`), written into the generated deck verbatim; an imported deck's undrawable dot cards arrive as directives. Distinct from the core's *Analysis command*: a `.tran`/`.ac`/`.op` directive replaces the analysis strip's command of its kind.
+- **Cross-probe** — a click in the Select tool probes into the Waveforms tab (wire → `V(net)`, R/C/L/V body → `I(device)`; the same probe twice isolates it) and hovering a plotted trace flashes its source on the canvas. Wire probes (click after a transient run, Shift+click after any run) find the net by its deck spelling — label or number, never the schematic's raw node number — and are valid only while the schematic regenerates the exact deck the results were simulated from (`run_text`).
 - **Element kind / CompKind** — the GUI enum paralleling element letters; import draws `R C L V` and counts the rest (`D`/`M`/`I` have no symbol yet) instead of dropping silently.
 - **Plot series / PlotState** — the tab plotting adapter: typed bounds state replacing the stringly scale fields, one `apply_bounds`, one element→series interface used by all tabs. Every result tab draws through `plot_frame` (axis labels, legend, gestures, the one-time bounds apply), and the four AC panels share `ac_plot_frame` with the frequency-cursor plumbing — log grid and 10ˣ→Hz hover labels in dB mode, plain ticks in linear mode; `AcMagScale` (default `Db`) and `AcCursor` live beside it. dB/phase math is GUI-internal, computed once, not re-derived per tab.
 - **Result tabs** — Overview, DC (operating point; `.dc` sweep as a plot when flat, a table when nested), Waveforms (Voltage / Current / Differential), Frequency (magnitude / phase / branch plots).
@@ -116,6 +124,12 @@ deepening that has not landed yet.
   `.log` sidecar), and operating points keep a synthetic `time = 0` axis so real plots stay
   axis-first (documented interpretation). Bit-for-bit LTspice parity is not the goal —
   reading its files and writing files its readers accept is.
+- **Raw comparison** — `rawcompare::compare(reference, ours)`, TODO §11: per-trace
+  `max|err|`, `rms`, and `max|err|/peak` of RSpice's traces against a reference `.raw` (usually
+  LTspice's), RSpice interpolated onto the reference axis. Plots pair by plotname occurrence,
+  traces by name; a missing reference plot, a NaN, or nothing compared fails `is_within`.
+  Reference-only traces / RSpice-only plots are informational. CLI `--compare-raw`, benchmark
+  `--reference-dir`.
 - **Expression trace (waveform arithmetic)** — a derived plot column named by the expression
   that made it (`V(out)*I(V1)`), TODO §6. `arith.rs`: `TraceExpr::parse` once, `evaluate` per
   `RawDataset` over whole columns (so `d()` sees the axis), `add_expression_traces` appends the
@@ -131,6 +145,10 @@ deepening that has not landed yet.
   and that run's analyses; `SimulationResult.runs` holds them all, with the first mirrored into
   the top-level fields for single-run consumers. The `.mc` driver's Monte Carlo runs ride this
   same shape.
+- **Run plan / worker count** — `runs::RunPlan` is one independent run (a `.step` combination or a
+  Monte Carlo index); `execute_plans` deals plans to `default_threads()` scoped workers
+  (`RSPICE_THREADS`, CLI `-j`) and collects them in plan order, so thread count never changes
+  results or which error surfaces (always the lowest-indexed failing plan).
 - **MC draw seed** — the 64-bit `ParamEnv.mc_seed` every keyed draw mixes in: the sweep
   overrides hashed by `seed_from_overrides`, optionally raised by `.options seed=<n>`
   (`mix64(overrides ⊕ literal)`, lifted before element lines expand). 0 stays the constant of
@@ -205,6 +223,14 @@ deepening that has not landed yet.
   with `tline_ac_angles` clamping |sinθ| < 1e-12 at 1e-12 — integer half-wavelength resonance is
   unbounded — and stamp and extraction call that one function, so the clamp cannot drift.
   `.model …TLINE(…)` imports as a `GenericModel` (kept, unused — the card takes Z0/TD directly).
+- **Lossy transmission line (`O`)** — `Oname n1 n2 n3 n4 model [N=<sections>]` with
+  `.model model LTRA(R= L= G= C= LEN= [N=])` (TODO §5; documented interpretation — a lumped
+  ladder, not the reference tools' exact LTRA convolution). `Circuit::expand_lossy_lines` replaces
+  each pending `LossyLine` after the card walk with `N` π-sections of ordinary `R`/`L`/`C` elements
+  (series R then L on the signal conductor, C and G to the shared return net, half weights at the
+  ports), so no analysis knows lossy lines exist; the card never survives a parse and emit prints the
+  ladder. `n2 ≠ n4` (floating return) is a loud error. Exact at DC and low frequency, band-limited
+  near `N/(π·TD)`. Arms are named so the family letter follows the last `.` (`X1.RO1_s3`).
 - **Passive model card** — `.model … R/C/L` supplying a value and `TC1`/`TC2`; the element
   card may omit its value when the model supplies it. `Circuit::resistance_at` (and the C/L
   siblings) is the one temperature-scaling point.

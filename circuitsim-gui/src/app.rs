@@ -15,7 +15,8 @@ use crate::plot::{
     tran_voltage_series, AcCursor, AcMagScale, AcQuantity, ExpressionTraces, PlotState,
 };
 use crate::schematic::{
-    instance_names, AnalysisType, CompKind, GridPt, NodeAssignment, SchematicState, Tool, GRID_SIZE,
+    instance_names, AnalysisType, CompKind, GridPt, NodeAssignment, Note, SchematicState, Tool,
+    GRID_SIZE,
 };
 
 /// Deck-spelling label for a node (`in`, `out`), falling back to its id.
@@ -250,6 +251,16 @@ enum TranSubTab {
     Expression,
 }
 
+/// The Label Net / SPICE Directive dialog: the text being typed, and whether
+/// it is the multi-line directive flavor. OK arms the schematic's matching
+/// tool; the next canvas click drops the text.
+struct NoteDialog {
+    directive: bool,
+    text: String,
+    /// True until the first frame has put the cursor in the text field.
+    fresh: bool,
+}
+
 /// What the schematic panel highlights because a Waveforms hover reached it
 /// across the probe plumbing ("hover a trace, see its source"): a node from a
 /// `V(...)` trace, or a family's element slot from an `I(...)` trace.
@@ -294,6 +305,15 @@ fn current_slot_targets(tran: &TranResult) -> Vec<(ElementFamily, usize)> {
         );
     }
     out
+}
+
+/// How the deck spells schematic net `node`: its label when it has one, else
+/// its number — the same rule the netlist writer follows. The schematic's
+/// node numbers are *not* the run's node ids once a net is labeled (the
+/// parser gives numeric nodes their own number and named nodes ids above
+/// them), so probes and highlights compare spellings, never raw numbers.
+fn net_spelling(assignment: &NodeAssignment, node: usize) -> String {
+    assignment.name_of(node).map_or_else(|| node.to_string(), str::to_string)
 }
 
 pub struct CircuitSimApp {
@@ -346,6 +366,14 @@ pub struct CircuitSimApp {
     /// Last painted schematic canvas, in screen space — the zoom buttons
     /// zoom about its center.
     canvas_rect: Rect,
+    /// The open Label Net / SPICE Directive dialog, if any.
+    note_dialog: Option<NoteDialog>,
+    /// The popup's edit buffer for the selected annotation (which one, text).
+    note_edit: Option<(Note, String)>,
+    /// The deck text the shown results were simulated from. Wire probing
+    /// trusts the schematic's nets only while the schematic still generates
+    /// exactly this text.
+    run_text: Option<String>,
 
     // Cross-probing: the Waveforms hover writes this highlight target and the
     // schematic panel draws it. No frame bookkeeping needed — the plot and
@@ -396,6 +424,9 @@ impl Default for CircuitSimApp {
             schematic_grid: false,
             plot_grid: false,
             canvas_rect: Rect::NOTHING,
+            note_dialog: None,
+            note_edit: None,
+            run_text: None,
 
             probe_flash: None,
             last_probe_click: None,
@@ -414,9 +445,9 @@ impl CircuitSimApp {
     /// on failure the netlist is untouched and the status says why, so callers
     /// switch to the netlist only when this returns `true`.
     fn generate_netlist_from_schematic(&mut self) -> bool {
-        match self.schematic.build_netlist() {
-            Ok(netlist) => {
-                self.netlist = netlist_emit(&netlist);
+        match self.schematic.deck_text() {
+            Ok(text) => {
+                self.netlist = text;
                 self.status = Some((true, "Generated netlist from schematic".into()));
                 true
             }
@@ -467,6 +498,7 @@ impl CircuitSimApp {
                     summary.push_str(&format!(" · {} import warning(s)", netlist.warnings.len()));
                 }
                 self.circuit_summary = Some(summary);
+                self.run_text = Some(self.netlist.clone());
                 self.node_names = netlist.circuit.node_names.clone();
                 self.circuit = Some(netlist.circuit.clone());
 
@@ -557,6 +589,7 @@ impl CircuitSimApp {
     }
 
     fn clear_results(&mut self) {
+        self.run_text = None;
         self.circuit_summary = None;
         self.dc = None;
         self.dc_sweep = None;
@@ -691,6 +724,7 @@ impl eframe::App for CircuitSimApp {
         });
 
         self.about_window(ctx);
+        self.note_dialog_window(ctx);
     }
 }
 
@@ -707,6 +741,23 @@ impl CircuitSimApp {
                 i.consume_shortcut(&KeyboardShortcut::new(Modifiers::COMMAND, Key::G)),
             )
         });
+        // F4 / S open the annotation dialogs from the schematic window (S is a
+        // plain letter, so it must never fire while a text field has focus or
+        // a dialog is already collecting text).
+        if self.schematic_active() && self.note_dialog.is_none() && !ctx.wants_keyboard_input() {
+            let (label, directive) = ctx.input_mut(|i| {
+                (
+                    i.consume_key(Modifiers::NONE, Key::F4),
+                    i.consume_key(Modifiers::NONE, Key::S),
+                )
+            });
+            if label {
+                self.open_note_dialog(false);
+            }
+            if directive {
+                self.open_note_dialog(true);
+            }
+        }
         if run {
             self.run_simulation();
         }
@@ -724,6 +775,138 @@ impl CircuitSimApp {
                 self.schematic_grid = !self.schematic_grid;
             }
         }
+    }
+
+    // ── Cross-probing ───────────────────────────────────────────────────────
+
+    /// The run's node id for the net under schematic wire `wire`, found by
+    /// the net's deck spelling (its label, or its number). Refused unless the
+    /// schematic still generates the very deck the results came from: after
+    /// any edit — or a hand-edited netlist — the schematic's net names no
+    /// longer say which trace is which, and a wrong trace is worse than none.
+    fn probe_target(&self, wire: usize) -> Result<usize, String> {
+        let Some(run_text) = self.run_text.as_deref() else {
+            return Err("Run a simulation first, then click a wire to plot its voltage".into());
+        };
+        let w = self.schematic.wires.get(wire).ok_or("no such wire")?;
+        let deck = self.schematic.deck_text()?;
+        if deck != run_text {
+            return Err("The schematic has changed since the last run — generate the netlist and run again to probe".into());
+        }
+        let a = NodeAssignment::of(
+            &self.schematic.components,
+            &self.schematic.wires,
+            &self.schematic.labels,
+        );
+        let node = a.node_of(w.p1);
+        if node == 0 {
+            return Err("Ground is 0 V — nothing to plot".into());
+        }
+        let spelling = net_spelling(&a, node);
+        self.node_names
+            .iter()
+            .position(|n| n.eq_ignore_ascii_case(&spelling))
+            .ok_or_else(|| format!("net '{spelling}' is not in the simulated deck"))
+    }
+
+    /// Shift+click on a wire: add `V(net)` to the viewer and show it.
+    fn probe_wire(&mut self, wire: usize) {
+        match self.probe_target(wire) {
+            Ok(id) => {
+                for plotted in [&mut self.plot_nodes, &mut self.dc_plot_nodes, &mut self.ac_plot_nodes] {
+                    if plotted.len() <= id {
+                        plotted.resize(id + 1, false);
+                    }
+                    plotted[id] = true;
+                }
+                if self.ac.is_some() {
+                    self.result_tab = ResultTab::FreqResponse;
+                } else if self.tran.is_some() {
+                    self.result_tab = ResultTab::Waveforms;
+                    self.tran_sub_tab = TranSubTab::Voltage;
+                } else if self.dc_sweep.is_some() {
+                    self.result_tab = ResultTab::Dc;
+                }
+                self.status = Some((true, format!("Probing V({})", self.node_names[id])));
+            }
+            Err(e) => self.status = Some((false, e)),
+        }
+    }
+
+    // ── Annotation dialogs ──────────────────────────────────────────────────
+
+    /// Edit ▸ Label Net / SPICE Directive: open the text dialog.
+    fn open_note_dialog(&mut self, directive: bool) {
+        if !self.schematic_active() {
+            return;
+        }
+        self.note_dialog = Some(NoteDialog { directive, text: String::new(), fresh: true });
+    }
+
+    /// The dialog itself. OK validates through the schematic (a bad net name
+    /// or an `.end` keeps the dialog open with the reason in the status line)
+    /// and arms the placement tool; the next canvas click drops the text.
+    fn note_dialog_window(&mut self, ctx: &egui::Context) {
+        let Some(mut dialog) = self.note_dialog.take() else {
+            return;
+        };
+        let (mut commit, mut cancel) = (false, false);
+        let title = if dialog.directive { "SPICE Directive" } else { "Label Net" };
+        egui::Window::new(title)
+            .collapsible(false)
+            .resizable(false)
+            .anchor(egui::Align2::CENTER_CENTER, [0.0, 0.0])
+            .show(ctx, |ui| {
+                if dialog.directive {
+                    ui.label("SPICE text — written into the netlist as typed:");
+                    let edit = ui.add(
+                        egui::TextEdit::multiline(&mut dialog.text)
+                            .font(egui::TextStyle::Monospace)
+                            .desired_rows(4)
+                            .desired_width(360.0),
+                    );
+                    if dialog.fresh {
+                        edit.request_focus();
+                    }
+                } else {
+                    ui.label("Net name:");
+                    let edit = ui.add(egui::TextEdit::singleline(&mut dialog.text).desired_width(200.0));
+                    if dialog.fresh {
+                        edit.request_focus();
+                    }
+                    if edit.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)) {
+                        commit = true;
+                    }
+                }
+                dialog.fresh = false;
+                ui.horizontal(|ui| {
+                    commit |= ui.button("OK").clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+        if ctx.input(|i| i.key_pressed(egui::Key::Escape)) {
+            cancel = true;
+        }
+        if cancel {
+            return;
+        }
+        if commit {
+            let armed = if dialog.directive {
+                self.schematic.arm_directive(&dialog.text)
+            } else {
+                self.schematic.arm_label(&dialog.text)
+            };
+            match armed {
+                Ok(()) => {
+                    let what = if dialog.directive { "directive" } else { "label" };
+                    self.status = Some((true, format!("Click the schematic to place the {what}")));
+                    self.show_schematic();
+                    return;
+                }
+                Err(e) => self.status = Some((false, e)),
+            }
+        }
+        self.note_dialog = Some(dialog);
     }
 
     // ── Document state ──────────────────────────────────────────────────────
@@ -941,12 +1124,16 @@ impl CircuitSimApp {
     /// trace was added: node 0 is ground (always 0 V), and a node without a
     /// slot (import mismatch) probes nothing.
     fn probe_wire_for(&mut self, wi: usize, isolate: bool) -> bool {
-        let node = {
-            let assignment = NodeAssignment::of(&self.schematic.components, &self.schematic.wires);
-            let Some(w) = self.schematic.wires.get(wi) else {
+        // The run's node id for the wire's net, by deck spelling and only
+        // while the schematic still generates the deck the traces came from
+        // ([`Self::probe_target`]); a refusal says why and the click falls
+        // back to selection.
+        let node = match self.probe_target(wi) {
+            Ok(id) => id,
+            Err(e) => {
+                self.status = Some((false, e));
                 return false;
-            };
-            assignment.node_of(w.p1)
+            }
         };
         if node == 0 || node >= self.plot_nodes.len() {
             return false;
@@ -1035,7 +1222,9 @@ impl CircuitSimApp {
             ui.menu_button("Edit", |ui| {
                 let can_edit = self.schematic_active();
                 let has_component = self.schematic.selected_component.is_some();
-                let has_selection = has_component || self.schematic.selected_wire.is_some();
+                let has_selection = has_component
+                    || self.schematic.selected_wire.is_some()
+                    || self.schematic.selected_note.is_some();
                 if ui.add_enabled(can_edit && has_component, egui::Button::new("Rotate").shortcut_text("Space")).clicked() {
                     self.rotate_selection();
                     ui.close_menu();
@@ -1050,6 +1239,15 @@ impl CircuitSimApp {
                         self.pick_tool(tool);
                         ui.close_menu();
                     }
+                }
+                ui.separator();
+                if ui.add(egui::Button::new("Label Net…").shortcut_text("F4")).clicked() {
+                    self.open_note_dialog(false);
+                    ui.close_menu();
+                }
+                if ui.add(egui::Button::new("SPICE Directive…").shortcut_text("S")).clicked() {
+                    self.open_note_dialog(true);
+                    ui.close_menu();
                 }
             });
 
@@ -1782,7 +1980,7 @@ impl CircuitSimApp {
         // The same NodeAssignment the netlist writer uses, so the on-canvas
         // labels can never drift away from the emitted netlist.
         {
-            let assignment = NodeAssignment::of(&self.schematic.components, &self.schematic.wires);
+            let assignment = NodeAssignment::of(&self.schematic.components, &self.schematic.wires, &self.schematic.labels);
 
             // Collect one representative screen position per node number.
             //    Pick the point with the smallest (x, y) grid coords for stability —
@@ -1802,6 +2000,10 @@ impl CircuitSimApp {
 
             // 6. Draw node labels.
             for (node_num, (pos, _grid_pt)) in &node_positions {
+                // A labeled net shows its label (drawn below), not a number.
+                if assignment.name_of(*node_num).is_some() {
+                    continue;
+                }
                 let label = format!("{node_num}");
                 let bg_color = Color32::from_rgb(255, 255, 225);
                 let text_color = if *node_num == 0 {
@@ -1844,8 +2046,13 @@ impl CircuitSimApp {
             match flash {
                 Some(ProbeFlash::Node(node)) => {
                     let stroke = Stroke::new(3.0 * z, Color32::from_rgb(230, 80, 40));
+                    // `node` is a run node id; wires are matched by the
+                    // deck spelling of their net (a labeled net's id is not
+                    // its schematic number).
+                    let spelling = node_label(&self.node_names, node);
                     for w in &self.schematic.wires {
-                        if assignment.node_of(w.p1) == node {
+                        let wire_net = net_spelling(&assignment, assignment.node_of(w.p1));
+                        if wire_net.eq_ignore_ascii_case(&spelling) {
                             painter.line_segment([to_screen(w.p1), to_screen(w.p2)], stroke);
                         }
                     }
@@ -1894,6 +2101,74 @@ impl CircuitSimApp {
             }
         }
         // ── End node labels ──────────────────────────────────────────────
+
+        // ── Annotations: net labels and SPICE directives ─────────────────
+        // Each one records its screen rectangle for the Select tool's
+        // hit-test below.
+        let mut note_rects: Vec<(Note, Rect)> = Vec::new();
+        {
+            let selected_color = Color32::from_rgb(230, 80, 40);
+            let label_font_id = egui::FontId::proportional((11.0 * z).clamp(8.0, 18.0));
+            for (i, l) in self.schematic.labels.iter().enumerate() {
+                let note = Note::Label(i);
+                let at = to_screen(l.at);
+                let color = if self.schematic.selected_note == Some(note) {
+                    selected_color
+                } else {
+                    theme::LT_SCHEM_TEXT
+                };
+                let galley = painter.layout_no_wrap(l.name.clone(), label_font_id.clone(), color);
+                let size = galley.size();
+                // The name rides a short leader running right from the pin.
+                let text_pos = at + Vec2::new(3.0 * z, -size.y - 1.0 * z);
+                painter.line_segment(
+                    [at, at + Vec2::new(size.x + 6.0 * z, 0.0)],
+                    Stroke::new(1.0 * z, color),
+                );
+                painter.circle_filled(at, 2.5 * z.max(0.6), color);
+                painter.galley(text_pos, galley, color);
+                note_rects.push((
+                    note,
+                    Rect::from_min_size(text_pos, size).union(Rect::from_center_size(at, Vec2::splat(8.0))).expand(3.0),
+                ));
+            }
+            let mono = egui::FontId::monospace((11.0 * z).clamp(7.0, 18.0));
+            for (i, d) in self.schematic.directives.iter().enumerate() {
+                let note = Note::Directive(i);
+                let at = to_screen(d.at);
+                let selected = self.schematic.selected_note == Some(note);
+                let color = if selected { selected_color } else { theme::LT_SCHEM_TEXT };
+                let galley = painter.layout(d.text.clone(), mono.clone(), color, f32::INFINITY);
+                let text_rect = Rect::from_min_size(at, galley.size());
+                painter.galley(at, galley, color);
+                if selected {
+                    painter.rect_stroke(text_rect.expand(2.0), 0.0, Stroke::new(1.0, selected_color));
+                }
+                note_rects.push((note, text_rect.expand(3.0)));
+            }
+            // Ghost of the armed text under the cursor, so the user sees what
+            // the next click will drop.
+            if matches!(self.schematic.tool, Tool::Label | Tool::Directive)
+                && !self.schematic.pending_text.is_empty()
+            {
+                if let Some(hover_pos) = response.hover_pos() {
+                    let snapped = to_screen(GridPt::from_pos(Pos2::new(
+                        (hover_pos.x - rect.left_top().x - pan.x) / z,
+                        (hover_pos.y - rect.left_top().y - pan.y) / z,
+                    )));
+                    let font = if self.schematic.tool == Tool::Directive { mono.clone() } else { label_font_id.clone() };
+                    painter.text(
+                        snapped,
+                        egui::Align2::LEFT_BOTTOM,
+                        &self.schematic.pending_text,
+                        font,
+                        theme::LT_SCHEM_TEXT.gamma_multiply(0.55),
+                    );
+                    painter.circle_filled(snapped, 3.0 * z, theme::LT_WIRE);
+                }
+            }
+        }
+        // ── End annotations ──────────────────────────────────────────────
         if self.schematic.tool == Tool::Select {
             // 1. Detect drag start and lock onto the target component
             if response.drag_started() {
@@ -1958,6 +2233,9 @@ impl CircuitSimApp {
                     Tool::R | Tool::C | Tool::L | Tool::V | Tool::Gnd => {
                         self.schematic.place_at(grid_pt);
                     }
+                    Tool::Label | Tool::Directive => {
+                        self.schematic.place_note(grid_pt);
+                    }
                     Tool::Select => {
                         let mut selected = None;
                         for (i, c) in self.schematic.components.iter().enumerate() {
@@ -1977,8 +2255,15 @@ impl CircuitSimApp {
                         // If no component hit, check wires; the hit-test
                         // result goes through the model so the selection
                         // fields can never disagree.
+                        // Annotations sit above wires: their text is the
+                        // click target, so a label on a wire stays pickable.
+                        let hit_note = if selected.is_none() {
+                            note_rects.iter().find(|(_, r)| r.contains(interact_pos)).map(|(n, _)| *n)
+                        } else {
+                            None
+                        };
                         let mut hit_wire = None;
-                        if selected.is_none() {
+                        if selected.is_none() && hit_note.is_none() {
                             for (wi, w) in self.schematic.wires.iter().enumerate() {
                                 let a = to_screen(w.p1);
                                 let b = to_screen(w.p2);
@@ -2007,8 +2292,10 @@ impl CircuitSimApp {
                         // semantics. Ground bodies and empty canvas still
                         // behave as ordinary selection clicks. Clicking the
                         // same probe again erases the rest ("plotted by
-                        // itself").
-                        let probed = if self.tran.is_some() {
+                        // itself"). A click on an annotation's text selects
+                        // it instead, so a label sitting on a wire stays
+                        // pickable.
+                        let probed = if self.tran.is_some() && hit_note.is_none() {
                             match self.probe_target_at(interact_pos, to_screen, z) {
                                 Some(target) => {
                                     let isolate = self.last_probe_click == Some(target);
@@ -2029,7 +2316,16 @@ impl CircuitSimApp {
                             false
                         };
                         if !probed {
-                            self.schematic.select(selected, hit_wire);
+                            match hit_note {
+                                Some(note) => self.schematic.select_note(Some(note)),
+                                None => self.schematic.select(selected, hit_wire),
+                            }
+                            // Shift+click probes a wire's voltage after any
+                            // analysis (plain click covers transient runs
+                            // above); same freshness rule, same spelling.
+                            if let (Some(wi), true) = (hit_wire, ui.input(|i| i.modifiers.shift)) {
+                                self.probe_wire(wi);
+                            }
                         }
                     }
                 }
@@ -2057,22 +2353,11 @@ impl CircuitSimApp {
         {
             if let Some(hover_pos) = response.hover_pos() {
                 let preview = match self.probe_target_at(hover_pos, to_screen, z) {
-                    Some(ProbeTarget::Wire(wi)) => {
-                        let node = self
-                            .schematic
-                            .wires
-                            .get(wi)
-                            .map(|w| {
-                                NodeAssignment::of(
-                                    &self.schematic.components,
-                                    &self.schematic.wires,
-                                )
-                                .node_of(w.p1)
-                            })
-                            .unwrap_or(0);
-                        (node > 0 && node < self.plot_nodes.len())
-                            .then(|| format!("V({})", node_label(&self.node_names, node)))
-                    }
+                    Some(ProbeTarget::Wire(wi)) => self
+                        .probe_target(wi)
+                        .ok()
+                        .filter(|&node| node > 0 && node < self.plot_nodes.len())
+                        .map(|node| format!("V({})", node_label(&self.node_names, node))),
                     Some(ProbeTarget::Part(ci)) => self
                         .schematic
                         .components
@@ -2180,6 +2465,75 @@ impl CircuitSimApp {
         }
         if let Some(wi) = delete_wire_idx {
             self.schematic.delete_wire(wi);
+        }
+
+        // Annotation popup: edit the selected label's name or directive's
+        // text in place, or delete it.
+        if let Some(note) = self.schematic.selected_note {
+            let current = match note {
+                Note::Label(i) => self.schematic.labels.get(i).map(|l| (l.at, l.name.clone())),
+                Note::Directive(i) => self.schematic.directives.get(i).map(|d| (d.at, d.text.clone())),
+            };
+            if let Some((at, text)) = current {
+                if self.note_edit.as_ref().map(|(n, _)| *n) != Some(note) {
+                    self.note_edit = Some((note, text));
+                }
+                let multiline = matches!(note, Note::Directive(_));
+                let heading = if multiline { "SPICE directive" } else { "Net label" };
+                let (mut apply, mut delete, mut is_open) = (false, false, true);
+                egui::Window::new("")
+                .id(egui::Id::new("edit_note_window"))
+                .title_bar(false)
+                .fixed_pos(to_screen(at) + Vec2::new(10.0, 14.0))
+                .collapsible(false)
+                .resizable(false)
+                .open(&mut is_open)
+                .frame(
+                    egui::Frame::none()
+                    .fill(theme::BG_SURFACE)
+                    .stroke(egui::Stroke::new(1.0, theme::LT_FRAME))
+                    .rounding(egui::Rounding::same(0.0))
+                    .inner_margin(egui::Margin::same(10.0))
+                )
+                .show(ui.ctx(), |ui| {
+                    ui.label(egui::RichText::new(heading).strong().size(12.0).color(theme::LT_WIRE));
+                    ui.add_space(4.0);
+                    if let Some((_, buf)) = self.note_edit.as_mut() {
+                        if multiline {
+                            ui.add(egui::TextEdit::multiline(buf)
+                                .font(egui::TextStyle::Monospace)
+                                .desired_rows(3)
+                                .desired_width(280.0));
+                        } else {
+                            ui.add(egui::TextEdit::singleline(buf).desired_width(160.0));
+                        }
+                    }
+                    ui.add_space(4.0);
+                    ui.horizontal(|ui| {
+                        apply = ui.button("Apply").clicked();
+                        delete = ui.button("Delete").clicked();
+                    });
+                });
+                if !is_open {
+                    self.schematic.select_note(None);
+                }
+                if apply {
+                    if let Some((n, buf)) = self.note_edit.clone() {
+                        self.status = Some(match self.schematic.edit_note(n, &buf) {
+                            Ok(()) => (true, format!("Updated {}", heading.to_lowercase())),
+                            Err(e) => (false, e),
+                        });
+                    }
+                }
+                if delete {
+                    self.schematic.delete_note(note);
+                }
+            } else {
+                self.schematic.select_note(None);
+            }
+        }
+        if self.schematic.selected_note.is_none() {
+            self.note_edit = None;
         }
 
         // --- ADD THIS AT THE END OF schematic_panel ---
@@ -3277,5 +3631,109 @@ mod tests {
         app.netlist = Example::VoltageDivider.netlist().into();
         app.run_simulation();
         assert_eq!(app.result_tab, ResultTab::Overview);
+    }
+
+    /// A V source, a divider and a labeled middle net, drawn and generated.
+    fn probe_app() -> CircuitSimApp {
+        let mut app = CircuitSimApp::default();
+        let comp = |kind, p1: (i32, i32), p2: (i32, i32), val: &str| Component {
+            kind,
+            p1: GridPt(p1.0, p1.1),
+            p2: GridPt(p2.0, p2.1),
+            val: val.to_string(),
+        };
+        app.schematic.components = vec![
+            comp(CompKind::Voltage, (0, 0), (0, 3), "5"),
+            comp(CompKind::Resistor, (4, 0), (4, 3), "1k"),
+            comp(CompKind::Resistor, (8, 3), (8, 6), "1k"),
+            comp(CompKind::Ground, (0, 3), (0, 3), ""),
+            comp(CompKind::Ground, (8, 6), (8, 6), ""),
+        ];
+        app.schematic.wires = vec![
+            crate::schematic::Wire { p1: GridPt(0, 0), p2: GridPt(4, 0) },
+            crate::schematic::Wire { p1: GridPt(4, 3), p2: GridPt(8, 3) },
+        ];
+        app.schematic.labels = vec![crate::schematic::NetLabel { at: GridPt(4, 3), name: "mid".into() }];
+        app.schematic.tran_step = "1m".into();
+        app.schematic.tran_stop = "5m".into();
+        assert!(app.generate_netlist_from_schematic());
+        app
+    }
+
+    #[test]
+    fn probing_before_a_run_explains_itself() {
+        let app = probe_app();
+        assert!(app.probe_target(0).unwrap_err().contains("Run a simulation"));
+    }
+
+    #[test]
+    fn shift_click_probe_plots_the_labeled_net() {
+        let mut app = probe_app();
+        app.run_simulation();
+        assert!(app.tran.is_some(), "{:?}", app.status);
+        for v in [&mut app.plot_nodes, &mut app.dc_plot_nodes, &mut app.ac_plot_nodes] {
+            v.iter_mut().for_each(|b| *b = false);
+        }
+        let id = app.probe_target(1).expect("wire 1 is the mid net");
+        assert_eq!(app.node_names[id], "mid");
+        app.probe_wire(1);
+        assert!(app.plot_nodes[id]);
+        assert_eq!(app.result_tab, ResultTab::Waveforms);
+        // The unlabeled top net resolves by its number.
+        let top = app.probe_target(0).expect("wire 0 is the V1 net");
+        assert_ne!(top, id);
+        assert!(!app.plot_nodes[top], "other nets stay unplotted");
+    }
+
+    #[test]
+    fn probing_refuses_after_the_schematic_drifts_from_the_run() {
+        let mut app = probe_app();
+        app.run_simulation();
+        app.schematic.components[1].val = "2k".into();
+        let err = app.probe_target(1).unwrap_err();
+        assert!(err.contains("changed since the last run"), "{err}");
+        app.probe_wire(1);
+        assert!(matches!(app.status, Some((false, _))));
+    }
+
+    #[test]
+    fn probing_a_ground_wire_is_refused() {
+        let mut app = probe_app();
+        app.schematic.wires.push(crate::schematic::Wire { p1: GridPt(0, 3), p2: GridPt(2, 3) });
+        assert!(app.generate_netlist_from_schematic());
+        app.run_simulation();
+        let err = app.probe_target(2).unwrap_err();
+        assert!(err.contains("Ground"), "{err}");
+    }
+
+    /// The plain-click probe finds a labeled net by its deck name: the run's
+    /// id for `mid` is not the schematic's node number for it.
+    #[test]
+    fn click_probe_plots_the_labeled_net_by_its_deck_name() {
+        let mut app = probe_app();
+        app.run_simulation();
+        assert!(app.tran.is_some(), "{:?}", app.status);
+        let id = app.probe_target(1).expect("wire 1 is the mid net");
+        assert_eq!(app.node_names[id], "mid");
+        app.plot_nodes.iter_mut().for_each(|b| *b = false);
+        assert!(app.probe_wire_for(1, false));
+        assert!(app.plot_nodes[id]);
+        assert_eq!(app.plot_nodes.iter().filter(|b| **b).count(), 1);
+        assert!(app.tran_sub_tab == TranSubTab::Voltage);
+        // Probing the same net again isolates it.
+        assert!(app.probe_wire_for(1, true));
+        assert_eq!(app.plot_nodes.iter().filter(|b| **b).count(), 1);
+    }
+
+    #[test]
+    fn click_probe_refuses_a_drifted_schematic_and_says_why() {
+        let mut app = probe_app();
+        app.run_simulation();
+        app.schematic.components[1].val = "2k".into();
+        assert!(!app.probe_wire_for(1, false));
+        match &app.status {
+            Some((false, msg)) => assert!(msg.contains("changed since the last run"), "{msg}"),
+            other => panic!("expected a refusal, got {other:?}"),
+        }
     }
 }

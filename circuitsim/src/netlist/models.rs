@@ -150,8 +150,24 @@ pub(super) fn parse_model_card(
             kind,
             ..MosfetModel::default()
         };
-        for (key, raw) in pairs {
+        let given = |k: &str| pairs.iter().any(|(key, _)| key == k);
+        let (kp_given, gamma_given, phi_given) = (given("kp"), given("gamma"), given("phi"));
+        for (key, raw) in pairs.clone() {
             match key.as_str() {
+                "uo" | "u0" => model.uo = Some(value(&raw)?),
+                "ld" => model.ld = value(&raw)?,
+                "wd" => model.wd = value(&raw)?,
+                "vmax" => model.vmax = Some(value(&raw)?),
+                "ucrit" => model.ucrit = Some(value(&raw)?),
+                "uexp" => model.uexp = Some(value(&raw)?),
+                "utra" => model.utra = value(&raw)?,
+                "theta" => model.theta = value(&raw)?,
+                "eta" => model.eta = value(&raw)?,
+                "kappa" => model.kappa = value(&raw)?,
+                "delta" => model.delta = value(&raw)?,
+                "xj" => model.xj = Some(value(&raw)?),
+                "nfs" => model.nfs = Some(value(&raw)?),
+                "neff" => model.neff = Some(value(&raw)?),
                 "level" => match raw
                     .trim()
                     .trim_end_matches(|c| c == ')' || c == '%' || c == ',')
@@ -192,6 +208,13 @@ pub(super) fn parse_model_card(
                 )),
             }
         }
+        finish_mosfet_card(
+            &mut model,
+            (kp_given, gamma_given, phi_given),
+            &name,
+            line_no,
+            warnings,
+        );
         circuit.mosfet_models.insert(name, model);
         return Ok(());
     }
@@ -425,6 +448,114 @@ pub(super) fn parse_model_card(
     Ok(())
 }
 
+/// Post-pass over a freshly parsed MOSFET card.
+///
+/// * Derives the process-implied parameters the card left out, as the
+///   reference tools do: `KP = UO·Cox` (UO in cm²/V·s, `Cox = ε_ox/TOX`),
+///   `γ = √(2·q·ε_si·NSUB)/Cox`, `φ = 2·Vt·ln(NSUB/ni)` (NSUB in cm⁻³,
+///   `ni = 1.45e10 cm⁻³`). An explicit card value always wins.
+/// * Warns — never silently drops — about parameters the card's `LEVEL` does
+///   not act on, and about slots whose equation lacks a prerequisite
+///   (`TOX`/`NSUB`/`UO`).
+fn finish_mosfet_card(
+    model: &mut MosfetModel,
+    given: (bool, bool, bool),
+    name: &str,
+    line_no: usize,
+    warnings: &mut Vec<String>,
+) {
+    let (kp_given, gamma_given, phi_given) = given;
+    let cox = model.cox();
+    if !kp_given {
+        if let (Some(uo), Some(cox)) = (model.uo, cox) {
+            model.kp = uo * 1e-4 * cox;
+        }
+    }
+    if let Some(nsub) = model.nsub.filter(|n| *n > 0.0) {
+        if !gamma_given {
+            if let Some(cox) = cox {
+                model.gamma = (2.0 * crate::model::ELECTRON_CHARGE * crate::model::EPS_SI
+                    * nsub * 1e6).sqrt() / cox;
+            }
+        }
+        if !phi_given {
+            let vt = crate::model::thermal_voltage(model.tnom);
+            model.phi = 2.0 * vt * (nsub / 1.45e10).ln();
+        }
+    }
+
+    let mut warn = |msg: String| {
+        warnings.push(format!("line {line_no}: .model '{name}': {msg}"));
+    };
+    let level = model.level;
+    // (label, set?) for the slots each level reads.
+    let level2_only = [
+        ("UCRIT", model.ucrit.is_some()),
+        ("UEXP", model.uexp.is_some()),
+        ("UTRA", model.utra != 0.0),
+    ];
+    let level3_only = [
+        ("THETA", model.theta != 0.0),
+        ("ETA", model.eta != 0.0),
+        ("KAPPA", model.kappa != 0.2),
+        ("DELTA", model.delta != 0.0),
+        ("VMAX", model.vmax.is_some()),
+    ];
+    let geometry = [
+        ("LD", model.ld != 0.0),
+        ("WD", model.wd != 0.0),
+    ];
+    let set = |slots: &[(&str, bool)]| -> Vec<String> {
+        slots.iter().filter(|(_, on)| *on).map(|(k, _)| k.to_string()).collect()
+    };
+    match level {
+        1 => {
+            let stray: Vec<String> = [set(&level2_only), set(&level3_only), set(&geometry)].concat();
+            if !stray.is_empty() {
+                warn(format!("{} act on LEVEL 2/3 only — ignored on LEVEL 1", stray.join(", ")));
+            }
+        }
+        2 => {
+            let stray = set(&level3_only);
+            if !stray.is_empty() {
+                warn(format!("{} act on LEVEL 3 only — ignored on LEVEL 2", stray.join(", ")));
+            }
+            if (model.ucrit.is_some() || model.uexp.is_some()) && cox.is_none() {
+                warn("UCRIT/UEXP mobility degradation needs TOX — ignored".into());
+            }
+        }
+        3 => {
+            let stray = set(&level2_only);
+            if !stray.is_empty() {
+                warn(format!("{} act on LEVEL 2 only — ignored on LEVEL 3", stray.join(", ")));
+            }
+            if model.lambda != 0.0 {
+                warn("LAMBDA does not act on LEVEL 3 (use KAPPA with NSUB) — ignored".into());
+            }
+            if (model.eta != 0.0 || model.delta != 0.0) && cox.is_none() {
+                warn("ETA/DELTA need TOX — ignored".into());
+            }
+            if model.vmax.is_some() && model.uo.is_none() && cox.is_none() {
+                warn("VMAX needs UO or TOX to set the critical voltage — ignored".into());
+            }
+        }
+        _ => {}
+    }
+    if level == 2 || level == 3 {
+        let unmodelled = set(&[
+            ("XJ", model.xj.is_some()),
+            ("NFS", model.nfs.is_some()),
+            ("NEFF", model.neff.is_some()),
+        ]);
+        if !unmodelled.is_empty() {
+            warn(format!(
+                "{} are kept but not modelled (no short-channel/weak-inversion terms)",
+                unmodelled.join(", ")
+            ));
+        }
+    }
+}
+
 /// Byte span of the `index`-th whitespace-separated token of `line`.
 pub(super) fn nth_token_span(line: &str, index: usize) -> Option<std::ops::Range<usize>> {
     let bytes = line.as_bytes();
@@ -566,6 +697,22 @@ pub(super) fn emit_models(circuit: &Circuit, out: &mut String) {
         if let Some(v) = m.nsub { out.push_str(&format!(" NSUB={v}")); }
         if let Some(v) = m.nss { out.push_str(&format!(" NSS={v}")); }
         if let Some(v) = m.tpg { out.push_str(&format!(" TPG={v}")); }
+        // Level 2/3 slots, printed only when set so level-1 decks emit
+        // exactly as before.
+        if let Some(v) = m.uo { out.push_str(&format!(" UO={v}")); }
+        if m.ld != 0.0 { out.push_str(&format!(" LD={}", m.ld)); }
+        if m.wd != 0.0 { out.push_str(&format!(" WD={}", m.wd)); }
+        if let Some(v) = m.vmax { out.push_str(&format!(" VMAX={v}")); }
+        if let Some(v) = m.ucrit { out.push_str(&format!(" UCRIT={v}")); }
+        if let Some(v) = m.uexp { out.push_str(&format!(" UEXP={v}")); }
+        if m.utra != 0.0 { out.push_str(&format!(" UTRA={}", m.utra)); }
+        if m.theta != 0.0 { out.push_str(&format!(" THETA={}", m.theta)); }
+        if m.eta != 0.0 { out.push_str(&format!(" ETA={}", m.eta)); }
+        if m.kappa != 0.2 { out.push_str(&format!(" KAPPA={}", m.kappa)); }
+        if m.delta != 0.0 { out.push_str(&format!(" DELTA={}", m.delta)); }
+        if let Some(v) = m.xj { out.push_str(&format!(" XJ={v}")); }
+        if let Some(v) = m.nfs { out.push_str(&format!(" NFS={v}")); }
+        if let Some(v) = m.neff { out.push_str(&format!(" NEFF={v}")); }
         out.push_str(")\n");
     }
     // Passive model cards. Parasitic slots (`RSER`/`LSER`/`CPAR`/`RPAR`) are

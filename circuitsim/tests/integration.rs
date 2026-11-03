@@ -2856,3 +2856,334 @@ R2 out 0 1k
         );
     }
 }
+
+/// MOSFET levels 2 and 3 through the whole stack (parse → NR → report). The
+/// drain voltage is pinned by an independent hand-computed saturation current
+/// (Python reference, see the `model.rs` level-2/3 tests): `Vd = VDD − Id·RD`.
+#[test]
+fn mosfet_level_two_solves_to_the_grove_frohman_current() {
+    let n = parse(
+        r#"
+.model nm NMOS(LEVEL=2 KP=2e-4 VTO=0.7 GAMMA=0.4 PHI=0.6)
+Vdd vdd 0 DC 3
+Vg g 0 DC 2
+Vb b 0 DC -1
+RD vdd d 1k
+M1 d g 0 b nm W=1u L=1u
+.op
+.end
+"#,
+    )
+    .unwrap();
+    let r = run(&n).unwrap();
+    let d = node_index(&n.circuit.node_names, "d");
+    let op = r.dc.unwrap();
+    // Id(Vgs = 2, Vsb = 1) = 1.0642337326472922e-4 A in saturation.
+    let expected = 3.0 - 1.0642337326472922e-4 * 1e3;
+    assert!((op.node_voltages[d] - expected).abs() < 1e-6, "Vd {}", op.node_voltages[d]);
+}
+
+#[test]
+fn mosfet_level_three_solves_to_the_semi_empirical_current() {
+    let n = parse(
+        r#"
+.model nm NMOS(LEVEL=3 KP=2e-4 VTO=0.7 GAMMA=0.4 PHI=0.6 THETA=0.1 TOX=20n)
+Vdd vdd 0 DC 3
+Vg g 0 DC 2
+Vb b 0 DC -1
+RD vdd d 100
+M1 d g 0 b nm W=10u L=1u
+.op
+.end
+"#,
+    )
+    .unwrap();
+    let r = run(&n).unwrap();
+    let d = node_index(&n.circuit.node_names, "d");
+    let op = r.dc.unwrap();
+    // Id = 1.0169984752362528e-3 A (θ-degraded β, body-shifted threshold).
+    let expected = 3.0 - 1.0169984752362528e-3 * 100.0;
+    assert!((op.node_voltages[d] - expected).abs() < 1e-6, "Vd {}", op.node_voltages[d]);
+}
+
+/// A level-2 PMOS is the exact mirror image of its NMOS twin.
+#[test]
+fn mosfet_level_two_pmos_mirrors_nmos() {
+    let n = parse(
+        r#"
+.model pm PMOS(LEVEL=2 KP=2e-4 VTO=-0.7 GAMMA=0.4 PHI=0.6)
+Vdd vdd 0 DC 3
+Vg g 0 DC 1
+Vb b 0 DC 4
+RD d 0 1k
+M1 d g vdd b pm W=1u L=1u
+.op
+.end
+"#,
+    )
+    .unwrap();
+    let r = run(&n).unwrap();
+    let d = node_index(&n.circuit.node_names, "d");
+    let op = r.dc.unwrap();
+    let expected = 1.0642337326472922e-4 * 1e3;
+    assert!((op.node_voltages[d] - expected).abs() < 1e-6, "Vd {}", op.node_voltages[d]);
+}
+
+/// The gate sweep of a level-2 device carries the body-effect threshold
+/// shift: with the bulk 1 V below the source the curve turns on later.
+#[test]
+fn mosfet_level_two_dc_sweep_shows_the_body_effect() {
+    let sweep = |vb: f64| {
+        let n = parse(&format!(
+            r#"
+.model nm NMOS(LEVEL=2 KP=2e-4 VTO=0.7 GAMMA=0.4 PHI=0.6)
+Vdd vdd 0 DC 3
+Vg g 0 DC 0
+Vb b 0 DC {vb}
+RD vdd d 1k
+M1 d g 0 b nm W=1u L=1u
+.dc Vg 0 2 0.5
+.end
+"#
+        ))
+        .unwrap();
+        let d = node_index(&n.circuit.node_names, "d");
+        let pts = run(&n).unwrap().dc_sweep.unwrap().points;
+        pts.iter().map(|p| p.node_voltages[d]).collect::<Vec<_>>()
+    };
+    let flat = sweep(0.0);
+    let biased = sweep(-1.0);
+    // Both start off (Vd = 3 V). At Vg = 1 V the flat device conducts harder,
+    // pulling the drain lower than the back-biased one.
+    assert!((flat[0] - 3.0).abs() < 1e-6 && (biased[0] - 3.0).abs() < 1e-6);
+    assert!(flat[2] < biased[2] - 1e-3, "flat {} biased {}", flat[2], biased[2]);
+}
+
+// ─── Lossy transmission line (`O`, lumped LTRA ladder) ──────────────────────
+
+fn dc_at(deck: &str, node: &str) -> f64 {
+    let n = parse(deck).unwrap();
+    let idx = node_index(&n.circuit.node_names, node);
+    run(&n).unwrap().dc.unwrap().node_voltages[idx]
+}
+
+/// The series arms sum to R·LEN and the inductors are DC shorts: the line is
+/// exactly a `R·LEN` series resistor at DC, whatever the section count.
+#[test]
+fn lossy_line_is_exactly_its_series_resistance_at_dc() {
+    for n in ["", "N=1", "N=7", "N=64"] {
+        let deck = format!(
+            "* line dc\n\
+             V1 in 0 DC 10\n\
+             O1 in 0 out 0 line {n}\n\
+             RL out 0 50\n\
+             .model line LTRA(R=2 L=250n C=100p LEN=1)\n\
+             .op\n.end\n"
+        );
+        let v = dc_at(&deck, "out");
+        assert!((v - 10.0 * 50.0 / 52.0).abs() < 1e-8, "N card '{n}': {v}");
+    }
+}
+
+/// A leaky dielectric: with no series loss every node sits at the source
+/// voltage, so the source feeds exactly V·G·LEN through the shunt arms
+/// (half-weights at the ports sum with the interior ones to N·G·LEN/N).
+#[test]
+fn lossy_line_shunt_conductance_sums_to_g_times_length() {
+    let n = parse(
+        "* leak\n\
+         V1 in 0 DC 5\n\
+         O1 in 0 out 0 line N=9\n\
+         .model line LTRA(L=50n C=20p G=2m LEN=0.5)\n\
+         .op\n.end\n",
+    )
+    .unwrap();
+    let r = run(&n).unwrap();
+    let dc = r.dc.unwrap();
+    let v1 = n.circuit.voltage_sources.iter().position(|v| v.name.eq_ignore_ascii_case("V1")).unwrap();
+    // Current delivered by the source = V·G·LEN = 5 · 2e-3 · 0.5.
+    assert!((dc.source_currents[v1].abs() - 5e-3).abs() < 1e-9, "{}", dc.source_currents[v1]);
+}
+
+/// The capacitance appears at low frequency exactly as `C·LEN` (a source
+/// through 1 kΩ into an open lossless line is an RC low-pass).
+#[test]
+fn lossy_line_capacitance_shows_in_the_ac_response() {
+    let n = parse(
+        "* line ac\n\
+         V1 s 0 DC 0 AC 1\n\
+         R1 s in 1k\n\
+         O1 in 0 out 0 line\n\
+         .model line LTRA(L=50n C=20p LEN=1)\n\
+         .ac lin 1 10k 10k\n.end\n",
+    )
+    .unwrap();
+    let r = run(&n).unwrap();
+    let in_node = node_index(&n.circuit.node_names, "in");
+    let h = r.ac.unwrap().points[0].node_voltages[in_node].norm();
+    let wrc = 2.0 * std::f64::consts::PI * 10e3 * 1e3 * 20e-12;
+    let analytic = 1.0 / (1.0 + wrc * wrc).sqrt();
+    assert!((h - analytic).abs() < 1e-8, "|H| {h} vs {analytic}");
+}
+
+fn tran_at(t: &circuitsim::TranResult, node: usize, time: f64) -> f64 {
+    let pts = &t.points;
+    let hi = pts.partition_point(|p| p.time <= time).min(pts.len() - 1).max(1);
+    let (a, b) = (&pts[hi - 1], &pts[hi]);
+    if b.time == a.time {
+        return b.node_voltages[node];
+    }
+    let f = ((time - a.time) / (b.time - a.time)).clamp(0.0, 1.0);
+    a.node_voltages[node] + f * (b.node_voltages[node] - a.node_voltages[node])
+}
+
+/// Lossless limit against the exact method-of-characteristics `T` element: a
+/// 50 Ω, 1 ns line behind a 50 Ω source, open far end. The ladder's reflected
+/// staircase must track the exact one (edges are rounded by the lumping, so
+/// compare RMS over the whole record, not point by point).
+#[test]
+fn lossless_lossy_line_tracks_the_exact_t_element() {
+    let source = "V1 s 0 PULSE(0 1 0 200p 200p 1 2)\nR1 s in 50\n";
+    let exact = format!("* exact\n{source}T1 in 0 out 0 Z0=50 TD=1n\n.tran 25p 6n\n.end\n");
+    let ladder = format!(
+        "* ladder\n{source}O1 in 0 out 0 line N=30\n\
+         .model line LTRA(L=50n C=20p LEN=1)\n.tran 25p 6n\n.end\n"
+    );
+    let a = parse(&exact).unwrap();
+    let b = parse(&ladder).unwrap();
+    let (ta, tb) = (run(&a).unwrap().tran.unwrap(), run(&b).unwrap().tran.unwrap());
+    let (oa, ob) = (
+        node_index(&a.circuit.node_names, "out"),
+        node_index(&b.circuit.node_names, "out"),
+    );
+    let (mut sq, mut worst, mut count) = (0.0f64, 0.0f64, 0usize);
+    let mut t = 0.1e-9;
+    while t < 6e-9 {
+        let d = tran_at(&ta, oa, t) - tran_at(&tb, ob, t);
+        sq += d * d;
+        worst = worst.max(d.abs());
+        count += 1;
+        t += 0.05e-9;
+    }
+    let rms = (sq / count as f64).sqrt();
+    assert!(rms < 0.06, "rms difference {rms} V over {count} samples (worst {worst})");
+    // After the first round trip the open end has doubled the incident half.
+    let late = tran_at(&tb, ob, 5.8e-9);
+    assert!((late - 1.0).abs() < 0.2, "settled far end {late}");
+    assert!(tran_at(&tb, ob, 0.4e-9) < 0.1, "nothing arrives before TD");
+}
+
+/// Series loss attenuates the arriving front: a matched 50 Ω load settles to
+/// the DC divider, strictly below the lossless value, and a lossier line sits
+/// lower still.
+#[test]
+fn series_loss_lowers_the_matched_line_level() {
+    let level = |r: f64| {
+        let deck = format!(
+            "* matched\nV1 s 0 PULSE(0 1 0 200p 200p 1 2)\nR1 s in 50\n\
+             O1 in 0 out 0 line N=12\nRL out 0 50\n\
+             .model line LTRA(R={r} L=50n C=20p LEN=1)\n.tran 100p 8n\n.end\n"
+        );
+        let n = parse(&deck).unwrap();
+        let out = node_index(&n.circuit.node_names, "out");
+        let t = run(&n).unwrap().tran.unwrap();
+        tran_at(&t, out, 7.9e-9)
+    };
+    let (lossless, mild, heavy) = (level(0.0), level(5.0), level(20.0));
+    assert!((lossless - 0.5).abs() < 0.01, "matched lossless divider {lossless}");
+    assert!(mild < lossless && heavy < mild, "{lossless} > {mild} > {heavy}");
+    // DC divider: 0.5·RL/(RL + R·LEN)·... = 1·50/(50 + 50 + R)
+    assert!((heavy - 50.0 / (100.0 + 20.0)).abs() < 0.01, "heavy {heavy}");
+}
+
+#[test]
+fn lossy_line_cards_fail_loudly_when_malformed() {
+    let base = |model: &str, card: &str| {
+        format!("* bad\nV1 in 0 DC 1\n{card}\nRL out 0 50\n{model}\n.op\n.end\n")
+    };
+    let line = ".model line LTRA(R=1 L=50n C=20p LEN=1)";
+    let cases = [
+        (base(line, "O1 in 0 out 0 nosuch"), "unknown LTRA model 'nosuch'"),
+        (base(".model line LTRA(R=1 L=50n C=20p)", "O1 in 0 out 0 line"), "missing LEN="),
+        (base(".model line LTRA(R=1 L=50n C=20p LEN=0)", "O1 in 0 out 0 line"), "LEN must be positive"),
+        (base(".model line LTRA(R=1 L=50n LEN=1)", "O1 in 0 out 0 line"), "C must be positive"),
+        (base(".model line LTRA(C=20p LEN=1)", "O1 in 0 out 0 line"), "needs L > 0"),
+        (base(".model line LTRA(R=-1 L=50n C=20p LEN=1)", "O1 in 0 out 0 line"), "cannot be negative"),
+        (base(line, "O1 in 0 out 5 line"), "share one return node"),
+        (base(line, "O1 in 0 out 0 line N=0"), "N= must be a whole number"),
+        (base(line, "O1 in 0 out 0 line N=1.5"), "N= must be a whole number"),
+        (base(line, "O1 in 0 out 0 line N=5000"), "outside 1..=1000"),
+        (base(line, "O1 in 0 out 0 line bogus"), "unexpected token"),
+        (base(line, "O1 in 0 out"), "O requires"),
+    ];
+    for (deck, needle) in cases {
+        let err = parse(&deck).unwrap_err().to_string();
+        assert!(err.contains(needle), "wanted '{needle}', got: {err}");
+    }
+    // A line referencing a model of another type (a resistor card) is no LTRA.
+    let wrong = base(".model line R(R=1k)", "O1 in 0 out 0 line");
+    assert!(parse(&wrong).unwrap_err().to_string().contains("unknown LTRA model"));
+}
+
+/// The model may follow its element, tuning knobs the lumped ladder lacks warn,
+/// and the element's `N=` beats the model's.
+#[test]
+fn lossy_line_model_order_warnings_and_section_precedence() {
+    let n = parse(
+        "* order\nV1 in 0 DC 1\nO1 in 0 out 0 line N=3\nRL out 0 50\n\
+         .model line LTRA(R=1 L=50n C=20p LEN=1 N=10 REL=1.2 ABS=1)\n.op\n.end\n",
+    )
+    .unwrap();
+    // 3 sections: R arms R·s1..s3 (+ L arms and 4 shunt caps).
+    let series = n.circuit.resistors.iter().filter(|r| r.name.contains("_s")).count();
+    assert_eq!(series, 3);
+    assert_eq!(n.circuit.capacitors.len(), 4);
+    let all = n.warnings.join("\n");
+    assert!(all.contains("REL, ABS do not apply to RSpice's lumped ladder"), "{all}");
+    // Without an element N=, the model's N applies; without either, 20.
+    let model_n = parse(
+        "* m\nV1 in 0 DC 1\nO1 in 0 out 0 line\nRL out 0 50\n.model line LTRA(R=1 L=50n C=20p LEN=1 N=10)\n.op\n.end\n",
+    )
+    .unwrap();
+    assert_eq!(model_n.circuit.capacitors.len(), 11);
+    let default_n = parse(
+        "* d\nV1 in 0 DC 1\nO1 in 0 out 0 line\nRL out 0 50\n.model line LTRA(R=1 L=50n C=20p LEN=1)\n.op\n.end\n",
+    )
+    .unwrap();
+    assert_eq!(default_n.circuit.capacitors.len(), circuitsim::circuit::LTRA_DEFAULT_SECTIONS + 1);
+}
+
+/// Inside a subcircuit the instance path mangles the line's nets and arms;
+/// the ladder still reads as plain passives and solves like the flat deck.
+#[test]
+fn lossy_line_inside_a_subcircuit_matches_the_flat_deck() {
+    let flat = "* flat\nV1 in 0 DC 10\nO1 in 0 out 0 line N=5\nRL out 0 50\n\
+                .model line LTRA(R=2 L=250n C=100p LEN=1)\n.op\n.end\n";
+    let hier = "* hier\nV1 in 0 DC 10\n\
+                .subckt wire a b\nO1 a 0 b 0 line N=5\n.ends\n\
+                X1 in out wire\nRL out 0 50\n\
+                .model line LTRA(R=2 L=250n C=100p LEN=1)\n.op\n.end\n";
+    let (a, b) = (dc_at(flat, "out"), dc_at(hier, "out"));
+    assert!((a - b).abs() < 1e-12, "{a} vs {b}");
+    let n = parse(hier).unwrap();
+    assert!(n.circuit.capacitors.iter().all(|c| c.name.starts_with("X1.CO1_c")), "{:?}",
+        n.circuit.capacitors.iter().map(|c| &c.name).collect::<Vec<_>>());
+}
+
+/// The expansion is plain elements, so the emitted deck has no `O` card, no
+/// pending line, and re-parses to the same solution.
+#[test]
+fn lossy_line_survives_emit_as_its_ladder() {
+    let n = parse(
+        "* rt\nV1 in 0 DC 10\nO1 in 0 out 0 line N=4\nRL out 0 50\n\
+         .model line LTRA(R=2 L=250n C=100p G=1m LEN=1)\n.op\n.end\n",
+    )
+    .unwrap();
+    let text = circuitsim::netlist::emit(&n);
+    assert!(!text.lines().any(|l| l.trim_start().to_ascii_uppercase().starts_with("O1")), "{text}");
+    let again = parse(&text).unwrap();
+    let idx = |net: &circuitsim::Netlist| node_index(&net.circuit.node_names, "out");
+    let v1 = run(&n).unwrap().dc.unwrap().node_voltages[idx(&n)];
+    let v2 = run(&again).unwrap().dc.unwrap().node_voltages[idx(&again)];
+    assert!((v1 - v2).abs() < 1e-12, "{v1} vs {v2}");
+}

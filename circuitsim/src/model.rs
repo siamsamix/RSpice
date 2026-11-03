@@ -204,6 +204,36 @@ pub struct MosfetModel {
     pub nss: Option<f64>,
     /// Gate-material type TPG — not stamped yet.
     pub tpg: Option<f64>,
+    /// Surface mobility UO (cm²/V·s); with `TOX` it derives `KP` when the
+    /// card omits `KP` (levels 2/3), and it sets the velocity-saturation
+    /// critical voltage on level 3.
+    pub uo: Option<f64>,
+    /// Lateral diffusion LD (m): `Leff = L − 2·LD` on levels 2/3.
+    pub ld: f64,
+    /// Width narrowing WD (m): `Weff = W − 2·WD` on levels 2/3.
+    pub wd: f64,
+    /// Maximum carrier drift velocity VMAX (m/s) — level 3 only.
+    pub vmax: Option<f64>,
+    /// Critical field for mobility degradation UCRIT (V/cm) — level 2.
+    pub ucrit: Option<f64>,
+    /// Critical-field exponent UEXP — level 2 (0/absent = no degradation).
+    pub uexp: Option<f64>,
+    /// Transverse-field coefficient UTRA — level 2.
+    pub utra: f64,
+    /// Mobility modulation THETA (1/V) — level 3.
+    pub theta: f64,
+    /// Static feedback ETA (drain-induced barrier lowering) — level 3.
+    pub eta: f64,
+    /// Saturation-field factor KAPPA — level 3.
+    pub kappa: f64,
+    /// Narrow-width threshold factor DELTA — level 3.
+    pub delta: f64,
+    /// Metallurgical junction depth XJ — stored, not modelled.
+    pub xj: Option<f64>,
+    /// Fast-surface-state density NFS — stored, not modelled.
+    pub nfs: Option<f64>,
+    /// Total channel-charge coefficient NEFF — stored, not modelled.
+    pub neff: Option<f64>,
     /// Reserved MC tolerance slot (`DEV`/`LOT` cards).
     pub tolerance: ModelTolerance,
 }
@@ -235,6 +265,20 @@ impl Default for MosfetModel {
             nsub: None,
             nss: None,
             tpg: None,
+            uo: None,
+            ld: 0.0,
+            wd: 0.0,
+            vmax: None,
+            ucrit: None,
+            uexp: None,
+            utra: 0.0,
+            theta: 0.0,
+            eta: 0.0,
+            kappa: 0.2,
+            delta: 0.0,
+            xj: None,
+            nfs: None,
+            neff: None,
             tolerance: ModelTolerance::default(),
         }
     }
@@ -940,7 +984,177 @@ impl MosfetModel {
             i_eq: ids - gds * vds - gm * vgs - gbs * vbs,
         }
     }
+
+    /// Gate-oxide capacitance per area `ε_ox/TOX` (F/m²) when the card has a
+    /// positive `TOX`.
+    pub fn cox(&self) -> Option<f64> {
+        self.tox.filter(|t| *t > 0.0).map(|t| EPS_OX / t)
+    }
+
+    /// Level-dispatching evaluation: the per-element `w`/`l` (m) are folded
+    /// here because levels 2 and 3 need the *effective* geometry (`LD`/`WD`)
+    /// and the channel length itself, not only `β`. Level 1 is exactly
+    /// [`MosfetModel::eval_at`] with `β = KP·W/L`, bit for bit.
+    pub fn eval_sized(
+        &self,
+        w: f64,
+        l: f64,
+        vgs: f64,
+        vds: f64,
+        vbs: f64,
+        temp_c: f64,
+    ) -> MosfetEval {
+        match self.level {
+            2 | 3 => self.eval_deep(w, l, vgs, vds, vbs, temp_c),
+            _ => self.eval_at(self.kp * (w / l), vgs, vds, vbs, temp_c),
+        }
+    }
+
+    /// Levels 2 and 3: one analytic current `ids_deep`, linearized by central
+    /// differences. The finite-difference Jacobian is accurate to ~1e-9
+    /// relative (step 1 µV), well inside the NR tolerance, and keeps one
+    /// source of truth for the (mobility-/velocity-/DIBL-coupled) equations.
+    fn eval_deep(&self, w: f64, l: f64, vgs: f64, vds: f64, vbs: f64, temp_c: f64) -> MosfetEval {
+        let (ids, on) = self.ids_deep(w, l, vgs, vds, vbs, temp_c);
+        if !on {
+            return MosfetEval {
+                ids: 0.0,
+                gm: G_LEAK,
+                gds: G_LEAK,
+                gbs: 0.0,
+                i_eq: -G_LEAK * vds - G_LEAK * vgs,
+            };
+        }
+        const H: f64 = 1e-6;
+        let at = |a: f64, b: f64, c: f64| self.ids_deep(w, l, a, b, c, temp_c).0;
+        let gm = (at(vgs + H, vds, vbs) - at(vgs - H, vds, vbs)) / (2.0 * H);
+        let gds = (at(vgs, vds + H, vbs) - at(vgs, vds - H, vbs)) / (2.0 * H);
+        let gbs = (at(vgs, vds, vbs + H) - at(vgs, vds, vbs - H)) / (2.0 * H);
+        let (gm, gds, gbs) = (gm.max(0.0), gds.max(GDS_FLOOR), gbs.max(0.0));
+        MosfetEval {
+            ids,
+            gm,
+            gds,
+            gbs,
+            i_eq: ids - gds * vds - gm * vgs - gbs * vbs,
+        }
+    }
+
+    /// Drain current of the level-2 (Grove–Frohman) or level-3
+    /// (semi-empirical) equations in the NMOS-normalized bias space, plus
+    /// whether the channel is on (`false` = cut-off, `ids = 0`).
+    ///
+    /// *Level 2* integrates the bulk-charge term exactly:
+    /// `Ids = β·μf·[(Vgs−Vfb−φ−Vde/2)·Vde − ⅔γ((φ+Vsb+Vde)^1.5 − (φ+Vsb)^1.5)]·(1+λVds)`
+    /// with `Vdsat` the closed-form root of `∂Ids/∂Vds = 0`, and `μf` the
+    /// critical-field mobility reduction (`UCRIT`/`UEXP`/`UTRA`, needs `TOX`).
+    /// With `γ = 0`, `UEXP = 0` it collapses to the level-1 equations.
+    ///
+    /// *Level 3* is `Ids = β/(1+θ·Vov) · [Vov − (1+fb)/2·Vde]·Vde`, threshold
+    /// lowered by drain bias (`ETA`, DIBL), narrow-width term `DELTA`, a
+    /// velocity-saturation `Vdsat` and `1/(1+Vde/Vc)` factor under `VMAX`, and
+    /// the `KAPPA` saturation-field channel-length shortening (needs `NSUB`).
+    /// `LAMBDA` does not act on level 3, as in the reference SPICE.
+    ///
+    /// Documented interpretation: the short-channel `XJ` factor, narrow-width
+    /// `NFS` weak inversion and `NEFF` charge terms are parsed and kept but
+    /// not modelled (the parser warns).
+    fn ids_deep(&self, w: f64, l: f64, vgs: f64, vds: f64, vbs: f64, temp_c: f64) -> (f64, bool) {
+        let leff = (l - 2.0 * self.ld).max(l * 1e-3);
+        let weff = (w - 2.0 * self.wd).max(w * 1e-3);
+        let t_ratio = (ZERO_CELSIUS_K + temp_c) / (ZERO_CELSIUS_K + self.tnom);
+        let beta = self.kp * (weff / leff) * t_ratio.powf(self.bex);
+        let vto = if self.kind == MosfetType::Pmos { -self.vth0 } else { self.vth0 };
+        let vto = vto - self.tcv * (temp_c - self.tnom);
+        let gamma = self.gamma;
+        let phi = self.phi.abs();
+        let vsb = -vbs;
+        let s1 = (phi + vsb).max(0.0);
+        let vbi = vto - gamma * phi.sqrt();
+
+        if self.level == 2 {
+            let von = vbi + gamma * s1.sqrt();
+            let vgst = vgs - von;
+            if vgst <= 0.0 {
+                return (0.0, false);
+            }
+            let vfb = vbi - phi;
+            let a = vgs - vfb + vsb;
+            let x = 0.5 * (-gamma + (gamma * gamma + 4.0 * a).sqrt());
+            let vdsat = (x * x - phi - vsb).max(0.0);
+            let vde = vds.min(vdsat);
+            let muf = match (self.cox(), self.ucrit, self.uexp) {
+                (Some(cox), Some(ucrit), Some(uexp)) if uexp > 0.0 => {
+                    let field = (vgst - self.utra * vde).max(1e-6);
+                    (ucrit * 100.0 * EPS_SI / cox / field).powf(uexp).min(1.0)
+                }
+                _ => 1.0,
+            };
+            let body = (s1 + vde).max(0.0).powf(1.5) - s1.powf(1.5);
+            let f = (vgs - vfb - phi - 0.5 * vde) * vde - (2.0 / 3.0) * gamma * body;
+            return (beta * muf * f * (1.0 + self.lambda * vds), true);
+        }
+
+        // Level 3.
+        let cox = self.cox();
+        let sigma = match cox {
+            Some(c) if self.eta != 0.0 => self.eta * 8.15e-22 / (c * leff.powi(3)),
+            _ => 0.0,
+        };
+        let fnarrow = match cox {
+            Some(c) if self.delta != 0.0 => {
+                self.delta * std::f64::consts::PI * EPS_SI / (2.0 * c * weff)
+            }
+            _ => 0.0,
+        };
+        let von = vbi - sigma * vds + gamma * s1.sqrt() + fnarrow * s1;
+        let vgst = vgs - von;
+        if vgst <= 0.0 {
+            return (0.0, false);
+        }
+        let fb = gamma / (4.0 * s1.sqrt().max(1e-3)) + fnarrow;
+        let ufact = 1.0 / (1.0 + self.theta * vgst).max(1e-3);
+        let betap = beta * ufact;
+        let vdsat0 = vgst / (1.0 + fb);
+        let mu0 = self.uo.map(|u| u * 1e-4).or_else(|| cox.map(|c| self.kp / c));
+        let vc = match (self.vmax, mu0) {
+            (Some(vmax), Some(mu)) if vmax > 0.0 && mu > 0.0 => {
+                Some(vmax * leff / (mu * ufact))
+            }
+            _ => None,
+        };
+        let vdsat = match vc {
+            Some(vc) => vdsat0 + vc - (vdsat0 * vdsat0 + vc * vc).sqrt(),
+            None => vdsat0,
+        };
+        let vde = vds.min(vdsat);
+        let mut ids = betap * (vgst - 0.5 * (1.0 + fb) * vde) * vde;
+        if let Some(vc) = vc {
+            ids /= 1.0 + vde / vc;
+        }
+        if self.kappa > 0.0 {
+            if let Some(nsub) = self.nsub.filter(|n| *n > 0.0) {
+                let alpha = EPS_SI / (ELECTRON_CHARGE * nsub * 1e6);
+                // ΔL = √(κ·α·(Vds − Vdsat)) has an infinite slope at Vdsat,
+                // which would make the finite-difference gds explode within
+                // microvolts of the knee. The positive part of (Vds − Vdsat)
+                // is smoothed over 10 µV: the change is < 1e-10 relative
+                // away from the knee and ≈ 0.03 % of ΔL/L at it.
+                const KNEE: f64 = 1e-5;
+                let d = vds - vdsat;
+                let over = 0.5 * (d + (d * d + KNEE * KNEE).sqrt());
+                let dl = (self.kappa * alpha * over).sqrt();
+                ids /= (1.0 - dl / leff).max(0.1);
+            }
+        }
+        (ids, true)
+    }
 }
+
+/// Silicon permittivity ε_si = 11.7·ε₀ (F/m).
+pub const EPS_SI: f64 = 11.7 * 8.854187817e-12;
+/// Silicon-dioxide permittivity ε_ox = 3.9·ε₀ (F/m).
+pub const EPS_OX: f64 = 3.9 * 8.854187817e-12;
 
 // ─── Tests ──────────────────────────────────────────────────────────────────
 //
@@ -999,7 +1213,7 @@ mod tests {
             nsub: None,
             nss: None,
             tpg: None,
-            tolerance: ModelTolerance::default(),
+            ..MosfetModel::default()
         }
     }
 
@@ -1451,5 +1665,223 @@ mod tests {
         assert_relative_eq!(p.ic, -n.ic, max_relative = 1e-14);
         assert_relative_eq!(p.ib, -n.ib, max_relative = 1e-14);
         assert_relative_eq!(p.ie, -n.ie, max_relative = 1e-14);
+    }
+
+    // ─── MOSFET levels 2 and 3 ───────────────────────────────────────────────
+    //
+    // References were computed independently in Python (15-digit arithmetic,
+    // written out as literals), not read off the implementation.
+
+    /// β = 2e-4 at w = l = 1, γ = 0.4, φ = 0.6, VTO = 0.7.
+    fn level2() -> MosfetModel {
+        MosfetModel { level: 2, gamma: 0.4, phi: 0.6, ..test_model() }
+    }
+
+    /// Level 3 reference card: TOX = 20 nm (Cox = 1.7266e-3 F/m²), β = 2e-3
+    /// at w/l = 10, θ = 0.1.
+    fn level3() -> MosfetModel {
+        MosfetModel {
+            level: 3,
+            gamma: 0.4,
+            phi: 0.6,
+            theta: 0.1,
+            tox: Some(20e-9),
+            ..test_model()
+        }
+    }
+
+    fn ids2(m: &MosfetModel, vgs: f64, vds: f64, vbs: f64) -> f64 {
+        m.eval_sized(1.0, 1.0, vgs, vds, vbs, 27.0).ids
+    }
+
+    fn ids3(m: &MosfetModel, vgs: f64, vds: f64, vbs: f64) -> f64 {
+        m.eval_sized(10e-6, 1e-6, vgs, vds, vbs, 27.0).ids
+    }
+
+    #[test]
+    fn level_one_through_eval_sized_is_eval_at_bit_for_bit() {
+        let m = test_model();
+        for &(vgs, vds, vbs) in &[(2.0, 0.5, 0.0), (2.0, 3.0, -1.0), (0.3, 1.0, 0.0)] {
+            let a = m.eval_sized(4e-6, 2e-6, vgs, vds, vbs, 50.0);
+            let b = m.eval_at(m.kp * (4e-6 / 2e-6), vgs, vds, vbs, 50.0);
+            assert_eq!(
+                (a.ids, a.gm, a.gds, a.gbs, a.i_eq),
+                (b.ids, b.gm, b.gds, b.gbs, b.i_eq)
+            );
+        }
+    }
+
+    #[test]
+    fn level2_matches_grove_frohman_reference() {
+        let m = level2();
+        // Triode, saturation (Vdsat = 0.96875 at Vsb = 1), Vsb = 0, deep triode.
+        assert_relative_eq!(ids2(&m, 2.0, 0.5, -1.0), 8.161952467941834e-05, max_relative = 1e-12);
+        assert_relative_eq!(ids2(&m, 2.0, 3.0, -1.0), 1.0642337326472922e-04, max_relative = 1e-12);
+        assert_relative_eq!(ids2(&m, 2.0, 3.0, 0.0), 1.3974859189601707e-04, max_relative = 1e-12);
+        assert_relative_eq!(ids2(&m, 1.5, 0.1, -2.0), 8.173910064513213e-06, max_relative = 1e-12);
+        // λ multiplies the whole characteristic: 1 + 0.05·3 = 1.15.
+        let lam = MosfetModel { lambda: 0.05, ..level2() };
+        assert_relative_eq!(ids2(&lam, 2.0, 3.0, -1.0), 1.223868792544386e-04, max_relative = 1e-12);
+    }
+
+    /// γ = 0 removes the bulk-charge term: level 2 is the level-1 square law.
+    #[test]
+    fn level2_without_body_charge_is_level_one() {
+        let l1 = test_model();
+        let l2 = MosfetModel { level: 2, ..test_model() };
+        for &vgs in &[0.9, 1.4, 2.0, 3.3] {
+            for &vds in &[0.05, 0.4, 1.0, 2.5, 5.0] {
+                let a = l1.eval_at(2e-4, vgs, vds, 0.0, 27.0);
+                let b = l2.eval_sized(1.0, 1.0, vgs, vds, 0.0, 27.0);
+                assert_relative_eq!(b.ids, a.ids, max_relative = 1e-10);
+                assert_relative_eq!(b.gm, a.gm, max_relative = 1e-5, epsilon = 1e-9);
+                assert_relative_eq!(b.gds, a.gds, max_relative = 1e-5, epsilon = 1e-9);
+                assert_eq!(b.gbs, 0.0);
+            }
+        }
+    }
+
+    #[test]
+    fn level2_body_charge_lowers_current_and_has_body_transconductance() {
+        let m = level2();
+        let flat = m.eval_sized(1.0, 1.0, 2.0, 3.0, 0.0, 27.0);
+        let back = m.eval_sized(1.0, 1.0, 2.0, 3.0, -1.0, 27.0);
+        assert!(back.ids < flat.ids);
+        // Reverse body bias deepens the depletion charge: ids rises with vbs.
+        assert!(back.gbs > 0.0);
+        // The linearization is a true tangent: i_eq closes at the bias point.
+        assert_relative_eq!(
+            back.gm * 2.0 + back.gds * 3.0 + back.gbs * -1.0 + back.i_eq,
+            back.ids,
+            max_relative = 1e-12
+        );
+        // Mirrors the closed-form Vdsat: just across it the current is continuous.
+        let vdsat = 0.9687463110379926;
+        assert_relative_eq!(
+            ids2(&m, 2.0, vdsat - 1e-9, -1.0),
+            ids2(&m, 2.0, vdsat + 1e-9, -1.0),
+            max_relative = 1e-7
+        );
+    }
+
+    #[test]
+    fn level2_critical_field_reduces_mobility() {
+        let plain = MosfetModel { tox: Some(20e-9), ..level2() };
+        let field = MosfetModel { ucrit: Some(1e4), uexp: Some(0.2), ..plain.clone() };
+        // At 2 V gate drive: (1e4·100·ε_si/Cox / Vov)^0.2 < 1.
+        let a = ids2(&plain, 2.0, 0.3, 0.0);
+        let b = ids2(&field, 2.0, 0.3, 0.0);
+        assert!(b < a && b > 0.4 * a, "plain {a}, degraded {b}");
+        // A huge critical field means no degradation at all.
+        let off = MosfetModel { ucrit: Some(1e12), uexp: Some(0.2), ..plain.clone() };
+        assert_eq!(ids2(&off, 2.0, 0.3, 0.0), a);
+        // UTRA subtracts Vds from the transverse-field drive (the reference
+        // `(Vgs − Von − UTRA·Vds)` law), so the degradation relaxes.
+        let utra = MosfetModel { utra: 0.5, ..field.clone() };
+        let c = ids2(&utra, 2.0, 0.3, 0.0);
+        assert!(c > b && c < a, "plain {a}, utra {c}, degraded {b}");
+        // Without TOX the mobility term is inert.
+        let no_tox = MosfetModel { tox: None, ..field };
+        assert_eq!(ids2(&no_tox, 2.0, 0.3, 0.0), a);
+    }
+
+    #[test]
+    fn level2_effective_geometry_scales_the_current() {
+        // γ = 0: current is exactly ∝ Weff/Leff. LD = 0.1 on L = 1 → Leff = 0.8.
+        let base = MosfetModel { level: 2, ..test_model() };
+        let narrowed = MosfetModel { ld: 0.1, wd: 0.1, ..base.clone() };
+        let ratio = ids2(&narrowed, 2.0, 0.3, 0.0) / ids2(&base, 2.0, 0.3, 0.0);
+        assert_relative_eq!(ratio, 0.8 / 0.8, max_relative = 1e-12);
+        let long = MosfetModel { ld: 0.1, ..base.clone() };
+        assert_relative_eq!(
+            ids2(&long, 2.0, 0.3, 0.0) / ids2(&base, 2.0, 0.3, 0.0),
+            1.0 / 0.8,
+            max_relative = 1e-12
+        );
+    }
+
+    #[test]
+    fn level3_matches_semi_empirical_reference() {
+        let m = level3();
+        // Triode, saturation, body-biased saturation.
+        assert_relative_eq!(ids3(&m, 2.0, 0.3, 0.0), 6.003372123552016e-04, max_relative = 1e-12);
+        assert_relative_eq!(ids3(&m, 2.0, 3.0, 0.0), 1.3245735156715006e-03, max_relative = 1e-12);
+        assert_relative_eq!(ids3(&m, 2.0, 3.0, -1.0), 1.0169984752362528e-03, max_relative = 1e-12);
+        // ETA (drain-induced barrier lowering): the threshold falls with Vds.
+        let dibl = MosfetModel { eta: 0.5, ..level3() };
+        assert_relative_eq!(ids3(&dibl, 2.0, 3.0, 0.0), 2.974030354977688e-03, max_relative = 1e-12);
+        // Velocity saturation (VMAX with UO from KP/Cox), KAPPA with NSUB, DELTA.
+        let vsat = MosfetModel { vmax: Some(1e5), ..level3() };
+        assert_relative_eq!(ids3(&vsat, 2.0, 3.0, 0.0), 6.368173510658481e-04, max_relative = 1e-12);
+        let clm = MosfetModel { nsub: Some(1e16), ..level3() };
+        // (the 10 µV knee smoothing moves this point by < 1e-10 relative)
+        assert_relative_eq!(ids3(&clm, 2.0, 3.0, 0.0), 1.566829822663347e-03, max_relative = 1e-9);
+        let narrow = MosfetModel { delta: 1.0, ..level3() };
+        assert_relative_eq!(ids3(&narrow, 2.0, 3.0, 0.0), 1.3028573292107593e-03, max_relative = 1e-12);
+    }
+
+    /// θ = γ = 0 and nothing else: level 3 is the level-1 square law too.
+    #[test]
+    fn level3_bare_card_is_level_one() {
+        let l1 = test_model();
+        let l3 = MosfetModel { level: 3, kappa: 0.0, ..test_model() };
+        for &vgs in &[0.9, 2.0, 3.3] {
+            for &vds in &[0.05, 1.0, 5.0] {
+                let a = l1.eval_at(2e-4, vgs, vds, 0.0, 27.0).ids;
+                let b = l3.eval_sized(1.0, 1.0, vgs, vds, 0.0, 27.0).ids;
+                assert_relative_eq!(b, a, max_relative = 1e-10);
+            }
+        }
+    }
+
+    #[test]
+    fn level3_velocity_saturation_limits() {
+        let none = ids3(&level3(), 2.0, 3.0, 0.0);
+        // A huge drift velocity is no limit at all.
+        let fast = MosfetModel { vmax: Some(1e12), ..level3() };
+        assert_relative_eq!(ids3(&fast, 2.0, 3.0, 0.0), none, max_relative = 1e-5);
+        // Slower carriers saturate earlier and lower.
+        let mut last = none;
+        for vmax in [1e6, 1e5, 1e4] {
+            let m = MosfetModel { vmax: Some(vmax), ..level3() };
+            let i = ids3(&m, 2.0, 3.0, 0.0);
+            assert!(i < last, "vmax {vmax}: {i} !< {last}");
+            last = i;
+        }
+        // Without UO or TOX the card has no critical voltage: inert.
+        let inert = MosfetModel { vmax: Some(1e4), tox: None, ..level3() };
+        assert_eq!(ids3(&inert, 2.0, 3.0, 0.0), none);
+    }
+
+    #[test]
+    fn level3_mobility_modulation_and_kappa_continuity() {
+        let m = level3();
+        let sharp = MosfetModel { theta: 0.5, ..level3() };
+        assert!(ids3(&sharp, 2.0, 3.0, 0.0) < ids3(&m, 2.0, 3.0, 0.0));
+        // KAPPA shortening starts at zero at Vdsat: current is continuous there
+        // (Vdsat = Vov/(1+fb) with Vov = 2 − Von).
+        let clm = MosfetModel { nsub: Some(1e16), ..level3() };
+        let at = |vds: f64| clm.eval_sized(10e-6, 1e-6, 2.0, vds, 0.0, 27.0).ids;
+        let vbi = 0.7 - 0.4 * 0.6_f64.sqrt();
+        let von = vbi + 0.4 * 0.6_f64.sqrt();
+        let fb = 0.4 / (4.0 * 0.6_f64.sqrt());
+        let vdsat = (2.0 - von) / (1.0 + fb);
+        assert_relative_eq!(at(vdsat - 1e-9), at(vdsat + 1e-9), max_relative = 1e-6);
+        assert!(at(vdsat + 1.0) > at(vdsat), "CLM must keep raising the current");
+        // The knee is smooth: gds stays finite and modest right at Vdsat
+        // (an unsmoothed √ knee would report ~1e2 S there).
+        let knee = clm.eval_sized(10e-6, 1e-6, 2.0, vdsat, 0.0, 27.0);
+        assert!(knee.gds.is_finite() && knee.gds < 0.1, "knee gds {}", knee.gds);
+    }
+
+    #[test]
+    fn levels_two_and_three_cut_off_below_threshold() {
+        for m in [level2(), level3()] {
+            let e = m.eval_sized(1.0, 1.0, 0.4, 2.0, 0.0, 27.0);
+            assert_eq!(e.ids, 0.0);
+            assert_eq!(e.gm, G_LEAK);
+            assert_eq!(e.gds, G_LEAK);
+            assert_eq!(e.gbs, 0.0);
+        }
     }
 }

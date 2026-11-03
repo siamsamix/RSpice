@@ -140,9 +140,8 @@ pub fn compute_branch_currents(
         let vg = sign * node_voltage(solution, m.ng);
         let vs = sign * node_voltage(solution, m.ns);
         let vb = sign * node_voltage(solution, m.nb);
-        let beta = model.kp * (m.w / m.l);
         // Raw Vds here: reports the physical model current, as before.
-        mosfets.push(sign * model.eval_at(beta, vg - vs, vd - vs, vb - vs, circuit.temperature).ids);
+        mosfets.push(sign * model.eval_sized(m.w, m.l, vg - vs, vd - vs, vb - vs, circuit.temperature).ids);
     }
 
     let mut bjts = Vec::with_capacity(circuit.bjts.len());
@@ -376,8 +375,7 @@ pub fn compute_ac_branch_currents(
         let vs_dc = sign * node_voltage(dc_solution, m.ns);
         let vb_dc = sign * node_voltage(dc_solution, m.nb);
 
-        let beta = model.kp * (m.w / m.l);
-        let ev = model.eval_at(beta, vg_dc - vs_dc, vd_dc - vs_dc, vb_dc - vs_dc, circuit.temperature);
+        let ev = model.eval_sized(m.w, m.l, vg_dc - vs_dc, vd_dc - vs_dc, vb_dc - vs_dc, circuit.temperature);
         let gm = ev.gm;
         let gds = ev.gds;
         let gbs = ev.gbs;

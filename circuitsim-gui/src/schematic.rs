@@ -8,7 +8,10 @@ use circuitsim::circuit::{
     Capacitor as CsCapacitor, Circuit as CsCircuit, Inductor as CsInductor, NodeId,
     Resistor as CsResistor, VoltageSource as CsVoltageSource,
 };
-use circuitsim::netlist::{parse, AcCommand, AcScale, AnalysisCommands, Netlist, ParseOptions};
+use circuitsim::netlist::{
+    deck_directives, emit as netlist_emit, parse, AcCommand, AcScale, AnalysisCommands, Netlist,
+    ParseOptions,
+};
 use circuitsim::units::parse_value;
 use egui::{Pos2, Vec2};
 use std::collections::{HashMap, HashSet};
@@ -26,7 +29,7 @@ const FIT_MARGIN: f32 = 60.0;
 /// would otherwise "fit" at the zoom limit.
 const FIT_MAX_ZOOM: f32 = 2.0;
 
-#[derive(Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct GridPt(pub i32, pub i32);
 
 impl GridPt {
@@ -109,6 +112,82 @@ pub struct Wire {
     pub p2: GridPt,
 }
 
+/// A net label: the name of the net its anchor point sits on. Labels that
+/// spell the same name (case-insensitively, as SPICE nodes are) are one net
+/// even with no wire between them; `0` and `gnd` label ground.
+#[derive(Clone, PartialEq, Debug)]
+pub struct NetLabel {
+    pub at: GridPt,
+    pub name: String,
+}
+
+/// SPICE text placed on the canvas — a `.meas`, `.model`, `.step`, `.include`
+/// or a whole `.subckt` block — written into the generated deck verbatim.
+/// `text` may span several lines.
+#[derive(Clone, PartialEq, Debug)]
+pub struct Directive {
+    pub at: GridPt,
+    pub text: String,
+}
+
+/// One selected annotation (label or directive), by index.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Note {
+    Label(usize),
+    Directive(usize),
+}
+
+/// Whether `name` is a ground alias (`0`, `gnd`).
+fn is_ground_name(name: &str) -> bool {
+    name == "0" || name.eq_ignore_ascii_case("gnd")
+}
+
+/// Validate and normalize a net label: trimmed, one token, nothing the deck
+/// grammar would read as structure, and no bare number other than `0` — a
+/// numeric name would fight the numbered nodes of unlabeled nets.
+pub fn check_net_name(raw: &str) -> Result<String, String> {
+    let name = raw.trim();
+    if name.is_empty() {
+        return Err("net name is empty".into());
+    }
+    if let Some(bad) = name
+        .chars()
+        .find(|c| c.is_whitespace() || "{}()[],;=*\"'".contains(*c))
+    {
+        return Err(format!("net name '{name}' cannot contain '{bad}'"));
+    }
+    if name.starts_with('.') || name.starts_with('+') {
+        return Err(format!("net name '{name}' cannot start with '{}'", &name[..1]));
+    }
+    if name.chars().all(|c| c.is_ascii_digit()) && name != "0" {
+        return Err(format!(
+            "net name '{name}' is a bare number; numbers are reserved for unlabeled nets (use 0 for ground)"
+        ));
+    }
+    Ok(name.to_string())
+}
+
+/// The first word of every dot line in a directive's text, lowercased.
+fn directive_words(text: &str) -> impl Iterator<Item = String> + '_ {
+    text.lines().filter_map(|line| {
+        let word = line.split_whitespace().next()?;
+        word.starts_with('.').then(|| word.to_ascii_lowercase())
+    })
+}
+
+/// Validate a directive's text: non-blank, and no `.end` (the writer owns the
+/// deck's terminator; a stray one would cut the deck short).
+pub fn check_directive(raw: &str) -> Result<String, String> {
+    let text = raw.trim();
+    if text.is_empty() {
+        return Err("directive text is empty".into());
+    }
+    if directive_words(text).any(|w| w == ".end") {
+        return Err("`.end` is added to the deck automatically — remove it from the directive".into());
+    }
+    Ok(text.to_string())
+}
+
 /// SPICE node assignment over the schematic: every grid point maps to a node
 /// number (ground roots = 0, all other components' nodes numbered 1..n in
 /// sorted-grid order, deterministic frame to frame).
@@ -119,11 +198,18 @@ pub struct NodeAssignment {
     /// numbering. (The painter iterates this to place one label per node.)
     pub pt_list: Vec<GridPt>,
     pt_to_node: HashMap<GridPt, usize>,
+    /// Every distinct label name on a node, in label order (first spelling
+    /// per case-insensitive name). Ground's `0`/`gnd` aliases are not names.
+    names: HashMap<usize, Vec<String>>,
 }
 
 impl NodeAssignment {
-    /// Assign SPICE node numbers to the schematic's points.
-    pub fn of(components: &[Component], wires: &[Wire]) -> Self {
+    /// Assign SPICE node numbers to the schematic's points. Labels join the
+    /// point set, merge every net that shares a name, and ground the nets
+    /// labeled `0`/`gnd`; numbering of the remaining nets stays first-seen in
+    /// sorted point order, so a schematic without labels numbers exactly as
+    /// it always did.
+    pub fn of(components: &[Component], wires: &[Wire], labels: &[NetLabel]) -> Self {
         // 1. Collect all unique grid points touched by components or wires
         //    (a ground's p2 equals its p1 everywhere the editor creates them;
         //    including it here matches the historical writer exactly).
@@ -135,6 +221,9 @@ impl NodeAssignment {
         for w in wires {
             points.insert(w.p1);
             points.insert(w.p2);
+        }
+        for l in labels {
+            points.insert(l.at);
         }
 
         let mut pt_list: Vec<GridPt> = points.into_iter().collect();
@@ -151,13 +240,31 @@ impl NodeAssignment {
             dsu.union(i1, i2);
         }
 
-        // 3. Ground roots are forced to node 0.
+        // 2b. One name, one net: labels spelling the same name merge.
+        let mut first_with_name: HashMap<String, usize> = HashMap::new();
+        for l in labels {
+            let idx = pt_to_idx[&l.at];
+            match first_with_name.entry(l.name.to_ascii_lowercase()) {
+                std::collections::hash_map::Entry::Occupied(e) => dsu.union(*e.get(), idx),
+                std::collections::hash_map::Entry::Vacant(e) => {
+                    e.insert(idx);
+                }
+            }
+        }
+
+        // 3. Ground roots are forced to node 0 — by a ground symbol or a
+        //    `0`/`gnd` label.
         let mut ground_roots = HashSet::new();
         for c in components {
             if c.kind == CompKind::Ground {
                 if let Some(&idx) = pt_to_idx.get(&c.p1) {
                     ground_roots.insert(dsu.find(idx));
                 }
+            }
+        }
+        for l in labels {
+            if is_ground_name(&l.name) {
+                ground_roots.insert(dsu.find(pt_to_idx[&l.at]));
             }
         }
 
@@ -177,7 +284,7 @@ impl NodeAssignment {
             });
         }
 
-        let pt_to_node = pt_list
+        let pt_to_node: HashMap<GridPt, usize> = pt_list
             .iter()
             .enumerate()
             .map(|(i, &pt)| {
@@ -185,12 +292,55 @@ impl NodeAssignment {
                 (pt, root)
             })
             .collect();
-        Self { pt_list, pt_to_node }
+
+        // 5. Collect each node's distinct label names.
+        let mut names: HashMap<usize, Vec<String>> = HashMap::new();
+        for l in labels {
+            if is_ground_name(&l.name) {
+                continue;
+            }
+            let entry = names.entry(pt_to_node[&l.at]).or_default();
+            if !entry.iter().any(|n| n.eq_ignore_ascii_case(&l.name)) {
+                entry.push(l.name.clone());
+            }
+        }
+        Self { pt_list, pt_to_node, names }
     }
 
     /// SPICE node id at a grid point.
     pub fn node_of(&self, pt: GridPt) -> usize {
         self.pt_to_node[&pt]
+    }
+
+    /// The label name of a node (its first one, if two disagree — see
+    /// [`Self::conflicts`]); `None` for unlabeled nets and for ground.
+    pub fn name_of(&self, node: usize) -> Option<&str> {
+        self.names.get(&node).and_then(|v| v.first()).map(String::as_str)
+    }
+
+    /// Nets that cannot be named consistently, one sentence each: a net
+    /// carrying two different labels, or ground carrying any name besides
+    /// its aliases. The deck would have to pick one silently, so the netlist
+    /// writer refuses instead.
+    pub fn conflicts(&self) -> Vec<String> {
+        let mut nodes: Vec<usize> = self.names.keys().copied().collect();
+        nodes.sort_unstable();
+        let mut out = Vec::new();
+        for node in nodes {
+            let names = &self.names[&node];
+            if node == 0 {
+                out.push(format!(
+                    "ground is also labeled '{}' — a net cannot be both ground and named",
+                    names[0]
+                ));
+            } else if names.len() > 1 {
+                out.push(format!(
+                    "one net carries two labels, '{}' and '{}'",
+                    names[0], names[1]
+                ));
+            }
+        }
+        out
     }
 }
 
@@ -253,7 +403,7 @@ impl Direction {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Tool { Select, Wire, R, C, L, V, Gnd }
+pub enum Tool { Select, Wire, R, C, L, V, Gnd, Label, Directive }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AnalysisType { Tran, Ac }
@@ -270,6 +420,13 @@ pub struct SchematicState {
     pub tool: Tool,
     pub components: Vec<Component>,
     pub wires: Vec<Wire>,
+    pub labels: Vec<NetLabel>,
+    pub directives: Vec<Directive>,
+    /// The annotation under the Select tool's cursor, by index.
+    pub selected_note: Option<Note>,
+    /// Text armed for the Label / Directive tool: the next canvas click
+    /// drops it (see [`SchematicState::place_note`]).
+    pub pending_text: String,
     pub active_wire_start: Option<GridPt>,
     pub current_dir: Direction,
     pub selected_component: Option<usize>,
@@ -292,6 +449,10 @@ impl Default for SchematicState {
             tool: Tool::Select,
             components: vec![],
             wires: vec![],
+            labels: vec![],
+            directives: vec![],
+            selected_note: None,
+            pending_text: String::new(),
             active_wire_start: None,
             current_dir: Direction::Down,
             selected_component: None,
@@ -337,13 +498,18 @@ impl SchematicState {
         else {
             return false;
         };
-        // Keep wires attached to the rotated pin
+        // Keep wires and labels attached to the rotated pin
         for w in self.wires.iter_mut() {
             if w.p1 == old_p2 {
                 w.p1 = new_p2;
             }
             if w.p2 == old_p2 {
                 w.p2 = new_p2;
+            }
+        }
+        for l in self.labels.iter_mut() {
+            if l.at == old_p2 {
+                l.at = new_p2;
             }
         }
         true
@@ -372,6 +538,13 @@ impl SchematicState {
             if w.p2 == pins.0 || w.p2 == pins.1 {
                 w.p2.0 += dx;
                 w.p2.1 += dy;
+            }
+        }
+        // A label sitting on a pin names that pin's net: it travels with it.
+        for l in self.labels.iter_mut() {
+            if l.at == pins.0 || l.at == pins.1 {
+                l.at.0 += dx;
+                l.at.1 += dy;
             }
         }
         true
@@ -424,19 +597,96 @@ impl SchematicState {
     pub fn select(&mut self, component: Option<usize>, wire: Option<usize>) {
         self.selected_component = component;
         self.selected_wire = wire;
+        self.selected_note = None;
+    }
+
+    /// Select one annotation (and nothing else), or none.
+    pub fn select_note(&mut self, note: Option<Note>) {
+        self.selected_component = None;
+        self.selected_wire = None;
+        self.selected_note = note;
     }
 
     /// Deselect everything.
     pub fn clear_selection(&mut self) {
         self.selected_component = None;
         self.selected_wire = None;
+        self.selected_note = None;
     }
 
     /// Right click: cancel the in-flight wire and drop any selection.
     pub fn cancel_gesture(&mut self) {
         self.active_wire_start = None;
-        self.selected_component = None;
-        self.selected_wire = None;
+        self.clear_selection();
+    }
+
+    // ── Annotations: net labels and SPICE directives ────────────────────────
+
+    /// Arm the Label tool with `name` (validated now, so a bad name is
+    /// refused at the dialog, not after the click).
+    pub fn arm_label(&mut self, name: &str) -> Result<(), String> {
+        self.pending_text = check_net_name(name)?;
+        self.tool = Tool::Label;
+        Ok(())
+    }
+
+    /// Arm the Directive tool with `text` (validated now).
+    pub fn arm_directive(&mut self, text: &str) -> Result<(), String> {
+        self.pending_text = check_directive(text)?;
+        self.tool = Tool::Directive;
+        Ok(())
+    }
+
+    /// One click of the Label / Directive tool: drop the armed text at `at`
+    /// and fall back to Select (one placement per arming, as in LTspice's
+    /// dialog-then-click flow). A label dropped where one already sits
+    /// renames it instead of stacking a second. True if something was placed.
+    pub fn place_note(&mut self, at: GridPt) -> bool {
+        let text = std::mem::take(&mut self.pending_text);
+        if text.is_empty() {
+            return false;
+        }
+        match self.tool {
+            Tool::Label => {
+                match self.labels.iter_mut().find(|l| l.at == at) {
+                    Some(existing) => existing.name = text,
+                    None => self.labels.push(NetLabel { at, name: text }),
+                }
+            }
+            Tool::Directive => self.directives.push(Directive { at, text }),
+            _ => return false,
+        }
+        self.tool = Tool::Select;
+        true
+    }
+
+    /// Replace the text of the annotation `note` (the edit popup's OK).
+    pub fn edit_note(&mut self, note: Note, text: &str) -> Result<(), String> {
+        match note {
+            Note::Label(i) => {
+                let name = check_net_name(text)?;
+                self.labels.get_mut(i).ok_or("no such label")?.name = name;
+            }
+            Note::Directive(i) => {
+                let text = check_directive(text)?;
+                self.directives.get_mut(i).ok_or("no such directive")?.text = text;
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove one annotation.
+    pub fn delete_note(&mut self, note: Note) {
+        match note {
+            Note::Label(i) if i < self.labels.len() => {
+                self.labels.remove(i);
+            }
+            Note::Directive(i) if i < self.directives.len() => {
+                self.directives.remove(i);
+            }
+            _ => {}
+        }
+        self.selected_note = None;
     }
 
     /// Remove one component by index (the canvas popup's Delete).
@@ -455,6 +705,16 @@ impl SchematicState {
     /// action behind the Delete key, the Edit menu and the toolbar button.
     /// True if something was removed.
     pub fn delete_selection(&mut self) -> bool {
+        if let Some(note) = self.selected_note {
+            let exists = match note {
+                Note::Label(i) => i < self.labels.len(),
+                Note::Directive(i) => i < self.directives.len(),
+            };
+            self.delete_note(note);
+            if exists {
+                return true;
+            }
+        }
         if let Some(wi) = self.selected_wire {
             if wi < self.wires.len() {
                 self.delete_wire(wi);
@@ -500,6 +760,8 @@ impl SchematicState {
             .iter()
             .flat_map(|c| [c.p1, c.p2])
             .chain(self.wires.iter().flat_map(|w| [w.p1, w.p2]))
+            .chain(self.labels.iter().map(|l| l.at))
+            .chain(self.directives.iter().map(|d| d.at))
             .map(|g| g.to_pos());
         let first = pts.next()?;
         let mut bounds = egui::Rect::from_min_max(first, first);
@@ -534,7 +796,10 @@ impl SchematicState {
     /// parse through the shared value grammar — a bad literal is reported
     /// here instead of silently becoming 0.
     pub fn build_netlist(&self) -> Result<Netlist, String> {
-        let assignment = NodeAssignment::of(&self.components, &self.wires);
+        let assignment = NodeAssignment::of(&self.components, &self.wires, &self.labels);
+        if let Some(conflict) = assignment.conflicts().into_iter().next() {
+            return Err(conflict);
+        }
 
         let mut circuit = CsCircuit::new("schematic");
         let mut r_idx = 1; let mut c_idx = 1; let mut l_idx = 1; let mut v_idx = 1;
@@ -590,9 +855,30 @@ impl SchematicState {
             }
         }
 
+        // Labeled nets carry their label as the node's name, so the emitted
+        // deck, the run's `V(name)` traces and the canvas all agree. A net no
+        // element touches has no card to show a name on — and no node.
+        for node in 1..circuit.nodes {
+            if let Some(name) = assignment.name_of(node) {
+                circuit.set_node_name(node, name);
+            }
+        }
+
+        // A `.tran` / `.ac` / `.op` directive on the canvas *is* the analysis:
+        // it replaces the field-driven command of its kind, so the deck never
+        // carries two of them and a bad value in an unused field cannot block
+        // the build.
+        let placed: HashSet<String> = self
+            .directives
+            .iter()
+            .flat_map(|d| directive_words(&d.text))
+            .collect();
+
         let mut analysis = AnalysisCommands::default();
-        analysis.dc_op = true;
+        analysis.dc_op = !placed.contains(".op");
         match self.analysis_type {
+            AnalysisType::Tran if placed.contains(".tran") => {}
+            AnalysisType::Ac if placed.contains(".ac") => {}
             AnalysisType::Tran => {
                 let step = parse_value(&self.tran_step)
                     .map_err(|e| format!(".tran step '{}': {e}", self.tran_step))?;
@@ -639,6 +925,29 @@ impl SchematicState {
             options: ParseOptions::default(),
             overrides: HashMap::new(),
         })
+    }
+
+    /// The deck text the schematic stands for: the canonical writer's output
+    /// for the elements and the analysis fields, with every directive's text
+    /// spliced in verbatim ahead of the element cards (where `.param`,
+    /// `.model` and `.subckt` conventionally sit; the deck grammar does not
+    /// care about order, a reader does). This — not [`Self::build_netlist`]
+    /// alone — is what the Generate Netlist command writes and what a run
+    /// of the schematic simulates.
+    pub fn deck_text(&self) -> Result<String, String> {
+        let mut text = netlist_emit(&self.build_netlist()?);
+        if self.directives.is_empty() {
+            return Ok(text);
+        }
+        let block: String = self
+            .directives
+            .iter()
+            .map(|d| format!("{}\n", d.text.trim()))
+            .collect();
+        // The writer opens with a `* Canonical netlist` comment line.
+        let after_title = text.find('\n').map_or(text.len(), |i| i + 1);
+        text.insert_str(after_title, &block);
+        Ok(text)
     }
 
     /// Parse a netlist text and lay a schematic out from it: `Ok` carries
@@ -864,6 +1173,46 @@ impl SchematicState {
             }
         }
 
+        // ── 4b. Net labels: every named net keeps its name ──────────────────
+        // The label sits on the net's first spine point, a point the layout
+        // above guarantees is on the net (a wire end or the pin itself).
+        let mut new_labels: Vec<NetLabel> = Vec::new();
+        for &node in &node_set {
+            let name = circuit.node_name(node);
+            if name.is_empty() || name == node.to_string() {
+                continue;
+            }
+            let y = spine_pins[&node].iter().copied().min().unwrap_or(ORIGIN_Y);
+            new_labels.push(NetLabel {
+                at: GridPt(ORIGIN_X + node_to_col[&node] * COL_W, y),
+                name: name.to_string(),
+            });
+        }
+
+        // ── 4c. SPICE directives: the cards the schematic cannot draw ───────
+        // `.tran`/`.ac`/`.op` are the analysis fields' job (step 5); every
+        // other dot card rides along as text below the circuit, so a
+        // generate-netlist round trip keeps `.model`, `.meas`, `.step`, …
+        let mut new_directives: Vec<Directive> = Vec::new();
+        {
+            let bottom = new_components
+                .iter()
+                .flat_map(|c| [c.p1.1, c.p2.1])
+                .chain(new_wires.iter().flat_map(|w| [w.p1.1, w.p2.1]))
+                .max()
+                .unwrap_or(ORIGIN_Y);
+            let mut y = bottom + 3;
+            for card in deck_directives(text).map_err(|e| format!("Netlist error: {e}"))? {
+                let word = card.split_whitespace().next().unwrap_or("").to_ascii_lowercase();
+                if matches!(word.as_str(), ".tran" | ".ac" | ".op") {
+                    continue;
+                }
+                let rows = card.lines().count() as i32;
+                new_directives.push(Directive { at: GridPt(ORIGIN_X, y), text: card });
+                y += rows + 1;
+            }
+        }
+
         // ── 5. Analysis directives from the typed parse ──────────────────────
         // (The editor radio is single-choice; when a netlist carries both
         // sweeps, AC wins the UI — the simulation itself still runs both.)
@@ -903,11 +1252,16 @@ impl SchematicState {
         // ── 6. Commit (a fresh canvas: nothing selected, view reset) ─────────
         state.components = new_components;
         state.wires      = new_wires;
+        state.labels     = new_labels;
+        state.directives = new_directives;
 
         let n = parsed.len();
         let mut status = format!("Imported {} component(s) from netlist", n);
         if skipped > 0 {
             status.push_str(&format!(" ({} D/M/I element(s) not drawn)", skipped));
+        }
+        if !state.directives.is_empty() {
+            status.push_str(&format!(" · {} SPICE directive(s) kept as text", state.directives.len()));
         }
         if import_warnings > 0 {
             status.push_str(&format!(" · {} import warning(s)", import_warnings));
@@ -1081,5 +1435,227 @@ mod tests {
         // 8000 px of wire would fit at 0.05x; the floor keeps it at MIN_ZOOM.
         let (st, _) = fit_wire(400, canvas);
         assert_zoom_is(&st, MIN_ZOOM);
+    }
+
+    // ─── Net labels and SPICE directives ────────────────────────────────
+
+    fn label(x: i32, y: i32, name: &str) -> NetLabel {
+        NetLabel { at: GridPt(x, y), name: name.to_string() }
+    }
+
+    /// V1 across 0..3 on x=0 with R1 from the top pin to ground via a wire.
+    fn divider() -> SchematicState {
+        let mut st = SchematicState::default();
+        st.components = vec![
+            Component { kind: CompKind::Voltage, p1: GridPt(0, 0), p2: GridPt(0, 3), val: "5".into() },
+            Component { kind: CompKind::Resistor, p1: GridPt(4, 0), p2: GridPt(4, 3), val: "1k".into() },
+            Component { kind: CompKind::Ground, p1: GridPt(0, 3), p2: GridPt(0, 3), val: "".into() },
+            Component { kind: CompKind::Ground, p1: GridPt(4, 3), p2: GridPt(4, 3), val: "".into() },
+        ];
+        st.wires = vec![Wire { p1: GridPt(0, 0), p2: GridPt(4, 0) }];
+        st
+    }
+
+    #[test]
+    fn net_names_are_validated() {
+        assert_eq!(check_net_name("  out ").unwrap(), "out");
+        assert_eq!(check_net_name("0").unwrap(), "0");
+        for bad in ["", "  ", "a b", "x{y}", "v(out)", "12", ".tran", "+a", "a;b"] {
+            assert!(check_net_name(bad).is_err(), "{bad:?} must be refused");
+        }
+    }
+
+    #[test]
+    fn directives_refuse_blank_text_and_end() {
+        assert!(check_directive("  \n ").is_err());
+        assert!(check_directive(".meas tran m MAX V(1)\n.END").is_err());
+        assert_eq!(check_directive(" .step param r 1 3 1 ").unwrap(), ".step param r 1 3 1");
+    }
+
+    #[test]
+    fn unlabeled_schematics_number_as_before() {
+        let st = divider();
+        let a = NodeAssignment::of(&st.components, &st.wires, &[]);
+        assert_eq!(a.node_of(GridPt(0, 0)), 1);
+        assert_eq!(a.node_of(GridPt(4, 0)), 1);
+        assert_eq!(a.node_of(GridPt(0, 3)), 0);
+        assert!(a.name_of(1).is_none());
+        assert!(a.conflicts().is_empty());
+    }
+
+    #[test]
+    fn a_label_names_its_net_in_the_deck() {
+        let mut st = divider();
+        st.labels.push(label(0, 0, "Vin"));
+        let text = st.deck_text().expect("deck");
+        assert!(text.contains("V1 Vin 0"), "{text}");
+        assert!(text.contains("R1 Vin 0"), "{text}");
+        let net = parse(&text).expect("re-parse");
+        assert_eq!(net.circuit.node_name(1).to_string().to_lowercase(), "vin");
+    }
+
+    #[test]
+    fn same_name_labels_join_unwired_nets() {
+        // Two parts with no wire between them become one net by label alone.
+        let mut st = SchematicState::default();
+        st.components = vec![
+            Component { kind: CompKind::Resistor, p1: GridPt(0, 0), p2: GridPt(0, 3), val: "1k".into() },
+            Component { kind: CompKind::Resistor, p1: GridPt(8, 0), p2: GridPt(8, 3), val: "2k".into() },
+            Component { kind: CompKind::Ground, p1: GridPt(0, 3), p2: GridPt(0, 3), val: "".into() },
+            Component { kind: CompKind::Ground, p1: GridPt(8, 3), p2: GridPt(8, 3), val: "".into() },
+        ];
+        let apart = NodeAssignment::of(&st.components, &st.wires, &[]);
+        assert_ne!(apart.node_of(GridPt(0, 0)), apart.node_of(GridPt(8, 0)));
+        st.labels = vec![label(0, 0, "bus"), label(8, 0, "BUS")];
+        let joined = NodeAssignment::of(&st.components, &st.wires, &st.labels);
+        assert_eq!(joined.node_of(GridPt(0, 0)), joined.node_of(GridPt(8, 0)));
+        assert!(joined.conflicts().is_empty(), "case-insensitive: one name");
+        assert_eq!(joined.name_of(joined.node_of(GridPt(0, 0))), Some("bus"), "first spelling wins");
+    }
+
+    #[test]
+    fn zero_and_gnd_labels_ground_a_net() {
+        let mut st = divider();
+        st.components.retain(|c| c.kind != CompKind::Ground);
+        st.labels = vec![label(4, 3, "GND"), label(0, 3, "0")];
+        let a = NodeAssignment::of(&st.components, &st.wires, &st.labels);
+        assert_eq!(a.node_of(GridPt(4, 3)), 0);
+        assert_eq!(a.node_of(GridPt(0, 3)), 0);
+        assert!(a.conflicts().is_empty(), "aliases are not names");
+        assert!(st.deck_text().is_ok());
+    }
+
+    #[test]
+    fn two_labels_on_one_net_are_refused_not_guessed() {
+        let mut st = divider();
+        st.labels = vec![label(0, 0, "a"), label(4, 0, "b")];
+        let err = st.deck_text().unwrap_err();
+        assert!(err.contains("'a'") && err.contains("'b'"), "{err}");
+    }
+
+    #[test]
+    fn a_named_ground_is_refused() {
+        let mut st = divider();
+        st.labels = vec![label(0, 3, "out")];
+        let err = st.build_netlist().map(|_| ()).unwrap_err();
+        assert!(err.contains("ground"), "{err}");
+    }
+
+    #[test]
+    fn placing_a_label_arms_then_drops_once() {
+        let mut st = divider();
+        assert!(st.arm_label("bad name").is_err());
+        assert_eq!(st.tool, Tool::Select, "a refused name arms nothing");
+        st.arm_label("out").unwrap();
+        assert_eq!(st.tool, Tool::Label);
+        assert!(st.place_note(GridPt(4, 0)));
+        assert_eq!(st.labels, vec![label(4, 0, "out")]);
+        assert_eq!(st.tool, Tool::Select, "one placement per arming");
+        assert!(!st.place_note(GridPt(1, 1)), "nothing armed, nothing placed");
+        // Re-labeling the same point renames instead of stacking.
+        st.arm_label("vout").unwrap();
+        st.place_note(GridPt(4, 0));
+        assert_eq!(st.labels, vec![label(4, 0, "vout")]);
+    }
+
+    #[test]
+    fn labels_travel_with_a_dragged_or_rotated_pin() {
+        let mut st = divider();
+        st.labels.push(label(4, 3, "x"));
+        st.drag_component(1, 2, 0); // R1 right by two
+        assert_eq!(st.labels[0].at, GridPt(6, 3));
+        st.selected_component = Some(1);
+        st.rotate_selected();
+        let r1 = &st.components[1];
+        assert_eq!(st.labels[0].at, r1.p2, "label stays on the rotated pin");
+    }
+
+    #[test]
+    fn notes_edit_delete_and_select() {
+        let mut st = divider();
+        st.labels.push(label(0, 0, "a"));
+        st.directives.push(Directive { at: GridPt(0, 8), text: ".param r=1k".into() });
+        st.select_note(Some(Note::Directive(0)));
+        st.edit_note(Note::Directive(0), ".param r=2k").unwrap();
+        assert_eq!(st.directives[0].text, ".param r=2k");
+        assert!(st.edit_note(Note::Label(0), "no good").is_err());
+        assert_eq!(st.labels[0].name, "a", "refused edit changes nothing");
+        assert!(st.delete_selection());
+        assert!(st.directives.is_empty());
+        assert!(st.selected_note.is_none());
+        st.select_note(Some(Note::Label(0)));
+        assert!(st.delete_selection());
+        assert!(st.labels.is_empty());
+        assert!(!st.delete_selection());
+    }
+
+    #[test]
+    fn directives_are_spliced_into_the_deck_verbatim() {
+        let mut st = divider();
+        st.directives.push(Directive { at: GridPt(0, 8), text: ".param w=2u\n.meas tran vmax MAX V(1)".into() });
+        let text = st.deck_text().expect("deck");
+        assert!(text.contains(".param w=2u\n.meas tran vmax MAX V(1)\n"), "{text}");
+        assert!(text.trim_end().ends_with(".end"));
+        let net = parse(&text).expect("parses");
+        assert_eq!(net.params.len(), 1);
+    }
+
+    #[test]
+    fn a_tran_directive_replaces_the_field_command() {
+        let mut st = divider();
+        st.tran_stop = "garbage".into(); // would fail the field parse
+        assert!(st.deck_text().is_err());
+        st.directives.push(Directive { at: GridPt(0, 8), text: ".tran 2u 1m".into() });
+        let text = st.deck_text().expect("the directive owns the analysis");
+        assert_eq!(text.matches(".tran").count(), 1, "{text}");
+        assert!(text.contains(".tran"), "{text}");
+        let net = parse(&text).unwrap();
+        assert_eq!(net.analysis.tran_stop, Some(1e-3));
+    }
+
+    #[test]
+    fn import_keeps_net_names_and_directive_cards() {
+        let deck = "* d\n\
+                    .param w=2u\n\
+                    .model dx D(IS=1e-14)\n\
+                    V1 in 0 DC 5\n\
+                    R1 in out 1k\n\
+                    R2 out 0 2k\n\
+                    .meas tran vmax MAX V(out)\n\
+                    .op\n\
+                    .tran 1u 5m\n\
+                    .end\n";
+        let (st, status) = SchematicState::from_netlist(deck, &SchematicState::default()).expect("import");
+        let names: Vec<_> = st.labels.iter().map(|l| l.name.as_str()).collect();
+        assert!(names.contains(&"in") && names.contains(&"out"), "{names:?}");
+        let cards: Vec<_> = st.directives.iter().map(|d| d.text.as_str()).collect();
+        assert_eq!(cards, [".param w=2u", ".model dx D(IS=1e-14)", ".meas tran vmax MAX V(out)"]);
+        assert!(status.contains("3 SPICE directive"), "{status}");
+        // Directives are stacked below the circuit, not on top of it.
+        let bottom = st.components.iter().flat_map(|c| [c.p1.1, c.p2.1]).max().unwrap();
+        assert!(st.directives.iter().all(|d| d.at.1 > bottom));
+        // Round trip: the regenerated deck keeps names, cards and one analysis.
+        let again = st.deck_text().expect("regenerates");
+        assert!(again.contains("R1 in out") || again.contains("R1 out in"), "{again}");
+        for card in [".param w=2u", ".model dx D(IS=1e-14)", ".meas tran vmax MAX V(out)"] {
+            assert!(again.contains(card), "{card} lost:\n{again}");
+        }
+        assert_eq!(again.matches(".tran").count(), 1, "{again}");
+        let net = parse(&again).expect("re-parses");
+        assert_eq!(net.analysis.tran_stop, Some(5e-3));
+    }
+
+    #[test]
+    fn imported_labels_sit_on_their_nets() {
+        let deck = "V1 a 0 DC 1\nR1 a b 1k\nR2 b 0 1k\nR3 a b 2k\n.end\n";
+        let (st, _) = SchematicState::from_netlist(deck, &SchematicState::default()).expect("import");
+        let assignment = NodeAssignment::of(&st.components, &st.wires, &st.labels);
+        for l in &st.labels {
+            let node = assignment.node_of(l.at);
+            assert_eq!(assignment.name_of(node), Some(l.name.as_str()));
+            assert_ne!(node, 0);
+        }
+        assert!(assignment.conflicts().is_empty());
+        assert_eq!(st.labels.len(), 2);
     }
 }

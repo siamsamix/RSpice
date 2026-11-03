@@ -759,6 +759,58 @@ fn logical_lines(source: &str) -> Result<Vec<(usize, String)>> {
     Ok(out)
 }
 
+/// The deck's *directives*: every dot card, as the logical line it forms
+/// (comments stripped, `+` continuations joined), in file order — the text a
+/// front-end can carry verbatim when it cannot draw the card. A `.subckt …
+/// .ends` block (nested ones included) is one directive, its element lines
+/// riding along on `\n`-separated rows, since the body is meaningless without
+/// its header. Element cards outside a subckt are not directives; `.end` stops
+/// the walk and is not returned (a writer adds its own).
+///
+/// The cards are returned unjudged: a front-end that models `.tran`/`.ac`
+/// itself filters those by first word.
+pub fn deck_directives(source: &str) -> Result<Vec<String>> {
+    let mut out: Vec<String> = Vec::new();
+    // The open `.subckt` block, if any, and its nesting depth.
+    let mut block: Vec<String> = Vec::new();
+    let mut depth = 0usize;
+    for (_, raw) in logical_lines(source)? {
+        // A stripped `;` comment leaves its leading blanks behind.
+        let line = raw.trim().to_string();
+        let word = line
+            .split_whitespace()
+            .next()
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        if depth == 0 && word == ".end" {
+            break;
+        }
+        match word.as_str() {
+            ".subckt" => {
+                depth += 1;
+                block.push(line);
+            }
+            ".ends" if depth > 0 => {
+                block.push(line);
+                depth -= 1;
+                if depth == 0 {
+                    out.push(block.join("\n"));
+                    block.clear();
+                }
+            }
+            _ if depth > 0 => block.push(line),
+            _ if word.starts_with('.') => out.push(line),
+            _ => {}
+        }
+    }
+    if depth > 0 {
+        return Err(SimError::Parse(
+            ".subckt block is never closed by .ends".into(),
+        ));
+    }
+    Ok(out)
+}
+
 /// Lift the literal `seed=` value of every `.options`/`.option` card, before
 /// anything expands: element lines draw through the parameter environment (and
 /// the options card only *executes* during the final deck walk). Case-

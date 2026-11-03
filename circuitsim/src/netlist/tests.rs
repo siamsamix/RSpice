@@ -1578,3 +1578,62 @@ fn pwl_interpolates_between_consecutive_points() {
     assert_relative_eq!(src.value_at(0.5e-6), 2.5, epsilon = 1e-9);
     assert_relative_eq!(src.value_at(2e-6), 0.0, epsilon = 1e-12);
 }
+
+// ─── deck_directives: the cards a front-end carries verbatim ────────────────
+
+#[test]
+fn directives_are_the_dot_cards_in_file_order() {
+    let src = "* title\n\
+               .param w=2u\n\
+               R1 1 0 1k\n\
+               .model dino D(IS=1e-14\n\
+               + N=1.05) ; trailing\n\
+               V1 1 0 DC 1\n\
+               .tran 1u 5m\n\
+               .end\n\
+               .after_end 1\n";
+    let cards = deck_directives(src).expect("directives");
+    assert_eq!(
+        cards,
+        vec![
+            ".param w=2u".to_string(),
+            ".model dino D(IS=1e-14 N=1.05)".to_string(),
+            ".tran 1u 5m".to_string(),
+        ],
+        "element cards, comments and anything past .end are not directives"
+    );
+}
+
+#[test]
+fn a_subckt_block_is_one_directive_with_its_body() {
+    let src = "R1 1 0 1k\n\
+               .subckt amp in out\n\
+               R1 in out 10\n\
+               .subckt inner a b\n\
+               R2 a b 1\n\
+               .ends inner\n\
+               .ends amp\n\
+               .meas tran vmax MAX V(1)\n\
+               .end\n";
+    let cards = deck_directives(src).expect("directives");
+    assert_eq!(cards.len(), 2, "block + .meas, got {cards:?}");
+    assert_eq!(
+        cards[0],
+        ".subckt amp in out\nR1 in out 10\n.subckt inner a b\nR2 a b 1\n.ends inner\n.ends amp"
+    );
+    assert_eq!(cards[1], ".meas tran vmax MAX V(1)");
+}
+
+#[test]
+fn an_unclosed_subckt_is_an_error_not_a_silent_loss() {
+    let err = deck_directives(".subckt amp in out\nR1 in out 10\n.end\n").unwrap_err();
+    assert!(err.to_string().contains(".ends"), "got: {err}");
+}
+
+#[test]
+fn directive_words_match_case_insensitively() {
+    let cards = deck_directives(".SUBCKT a b\nR1 a b 1\n.ENDS\n.OPTIONS reltol=1e-4\n.END\n")
+        .expect("directives");
+    assert_eq!(cards.len(), 2);
+    assert!(cards[1].starts_with(".OPTIONS"));
+}

@@ -364,7 +364,10 @@ below is written against that state.
   no-anchor scale and three tests added (`si_labels_follow_the_prefixes`,
   `ac_log_axis_spells_decades`, `transient_ticks_spell_si`); export suite 31 green)*
 - [ ] **[P1] (both)** Cross-probing: click a wire/part in the schematic to add/trace `V(net)` and
-  `I(device)` in the viewer, and vice versa.
+  `I(device)` in the viewer, and vice versa. *(half done: Shift+click a wire after a run plots its
+  `V(net)` — resolved by the net's deck spelling, and refused unless the schematic still generates
+  exactly the deck the results came from. Open: `I(device)` (the viewer has no per-device current
+  selection), viewer → schematic highlighting, plain-click probing.)*
 - [ ] **[P1] (both)** Waveform file I/O: read/write binary and ASCII `.raw` (LTspice) / `.dat`
   (PSpice) *(the LTspice `.raw` half landed: `rawwave.rs` — a one-shot `rawwave::build(title,
   netlist, result)` turns every analysis of every step run into a plot (`RawDataset`:
@@ -411,11 +414,25 @@ below is written against that state.
   `R C L V Gnd`-only today.
 - [ ] **[P1] (both)** Symbol library format with attached model/.subckt references and a component
   picker: placing `MM1` should be able to attach `model=...`/`spiceline` data.
-- [ ] **[P1] (both)** Net/wire labels with clean node names governing the generated netlist and plot
-  names.
-- [ ] **[P1] (both)** SPICE text directives placed as schematic annotations (`.tran`, `.step`,
+- [x] **[P1] (both)** Net/wire labels with clean node names governing the generated netlist and plot
+  names. *(done at the state level, GUI only — `NetLabel` in `schematic.rs`: Edit ▸ Label Net (F4)
+  asks for a name, the next click drops it; same-name labels (case-insensitive) are one net even
+  unwired, `0`/`gnd` ground a net, a bare number is refused (it would fight unlabeled nets'
+  numbers), a net with two different labels or a named ground makes Generate Netlist fail loudly
+  instead of guessing. The label becomes the node's deck name, so `V(name)` traces follow;
+  import turns every named net into a label; labels travel with a dragged/rotated pin. Not
+  verified visually: the flag drawing (name above a leader line) and F4 are written from memory of
+  LTspice, not checked against the shipped help.)*
+- [x] **[P1] (both)** SPICE text directives placed as schematic annotations (`.tran`, `.step`,
   `.meas`, `.include` as first-class schematic objects) — both reference tools run the whole show this
-  way.
+  way. *(done, GUI + core — `Directive` text objects (Edit ▸ SPICE Directive, `S`) are spliced into
+  the generated deck verbatim; import keeps every dot card the schematic cannot draw
+  (`circuitsim::deck_directives`; a `.subckt…​.ends` block is one object) and stacks them under the
+  circuit, so a text → schematic → netlist round trip no longer drops `.model`/`.meas`/`.step`/
+  `.param`. A `.tran`/`.ac`/`.op` directive replaces the analysis-strip command of its kind;
+  import leaves those three to the strip (extra `.tran` args such as `uic` are still lost there).
+  Not done: dragging a note, placing text without the dialog, drawn `.subckt` elements on import
+  (D/M/I/X cards are still not drawn). Same unverified-visuals caveat as labels.)*
 - [ ] **[P1] (both)** Hierarchical schematics mapping to `.subckt` definitions and instances.
 - [ ] **[P2] (both)** ERC: dangling-pin, shorted-output, floating-node diagnostics with connectivity
   highlighting; undo/redo completeness.

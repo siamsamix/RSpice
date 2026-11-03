@@ -325,8 +325,16 @@ below is written against that state.
   layouts are served by the existing stacked-panel renderer. Fixture pins updated to the
   no-anchor scale and three tests added (`si_labels_follow_the_prefixes`,
   `ac_log_axis_spells_decades`, `transient_ticks_spell_si`); export suite 31 green)*
-- [ ] **[P1] (both)** Cross-probing: click a wire/part in the schematic to add/trace `V(net)` and
+- [x] **[P1] (both)** Cross-probing: click a wire/part in the schematic to add/trace `V(net)` and
   `I(device)` in the viewer, and vice versa.
+  *(done: `last_probe_click` click-probes in Select tool — wire → `V(node)`,
+  R/C/L/V body → `I(device)` via `current_slot_targets` slot expansion; repeat click isolates
+  that probe alone; waveforms Voltage/Current hovers map nearest series
+  (`plot_frame_hover` ≤8px vertex distance) back to a red schematic flash on the owning wire
+  (`probe_flash=Node`) or component (`probe_flash=Element`); red `V()/I()` hover pill preview on
+  canvas; Differential/Expression null the flash; `plot_currents` mirrors family slots, reset on
+  re-run; tests: `probe_target_*`, `current_slot_targets`, `waveforms_plot_visible` in app.rs,
+  `tran_current_series` slot tests in plot.rs; export suite 31 green)*
 - [ ] **[P1] (both)** Waveform file I/O: read/write binary and ASCII `.raw` (LTspice) / `.dat`
   (PSpice) *(the LTspice `.raw` half landed: `rawwave.rs` — a one-shot `rawwave::build(title,
   netlist, result)` turns every analysis of every step run into a plot (`RawDataset`:

@@ -312,8 +312,19 @@ below is written against that state.
   on both ends and no zero anchor, titles only with no legend chips; unstepped results, multi-target
   sweeps and `.mc` runs are each rejected with their own error, as is a stepped deck with no
   `.meas`. GUI overlays of these remain a later §7 item)*
-- [ ] **[P1] (both)** Axis completeness: linear/log on both axes, physical unit auto-detection and
-  formatting (Hz/s/V/A/dB/°), multi-pane layouts.
+- [x] **[P1] (both)** Axis completeness: linear/log on both axes, physical unit auto-detection and
+  formatting (Hz/s/V/A/dB/°), multi-pane layouts. *(done: CLI SVG exporter (`svg_panel`) — a
+  `log`-flagged plot (`.ac dec/oct`) maps x logarithmically with decade ticks plus the data's own
+  edge ticks and unlabeled minor log ticks, no pads (the first sample pins at the frame); linear
+  axes keep the 5% pads, y spans the plotted data and no longer anchors at zero; log y, dB scales
+  and the GUI stay §7. Columns carrying a physical unit (time/frequency/voltage/device_current/
+  impedance) spell their tick ladders SI-style — `µ m k Meg G`, Meg for millions like the deck
+  multipliers — with the unit letter kept off ticks: it rides the cursor readouts, whose Δt line
+  spells Hz. Mixed-unit layers (a default all-traces panel's `V(...)` beside `I(...)`) agree on no
+  shared unit and fall back to plain decimals; per-trace readouts keep their own units. Multi-pane
+  layouts are served by the existing stacked-panel renderer. Fixture pins updated to the
+  no-anchor scale and three tests added (`si_labels_follow_the_prefixes`,
+  `ac_log_axis_spells_decades`, `transient_ticks_spell_si`); export suite 31 green)*
 - [ ] **[P1] (both)** Cross-probing: click a wire/part in the schematic to add/trace `V(net)` and
   `I(device)` in the viewer, and vice versa.
 - [ ] **[P1] (both)** Waveform file I/O: read/write binary and ASCII `.raw` (LTspice) / `.dat`

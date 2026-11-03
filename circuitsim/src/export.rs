@@ -158,9 +158,13 @@ const TRACE_COLORS: [&str; 8] = [
 /// each chip naming the run's steps; single-run groups keep exactly the
 /// per-trace output. Complex columns draw their magnitude — the mag/phase
 /// pairing is CSV material; the measurements stay tabular there too and
-/// are not drawn. Axes are linear, the y scale anchored at zero, both
-/// padded 5%; anything fancier (log axes) is per-plot work with its own
-/// TODO entries.
+/// are not drawn. The y axis spans the plotted data with 5% pads and
+/// never anchors at zero; the x axis pads linear spans the same way, and
+/// a plot flagged `log` (`.ac dec/oct` sweeps) maps x logarithmically
+/// with decade ticks and no pads. Columns carrying a physical unit (s,
+/// Hz, V, A, Ω) spell their ticks SI-style without the unit letter
+/// (prefixes `µ m k Meg G`, Meg for millions like the deck multipliers);
+/// the unit letter itself rides the cursor readouts.
 pub fn svg_document(raw: &RawFile, traces: &[String]) -> String {
     svg_document_with_cursors(raw, traces, &[])
 }
@@ -421,10 +425,11 @@ fn svg_panel(
 
     // One curve per (run, kept trace): step columns are the runs'
     // identification metadata and draw nothing themselves. The y scale
-    // spans every curve of the overlay (zero anchors it, both ends pad 5%,
-    // flat data widens ±1 first); the x scale spans every run's axis
-    // samples, both ends padded 5% (a degenerate axis — one sample, as in
-    // synthetic `.op` rows — widens to [a, a+1] to stay degenerate-safe).
+    // spans every curve of the overlay (both ends pad 5%, flat data
+    // widens ±1 first); the x scale spans every run's axis samples,
+    // linear axes padded 5% (a degenerate axis — one sample, as in
+    // synthetic `.op` rows — widens to [a, a+1] to stay degenerate-safe)
+    // and a `log`-flagged axis mapped logarithmically with no pads.
     let mut layers: Vec<(usize, usize)> = Vec::new();
     for (run, ds) in runs.iter().enumerate() {
         for &i in keep.iter().skip(1) {
@@ -453,48 +458,61 @@ fn svg_panel(
                 .collect()
         })
         .collect();
-    let (min_y, max_y) = columns
-        .iter()
-        .flatten()
-        .copied()
-        .chain([0.0])
-        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
-            (lo.min(v), hi.max(v))
-        });
-    let (min_y, max_y) = if min_y == max_y {
-        (min_y - 1.0, max_y + 1.0)
-    } else {
-        let pad = 0.05 * (max_y - min_y);
-        (min_y - pad, max_y + pad)
+    let spanned_y =
+        columns
+            .iter()
+            .flatten()
+            .copied()
+            .fold(Option::<(f64, f64)>::None, |span, v| match span {
+                Some((lo, hi)) => Some((lo.min(v), hi.max(v))),
+                None => Some((v, v)),
+            });
+    let (min_y, max_y) = match spanned_y {
+        None => (0.0, 1.0),
+        Some((lo, hi)) if lo == hi => (lo - 1.0, hi + 1.0),
+        Some((lo, hi)) => {
+            let pad = 0.05 * (hi - lo);
+            (lo - pad, hi + pad)
+        }
     };
     let axis: Vec<f64> = runs
         .iter()
         .flat_map(|ds| ds.values.iter().map(|row| row[0].re))
         .collect();
-    let (min_x, max_x) = axis
-        .iter()
-        .copied()
-        .filter(|x| x.is_finite())
-        .chain([0.0])
-        .fold((f64::INFINITY, f64::NEG_INFINITY), |(lo, hi), v| {
-            (lo.min(v), hi.max(v))
-        });
-    let (min_x, max_x) = if min_x == max_x {
-        (min_x, max_x + 1.0)
+    let spanned_x = axis.iter().copied().filter(|x| x.is_finite()).fold(
+        Option::<(f64, f64)>::None,
+        |span, v| match span {
+            Some((lo, hi)) => Some((lo.min(v), hi.max(v))),
+            None => Some((v, v)),
+        },
+    );
+    let log_x = head.flags.iter().any(|flag| flag == "log")
+        && matches!(spanned_x, Some((lo, hi)) if lo > 0.0 && lo < hi);
+    let (min_x, max_x) = if log_x {
+        spanned_x.expect("the log gate requires a spanned axis")
     } else {
-        let pad = 0.05 * (max_x - min_x);
-        (min_x - pad, max_x + pad)
+        match spanned_x {
+            Some((lo, hi)) if lo == hi => (lo, hi + 1.0),
+            Some((lo, hi)) => {
+                let pad = 0.05 * (hi - lo);
+                (lo - pad, hi + pad)
+            }
+            None => (0.0, 1.0),
+        }
     };
-    let x_at = |value: f64| left + (value - min_x) / (max_x - min_x) * plot_w;
+    let (span_lo, span_hi) = if log_x {
+        (min_x.log10(), max_x.log10())
+    } else {
+        (min_x, max_x)
+    };
+    let x_at = move |value: f64| {
+        let value = if log_x { value.log10() } else { value };
+        left + (value - span_lo) / (span_hi - span_lo) * plot_w
+    };
     let y_at = |value: f64| bottom - (value - min_y) / (max_y - min_y) * plot_h;
 
     for i in 1..DIVISIONS {
-        let x = left + i as f64 / DIVISIONS as f64 * plot_w;
         let y = MARGIN_T as f64 + i as f64 / DIVISIONS as f64 * plot_h;
-        out.push_str(&format!(
-            "<line x1=\"{x:.2}\" y1=\"{}\" x2=\"{x:.2}\" y2=\"{bottom:.2}\" stroke=\"#999999\"/>\n",
-            MARGIN_T
-        ));
         out.push_str(&format!(
             "<line x1=\"{left:.2}\" y1=\"{y:.2}\" x2=\"{right:.2}\" y2=\"{y:.2}\" stroke=\"#999999\"/>\n"
         ));
@@ -502,9 +520,41 @@ fn svg_panel(
     out.push_str(&format!(
         "<rect x=\"{MARGIN_L}\" y=\"{MARGIN_T}\" width=\"{pw}\" height=\"{ph}\" fill=\"none\" stroke=\"#000000\"/>\n"
     ));
-    for i in 0..=DIVISIONS {
-        let x = x_at(min_x + (max_x - min_x) * i as f64 / DIVISIONS as f64);
-        let y = bottom - i as f64 / DIVISIONS as f64 * plot_h;
+    let x_unit = if axis.iter().filter(|x| x.is_finite()).count() > 1 {
+        axis_unit(&head.variables[0].kind)
+    } else {
+        None
+    };
+    let spell_x = |value: f64| match x_unit {
+        Some(_) => si_label(value, None),
+        None => tick_label(value),
+    };
+    let x_ticks: Vec<f64> = if log_x {
+        let lo = min_x.log10().ceil() as i32;
+        let hi = max_x.log10().floor() as i32;
+        let mut ticks: Vec<f64> = (lo..=hi)
+            .map(|k| 10f64.powi(k))
+            .filter(|tick| *tick >= min_x && *tick <= max_x)
+            .collect();
+        ticks.push(min_x);
+        ticks.push(max_x);
+        ticks.sort_by(|a, b| a.total_cmp(b));
+        ticks.dedup_by(|a, b| a == b);
+        ticks
+    } else {
+        (0..=DIVISIONS)
+            .map(|i| min_x + (max_x - min_x) * i as f64 / DIVISIONS as f64)
+            .collect()
+    };
+    for tick in &x_ticks {
+        if *tick != min_x && *tick != max_x {
+            let x = x_at(*tick);
+            out.push_str(&format!(
+                "<line x1=\"{x:.2}\" y1=\"{}\" x2=\"{x:.2}\" y2=\"{bottom:.2}\" stroke=\"#999999\"/>\n",
+                MARGIN_T
+            ));
+        }
+        let x = x_at(*tick);
         out.push_str(&format!(
             "<line x1=\"{x:.2}\" y1=\"{bottom:.2}\" x2=\"{x:.2}\" y2=\"{:.2}\"/>\n",
             bottom + 4.0
@@ -512,8 +562,33 @@ fn svg_panel(
         out.push_str(&format!(
             "<text x=\"{x:.2}\" y=\"{:.2}\" text-anchor=\"middle\" font-size=\"11\">{}</text>\n",
             bottom + 18.0,
-            tick_label(min_x + (max_x - min_x) * i as f64 / DIVISIONS as f64)
+            spell_x(*tick)
         ));
+    }
+    if log_x {
+        let lo = min_x.log10().ceil() as i32;
+        let hi = max_x.log10().floor() as i32;
+        for k in lo..=hi {
+            for m in 2..=9 {
+                let tick = 10f64.powi(k) * m as f64;
+                if tick > min_x && tick < max_x {
+                    out.push_str(&format!(
+                        "<line x1=\"{:.2}\" y1=\"{bottom:.2}\" x2=\"{:.2}\" y2=\"{:.2}\"/>\n",
+                        x_at(tick),
+                        x_at(tick),
+                        bottom - 2.0
+                    ));
+                }
+            }
+        }
+    }
+    let y_unit = same_unit(runs, &layers);
+    let spell_y = |value: f64| match y_unit {
+        Some(_) => si_label(value, None),
+        None => tick_label(value),
+    };
+    for i in 0..=DIVISIONS {
+        let y = bottom - i as f64 / DIVISIONS as f64 * plot_h;
         out.push_str(&format!(
             "<line x1=\"{:.2}\" y1=\"{y:.2}\" x2=\"{left:.2}\" y2=\"{y:.2}\"/>\n",
             left - 4.0
@@ -522,7 +597,7 @@ fn svg_panel(
             "<text x=\"{:.2}\" y=\"{:.2}\" text-anchor=\"end\" font-size=\"11\">{}</text>\n",
             left - 8.0,
             y + 4.0,
-            tick_label(min_y + (max_y - min_y) * i as f64 / DIVISIONS as f64)
+            spell_y(min_y + (max_y - min_y) * i as f64 / DIVISIONS as f64)
         ));
     }
 
@@ -600,6 +675,12 @@ fn svg_panel(
             }
             let axis_name = &runs[first_run].variables[0].name;
             let trace_name = &runs[first_run].variables[first].name;
+            let axis_kind_unit = axis_unit(&runs[first_run].variables[0].kind);
+            let trace_kind_unit = axis_unit(&runs[first_run].variables[first].kind);
+            let spell = |value: f64, unit: Option<&'static str>| match unit {
+                Some(_) => si_label(value, unit),
+                None => tick_label(value),
+            };
             let mut ry = MARGIN_T as f64 + 16.0;
             for (n, (sx, sy)) in snaps.iter().enumerate() {
                 out.push_str(&format!(
@@ -607,9 +688,9 @@ fn svg_panel(
                     left + 8.0,
                     n + 1,
                     xml_escape(axis_name),
-                    tick_label(*sx),
+                    spell(*sx, axis_kind_unit),
                     xml_escape(trace_name),
-                    tick_label(*sy)
+                    spell(*sy, trace_kind_unit)
                 ));
                 ry += 14.0;
             }
@@ -619,9 +700,9 @@ fn svg_panel(
                     "<text x=\"{:.2}\" y=\"{ry:.2}\" font-size=\"11\" fill=\"#aa00aa\">Δ{}={}, Δ{}={}</text>\n",
                     left + 8.0,
                     xml_escape(axis_name),
-                    tick_label(dx),
+                    spell(dx, axis_kind_unit),
                     xml_escape(trace_name),
-                    tick_label(dy)
+                    spell(dy, trace_kind_unit)
                 ));
                 ry += 14.0;
                 if axis_name.eq_ignore_ascii_case("time") && dx != 0.0 {
@@ -629,7 +710,7 @@ fn svg_panel(
                         "<text x=\"{:.2}\" y=\"{ry:.2}\" font-size=\"11\" fill=\"#aa00aa\">f = 1/Δ{} = {}</text>\n",
                         left + 8.0,
                         xml_escape(axis_name),
-                        tick_label((1.0 / dx).abs())
+                        spell((1.0 / dx).abs(), Some("Hz"))
                     ));
                 }
             }
@@ -689,6 +770,74 @@ fn tick_label(value: f64) -> String {
         .trim_end_matches('0')
         .trim_end_matches('.')
         .to_owned()
+}
+
+/// The SI unit letter for a column kind, `None` for kinds that carry no
+/// physical unit (parameters, step columns, reader-recovered names).
+fn axis_unit(kind: &str) -> Option<&'static str> {
+    match kind {
+        "time" => Some("s"),
+        "frequency" => Some("Hz"),
+        "voltage" => Some("V"),
+        "device_current" => Some("A"),
+        "impedance" => Some("Ω"),
+        _ => None,
+    }
+}
+
+/// The SI unit shared by every drawn layer of a panel, or `None` when the
+/// layers mix units (a voltage curve next to a current one) or carry no
+/// unit at all.
+fn same_unit(runs: &[&RawDataset], layers: &[(usize, usize)]) -> Option<&'static str> {
+    let mut shared: Option<&'static str> = None;
+    for &(run, i) in layers {
+        let unit = axis_unit(&runs[run].variables[i].kind);
+        match (shared, unit) {
+            (None, None) => {}
+            (None, unit) => shared = unit,
+            (Some(_), None) => return None,
+            (Some(current), Some(unit)) if current == unit => {}
+            _ => return None,
+        }
+    }
+    shared
+}
+
+/// An SI-style tick spelling: two decimals scaled by the magnitude's
+/// prefix — `m`, `µ`, `k`, `Meg` (millions, like the deck multipliers) —
+/// sitting between number and the optional unit letter (`1µs`), two-digit
+/// scientific notation outside the 1e-12..1e12 band, and just `0` at zero.
+fn si_label(value: f64, unit: Option<&str>) -> String {
+    if value == 0.0 {
+        return "0".to_owned();
+    }
+    let magnitude = value.abs();
+    let letter = unit.unwrap_or("");
+    if !(1e-12..1e12).contains(&magnitude) {
+        return format!("{value:.2e}{letter}");
+    }
+    const PREFIXES: [(&str, i32); 9] = [
+        ("T", 12),
+        ("G", 9),
+        ("Meg", 6),
+        ("k", 3),
+        ("", 0),
+        ("m", -3),
+        ("µ", -6),
+        ("n", -9),
+        ("p", -12),
+    ];
+    let (prefix, exponent) = PREFIXES
+        .iter()
+        .copied()
+        .find(|&(_, exponent)| 10f64.powi(exponent) <= magnitude)
+        .expect("the magnitude reaches the 1e-12 band edge");
+    let scaled = value / 10f64.powi(exponent);
+    let spelled = format!("{scaled:.2}")
+        .trim_end_matches('0')
+        .trim_end_matches('.')
+        .to_owned();
+    format!("{spelled}{prefix}{letter}")
 }
 
 /// SVG text nodes escape the XML specials; the markup this module builds
@@ -936,6 +1085,33 @@ R2 out 0 3k
         assert_eq!(tick_label(5e4), "5.00e4");
     }
 
+    /// The SI layer: reader kinds map to unit letters (none for
+    /// parameter-like kinds), and `si_label` scales by the magnitude's
+    /// prefix, appending the letter only when one is given. Meg spells
+    /// millions like the deck multipliers; outside the band it goes
+    /// two-digit scientific.
+    #[test]
+    fn si_labels_follow_the_prefixes() {
+        assert_eq!(axis_unit("time"), Some("s"));
+        assert_eq!(axis_unit("frequency"), Some("Hz"));
+        assert_eq!(axis_unit("voltage"), Some("V"));
+        assert_eq!(axis_unit("device_current"), Some("A"));
+        assert_eq!(axis_unit("impedance"), Some("Ω"));
+        assert_eq!(axis_unit(""), None);
+        assert_eq!(axis_unit("parameter"), None);
+        assert_eq!(si_label(0.0, None), "0");
+        assert_eq!(si_label(2.5, None), "2.5");
+        assert_eq!(si_label(-0.0025, None), "-2.5m");
+        assert_eq!(si_label(1e-6, None), "1µ");
+        assert_eq!(si_label(1e-6, Some("s")), "1µs");
+        assert_eq!(si_label(1e3, Some("Ω")), "1kΩ");
+        assert_eq!(si_label(1e6, None), "1Meg");
+        assert_eq!(si_label(-5e-5, Some("s")), "-50µs");
+        assert_eq!(si_label(1.5e3, None), "1.5k");
+        assert_eq!(si_label(1e13, None), "1.00e13");
+        assert_eq!(si_label(1e-13, None), "1.00e-13");
+    }
+
     /// Text nodes escape the XML specials; plain text passes through.
     #[test]
     fn svg_text_is_xml_escaped() {
@@ -1011,7 +1187,7 @@ R2 out 0 3k
         assert!(doc.contains(">1: time=1, V(out)=2</text>"), "{doc}");
         assert!(doc.contains(">2: time=2, V(out)=5</text>"), "{doc}");
         assert!(doc.contains(">Δtime=1, ΔV(out)=3</text>"), "{doc}");
-        assert!(doc.contains(">f = 1/Δtime = 1</text>"), "{doc}");
+        assert!(doc.contains(">f = 1/Δtime = 1Hz</text>"), "{doc}");
     }
 
     /// Three requests still crosshair two per panel (LTspice's limit),
@@ -1021,6 +1197,40 @@ R2 out 0 3k
         let doc = svg_document_with_cursors(&ramp_raw(), &[], &[0.6, 2.4, 2.9]);
         assert_eq!(doc.matches("r=\"3\" fill=\"#aa00aa\"").count(), 2, "{doc}");
         assert!(doc.contains(">Δtime=1, ΔV(out)=3</text>"), "{doc}");
+    }
+
+    /// A `.ac dec` sweep carries the `log` flag: x maps logarithmically
+    /// from the data's own edges (the first sample pins at the frame —
+    /// no pads), the decade ticks spell `1k`/`10k`, and no minor
+    /// logarithm tick earns a label.
+    #[test]
+    fn ac_log_axis_spells_decades() {
+        let (raw, _) = sim(AC_DECK);
+        let doc = svg_document(&raw, &[]);
+        assert!(doc.contains(">1k</text>"), "{doc}");
+        assert!(doc.contains(">10k</text>"), "{doc}");
+        assert!(!doc.contains(">2k</text>"), "{doc}");
+        let curve = doc
+            .lines()
+            .find(|line| line.contains("<polyline"))
+            .expect("polyline");
+        assert!(curve.contains("78.00,"), "{curve}");
+    }
+
+    /// A real transient axis carrying multiple seconds-spans spells its
+    /// ticks SI-style: the 0..1ms sweep pads to a −50µ..1.05m linear x
+    /// ladder, while the y volts climb the same ladder with their own
+    /// magnitudes.
+    #[test]
+    fn transient_ticks_spell_si() {
+        let (raw, _) = sim(TRAN_DECK);
+        let doc = svg_document(&raw, &[]);
+        assert!(doc.contains(">-50µ</text>"), "{doc}");
+        assert!(doc.contains(">170µ</text>"), "{doc}");
+        assert!(doc.contains(">390µ</text>"), "{doc}");
+        assert!(doc.contains(">610µ</text>"), "{doc}");
+        assert!(doc.contains(">830µ</text>"), "{doc}");
+        assert!(doc.contains(">1.05m</text>"), "{doc}");
     }
 
     /// Requests outside the x span, cursorless calls, and a panel with no
@@ -1105,15 +1315,15 @@ R2 out 0 3k
         assert!(doc.contains(">V(out): r=2000</text>"), "{doc}");
         assert!(doc.contains("stroke=\"#008000\""), "{doc}");
         assert!(doc.contains("stroke=\"#0000d0\""), "{doc}");
-        // Shared y scale: values reach 6, both ends pad 5% → the top tick
-        // is 6.3; a first-run-only scale would top out at 3.15. And run
-        // one's max (3) maps to exact mid-panel y under that shared scale.
-        assert!(doc.contains(">6.3</text>"), "{doc}");
+        // Shared y scale: values reach 6, both ends pad 5% off the data →
+        // the top tick is 6.25; a first-run-only scale would top out at
+        // 3.15. Run one's max (3) lands below mid-panel on that scale.
+        assert!(doc.contains(">6.25</text>"), "{doc}");
         let green = doc
             .lines()
             .find(|line| line.contains("stroke=\"#008000\""))
             .expect("green polyline");
-        assert!(green.contains(",204.00"), "{green}");
+        assert!(green.contains(",234.91"), "{green}");
     }
 
     /// Real transient axes live in seconds: a sub-1.0 span (here 20 µs)
@@ -1128,7 +1338,7 @@ R2 out 0 3k
             }
         }
         let doc = svg_document(&raw, &tr(&["V(out)"]));
-        assert!(doc.contains("410.00,255.52"), "{doc}");
+        assert!(doc.contains("410.00,296.73"), "{doc}");
         assert!(doc.contains("711.82,49.45"), "{doc}");
     }
 

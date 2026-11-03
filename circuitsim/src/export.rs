@@ -1276,6 +1276,9 @@ R2 out 0 1k
         assert_eq!(doc.matches("<polyline").count(), 2, "{doc}");
         assert!(doc.contains(">vout vs r</text>"), "{doc}");
         assert!(doc.contains(">isrc vs r</text>"), "{doc}");
+        // The x scale pads 5% past both data ends instead of anchoring at 0:
+        // runs span 1000..2000 ohms, so the first labelled tick is 950.
+        assert!(doc.contains(">950</text>"), "{doc}");
         // Panel titles only: performance curves carry no legend chips.
         assert!(!doc.contains("text-anchor=\"end\" fill="), "{doc}");
     }

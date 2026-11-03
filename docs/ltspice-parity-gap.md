@@ -190,7 +190,7 @@ LTspice `barbitrarybehavioralvoltageorcur.htm`: `R=<expr>` (behavioral resistor)
 | 9.1 | Cursors | Crosshair cursors with readouts and measured deltas (dual cursors; cursor measurements). | **Missing.** | `circuitsim-gui/src/plot.rs`/`plot_frame.rs` — cursor state + readout + delta annotations. |
 | 9.2 | Waveform arithmetic | Add arbitrary expression traces (`V(out)*I(V1)` power, scaled, offset, combined). | **Done (core + CLI + GUI transient).** `arith.rs` evaluates expressions over `.raw` columns; CLI `--expr`; GUI Waveforms → Expression. | Remaining: `.ac`/`.dc` plots in the GUI, axis-statistic functions (`integ`, `avg`, `rms`). |
 | 9.3 | FFT | FFT of transient traces with configurable windowing (Blackman-Harris et al.). | **Missing.** | GUI: FFT panel + window function; reuse `.four` or a standalone FFT. |
-| 9.4 | Stepped/parametric overlays | All `.step` runs on one plot with per-run identification; PSpice performance-analysis curves (measurement vs swept parameter). | Partially (results tagged per step; GUI overlays open). | GUI `plot.rs` overlays + legend per run; measurement-vs-parameter curve from `.meas`/`.step`. |
+| 9.4 | Stepped/parametric overlays | All `.step` runs on one plot with per-run identification; PSpice performance-analysis curves (measurement vs swept parameter). | CLI done (SVG overlay panel per run + `--perf` measurement-vs-parameter curves; GUI views open). | GUI `plot.rs` overlays + legend per run rendering the same overlays/curves as the CLI. |
 | 9.5 | Axis completeness | linear/log both axes, physical unit auto-detection & formatting (Hz/s/V/A/dB/°), multi-pane layouts. | Partially (log grid, dB mode, AcMagScale/AcCursor exist). | `plot.rs` axis formatting, multi-pane. |
 | 9.6 | Cross-probing | Click wire/part in schematic → add `V(net)`/`I(device)` in viewer; and vice versa. | **Missing.** | GUI: schematic↔plot wire-up; probe a pin/net adds a trace. |
 | 9.7 | Waveform file I/O | Read/write binary & ASCII `.raw` (LTspice) / `.dat` (PSpice), incl. step-run metadata. | `.raw` done (binary + ASCII, stepped runs). `.dat` (PSpice) missing. | `rawwave.rs` add PSpice `.dat` reader/writer. |
@@ -214,7 +214,7 @@ LTspice `barbitrarybehavioralvoltageorcur.htm`: `R=<expr>` (behavioral resistor)
 | 10.3 | Sensitivity analysis | Ranked parameter sensitivities of a target measurement. | **Missing.** | `.sens`-style adjoint or finite-difference sensitivities. |
 | 10.4 | Optimizer | Curve-fitting parameter tuning against measurement goals (goal-function library, user-defined goals). | **Missing.** | Optimizer loop over `.step`/`.meas`. |
 | 10.5 | Smoke test | Device stress checks (max V/I/power/temperature from model cards) + derating tables. | **Missing.** | Post-run check against `.model` max ratings. |
-| 10.6 | Performance analysis | Measurement-vs-parameter curves across parametric runs. | **Missing.** | GUI (9.4) + `.meas`/`.step` integration. |
+| 10.6 | Performance analysis | Measurement-vs-parameter curves across parametric runs. | CLI done (`svg_performance` + `--perf`; error paths for unstepped/multi-target/`.mc`/measless decks). | GUI rendering of the same curves (9.4). |
 | 10.7 | Digital primitives & mixed signal | Gates, flip-flops, `PINDLY`/`CONSTRAINT`, `DIGSTIM`/`DIGCLOCK`/`STIM*`/`FILESTIM`, A/D & D/A bridges, analog co-simulation during `.tran`. | **Missing.** | Digital element family + event-driven co-solver. Large; P2/PS. |
 | 10.8 | IBIS | IBIS I/O model translation & simulation. | **Missing.** | IBIS parser + I/O buffer model. P2/PS. |
 

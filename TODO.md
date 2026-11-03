@@ -300,8 +300,18 @@ below is written against that state.
   taper, next-power-of-two resample, bin = 1/span, `{trace} (FFT)` plots) + CLI `--fft` SVG;
   parameterized windows (Dolph-Chebyshev, Kaiser-Bessel, Gaussian, …) deferred; GUI viewing is a
   later §7 item)*
-- [ ] **[P1] (both)** Stepped/parametric overlays: all `.step`/parametric runs on one plot with per-run
+- [x] **[P1] (both)** Stepped/parametric overlays: all `.step`/parametric runs on one plot with per-run
   identification; PSpice performance-analysis curves of a measurement vs swept parameter belong here.
+  *(done: CLI `--image` overlays — same-shape `.raw` plots group in first-occurrence order and draw
+  one curve per (run, trace) on shared y/x scales, each legend chip naming the run's step values
+  (run ordinals for reader-built files without them); step columns stay metadata and never draw,
+  cursors snap to run 0's first kept trace, and a sub-1-s x axis no longer clamps into [0,1]; PSpice
+  performance analysis landed as CLI `--perf` — `svg_performance` renders one `{meas} vs {step}`
+  panel per distinct `.meas` name (measured runs only: a run whose meas failed is skipped, all-fail
+  keeps just the frame, a single-point run draws a circle), axes span the plotted points with 5% pad
+  on both ends and no zero anchor, titles only with no legend chips; unstepped results, multi-target
+  sweeps and `.mc` runs are each rejected with their own error, as is a stepped deck with no
+  `.meas`. GUI overlays of these remain a later §7 item)*
 - [ ] **[P1] (both)** Axis completeness: linear/log on both axes, physical unit auto-detection and
   formatting (Hz/s/V/A/dB/°), multi-pane layouts.
 - [ ] **[P1] (both)** Cross-probing: click a wire/part in the schematic to add/trace `V(net)` and
@@ -389,7 +399,7 @@ below is written against that state.
 - [ ] **[P2] (PS AA)** Smoke test: device stress checks (max V/I/power/temperature from model cards)
   with derating tables.
 - [ ] **[P2] (PS AA)** Performance analysis: measurement-vs-parameter curves across parametric runs
-  (see Waveforms section item).
+  (the CLI `--perf` curves landed with the Waveforms overlay item; this row tracks the GUI view).
 - [ ] **[P2] (PS)** Digital primitives & mixed signal: gates, flip-flops, `PINDLY`/`CONSTRAINT`,
   digital stimulus (`DIGSTIM`, `DIGCLOCK`, `STIM*`, `FILESTIM`), A/D and D/A interface bridges, analog
   co-simulation during `.tran`.

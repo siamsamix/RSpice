@@ -110,8 +110,27 @@ below is written against that state.
   **Still open:** nonlinear decks refactor every iterate (a new Jacobian each time); modified Newton or a
   partial refactor of only the nonlinear rows would change iterate paths and needs its own decision;
   `touched.compress()` still re-runs per solve.)*
-- [ ] **[P1] (LT baseline)** Multithreaded matrix assembly/factorization and time-stepping loop;
-  LTspice is threaded today, PSpice multithreading is unclear on this baseline.
+- [x] **[P1] (LT baseline)** Multithreaded matrix assembly/factorization and time-stepping loop;
+  LTspice is threaded today, PSpice multithreading is unclear on this baseline. *(Measured, not
+  asserted. Run-level parallelism is what LTspice's reserve threads (row 5.5.8 in the parity doc) do
+  — per-run work spread over workers — and RSpice already has it for `.step`/`.mc`/`.temp`
+  (`run_with_threads`, `RSPICE_THREADS`, CLI `-j/--jobs`, line 535). The in-loop shares, split by
+  instrumentation on the benchmark (rc-ladder-200, n=201, 203 steps, 1216 builds): assembly
+  stamping is 7–11 ms of a 148–161 ms wall (≈5%; a two-way stamp split pays ≤2.5% before sync
+  overhead); LU is Gilbert–Peierls over a fixed Markowitz column order — inherently sequential —
+  and 593/609 solves are served from cached factorizations (`factor_stats`), leaving ~16
+  refactorizations; the time-step loop consumes each step's accepted state, a hard data
+  dependency. The in-loop cost actually worth killing is not a parallelism problem: per-build
+  `DMatrix::zeros(n²)` churns mmap/munmap — ~68–157 µs spikes on ~55–60% of builds, 58–73 ms of
+  the wall; A/B proof `MALLOC_MMAP_THRESHOLD_`+`MALLOC_TRIM_THRESHOLD_`=1 GiB → wall 73–79 ms.
+  Tracked as the next item.)*
+- [ ] **[P2] (both)** Buffer pool instead of fresh `DMatrix::zeros`/`StampBits::zeros` per build
+  (the mmap/munmap churn above costs rc-ladder-200 ~58–73 ms of a ~150 ms wall): thread-local
+  spare buffers per type in `MnaSystem::for_circuit`, refill with `fill(T::zero())`, return on
+  drop. Caution (line 96): reuse-`fill(0.0)` inside the NR loop there measured fill 76.2 µs vs
+  fresh calloc-lazy zeros 10.9 µs and regressed ladder-200 — that probe predates the sparse path,
+  so re-probe fill-vs-fresh over `examples/benchmark.rs` end-to-end before committing; the env
+  knobs (1 GiB thresholds, ≈2× wall) are the no-code fallback if pooling loses.
 - [x] **[P1] (both)** Trapezoidal integration as the default companion model with `.options
   method=gear` (Gear I/II) available — done: trapezoidal default, `gear1`/`gear2` selectable,
   variable-step BDF2 coefficients for Gear II.

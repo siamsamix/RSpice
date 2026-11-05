@@ -1,6 +1,7 @@
 mod app;
 mod chrome;
 mod icons;
+mod parts;
 mod plot;
 mod schematic;
 mod theme;

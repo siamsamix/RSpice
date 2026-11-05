@@ -148,11 +148,17 @@ pub struct SymbolicOrder {
 ///
 /// At every elimination the pivot is the active entry minimizing the full
 /// Markowitz cost `(row_len−1)·(col_len−1)`; ties break on the lowest packed
-/// index `row·n + col`, which makes the scan order (ascending rows, set
-/// iteration ascending within a row) already yield that pivot. The scan is
-/// the honest `O(n·nnz)` version — the dict-of-lists bookkeeping that keeps
-/// Markowitz incremental is a follow-up behind the numeric solver, not
-/// groundwork this slice needs to be correct.
+/// index `row·n + col`, i.e. the key `(cost, row, col)` ascending.
+///
+/// **Incremental** (TODO §3): candidates live in a min-heap keyed
+/// `(cost, row, col)` instead of being re-scanned each step. An elimination
+/// changes the length of every row in the pivot column and every column in the
+/// pivot row, so exactly the entries of those rows/columns are re-pushed with
+/// their new cost; older heap entries of the same slot are *stale* and are
+/// discarded at pop time (dead row/column, entry gone, or cost no longer
+/// current). The pivot sequence is bit-for-bit the one the plain
+/// `O(n·nnz)` scan picks — a randomized test checks this against the retained
+/// scan oracle — it just stops paying for the entries nothing touched.
 ///
 /// One guard rides on top of the raw cost: a pivot is rejected when it
 /// would strand *another* alive row or column — any other row holding the
@@ -164,10 +170,21 @@ pub struct SymbolicOrder {
 /// still greedy — a transversal existing does not guarantee `Some`, only
 /// makes it far more likely — documented as groundwork behavior.
 ///
+/// Why discarding a guard-failed candidate is sound: a row of length 1 never
+/// grows (fill only lands in rows that hold the pivot column, and a length-1
+/// row other than the pivot row holding it would have vetoed that pivot), and
+/// it dies only when it is itself the pivot row — together with its single
+/// column. The same holds for length-1 columns. So an entry the guard rejects
+/// stays rejected for as long as it exists, and a later re-push of the slot
+/// is rejected again.
+///
 /// Returns `None` when no admissible pivot remains among the active
 /// entries: the surviving structure has nothing left to eliminate (no
 /// single-entry solve can come out of that shape).
 pub fn markowitz_ordering(pattern: &CompressedPattern) -> Option<SymbolicOrder> {
+    use std::cmp::Reverse;
+    use std::collections::BinaryHeap;
+
     let n = pattern.n();
     // Active bookkeeping: alive rows' visited columns and alive columns'
     // visited rows, always in sync — a dead row/column leaves both sides.
@@ -183,44 +200,42 @@ pub fn markowitz_ordering(pattern: &CompressedPattern) -> Option<SymbolicOrder> 
         }
     }
 
+    let mut heap: BinaryHeap<Reverse<(usize, usize, usize)>> = BinaryHeap::new();
+    for (row, cols) in row_cols.iter().enumerate() {
+        for &col in cols {
+            heap.push(Reverse(((cols.len() - 1) * (col_rows[col].len() - 1), row, col)));
+        }
+    }
+
     let mut order = Vec::with_capacity(n);
     let mut fill = 0usize;
     for _ in 0..n {
-        // The cheapest active pivot; the strict `<` keeps the first minimum,
-        // and candidates arrive in packed order, so ties break lowest.
-        let mut best: Option<(usize, usize, usize)> = None;
-        for row in 0..n {
-            if !rows_alive[row] {
+        let (pivot_row, pivot_col) = loop {
+            let Reverse((cost, row, col)) = heap.pop()?;
+            // Stale entries: a dead side, a vanished slot, or a cost that has
+            // since been re-pushed with its current value.
+            if !rows_alive[row] || !cols_alive[col] || !row_cols[row].contains(&col) {
                 continue;
             }
-            let row_len = row_cols[row].len();
-            for &col in &row_cols[row] {
-                debug_assert!(cols_alive[col], "dead column revisited");
-                // The stranding guard: skip pivots whose elimination empties
-                // another alive row or column outright.
-                let strands_a_row = col_rows[col]
-                    .iter()
-                    .any(|&other| other != row && row_cols[other].len() == 1);
-                if strands_a_row {
-                    continue;
-                }
-                let strands_a_col = row_cols[row]
-                    .iter()
-                    .any(|&other| other != col && col_rows[other].len() == 1);
-                if strands_a_col {
-                    continue;
-                }
-                let cost = (row_len - 1) * (col_rows[col].len() - 1);
-                let better = match best {
-                    None => true,
-                    Some((best_cost, _, _)) => cost < best_cost,
-                };
-                if better {
-                    best = Some((cost, row, col));
-                }
+            if cost != (row_cols[row].len() - 1) * (col_rows[col].len() - 1) {
+                continue;
             }
-        }
-        let (_, pivot_row, pivot_col) = best?;
+            // The stranding guard: skip pivots whose elimination empties
+            // another alive row or column outright.
+            let strands_a_row = col_rows[col]
+                .iter()
+                .any(|&other| other != row && row_cols[other].len() == 1);
+            if strands_a_row {
+                continue;
+            }
+            let strands_a_col = row_cols[row]
+                .iter()
+                .any(|&other| other != col && col_rows[other].len() == 1);
+            if strands_a_col {
+                continue;
+            }
+            break (row, col);
+        };
 
         // Eliminating (pivot_row, pivot_col) crosses the pivot's column
         // neighbors with its row neighbors: every such pair becomes an
@@ -253,6 +268,27 @@ pub fn markowitz_ordering(pattern: &CompressedPattern) -> Option<SymbolicOrder> 
         row_cols[pivot_row].clear();
         col_rows[pivot_col].clear();
         order.push((pivot_row as u32, pivot_col as u32));
+
+        // Re-price every entry whose row or column just changed length: the
+        // rows that held the pivot column, and the columns the pivot row held.
+        for &row in &rows_c {
+            if row == pivot_row {
+                continue;
+            }
+            let row_len = row_cols[row].len();
+            for &col in &row_cols[row] {
+                heap.push(Reverse(((row_len - 1) * (col_rows[col].len() - 1), row, col)));
+            }
+        }
+        for &col in &cols_r {
+            if col == pivot_col {
+                continue;
+            }
+            let col_len = col_rows[col].len();
+            for &row in &col_rows[col] {
+                heap.push(Reverse(((row_cols[row].len() - 1) * (col_len - 1), row, col)));
+            }
+        }
     }
     Some(SymbolicOrder { order, fill })
 }
@@ -629,6 +665,179 @@ pub(crate) fn sparse_plan(pattern: &CompressedPattern) -> Option<Arc<SparsePlan>
 
 #[cfg(test)]
 mod tests {
+
+    // ── Incremental ordering vs the scan oracle ─────────────────────────────
+
+    /// The original `O(n·nnz)` scan, kept as the oracle the incremental
+    /// [`markowitz_ordering`] is checked against pivot for pivot.
+    fn markowitz_ordering_scan(pattern: &CompressedPattern) -> Option<SymbolicOrder> {
+        let n = pattern.n();
+        // Active bookkeeping: alive rows' visited columns and alive columns'
+        // visited rows, always in sync — a dead row/column leaves both sides.
+        let mut rows_alive = vec![true; n];
+        let mut cols_alive = vec![true; n];
+        let mut row_cols: Vec<BTreeSet<usize>> = (0..n)
+            .map(|row| pattern.columns_of(row).iter().copied().collect())
+            .collect();
+        let mut col_rows: Vec<BTreeSet<usize>> = vec![BTreeSet::new(); n];
+        for (row, cols) in row_cols.iter().enumerate() {
+            for &col in cols {
+                col_rows[col].insert(row);
+            }
+        }
+
+        let mut order = Vec::with_capacity(n);
+        let mut fill = 0usize;
+        for _ in 0..n {
+            // The cheapest active pivot; the strict `<` keeps the first minimum,
+            // and candidates arrive in packed order, so ties break lowest.
+            let mut best: Option<(usize, usize, usize)> = None;
+            for row in 0..n {
+                if !rows_alive[row] {
+                    continue;
+                }
+                let row_len = row_cols[row].len();
+                for &col in &row_cols[row] {
+                    debug_assert!(cols_alive[col], "dead column revisited");
+                    // The stranding guard: skip pivots whose elimination empties
+                    // another alive row or column outright.
+                    let strands_a_row = col_rows[col]
+                        .iter()
+                        .any(|&other| other != row && row_cols[other].len() == 1);
+                    if strands_a_row {
+                        continue;
+                    }
+                    let strands_a_col = row_cols[row]
+                        .iter()
+                        .any(|&other| other != col && col_rows[other].len() == 1);
+                    if strands_a_col {
+                        continue;
+                    }
+                    let cost = (row_len - 1) * (col_rows[col].len() - 1);
+                    let better = match best {
+                        None => true,
+                        Some((best_cost, _, _)) => cost < best_cost,
+                    };
+                    if better {
+                        best = Some((cost, row, col));
+                    }
+                }
+            }
+            let (_, pivot_row, pivot_col) = best?;
+
+            // Eliminating (pivot_row, pivot_col) crosses the pivot's column
+            // neighbors with its row neighbors: every such pair becomes an
+            // entry, and the ones not already present are fill.
+            let cols_r: Vec<usize> = row_cols[pivot_row].iter().copied().collect();
+            let rows_c: Vec<usize> = col_rows[pivot_col].iter().copied().collect();
+            for &row in &rows_c {
+                if row == pivot_row {
+                    continue;
+                }
+                for &col in &cols_r {
+                    if col == pivot_col {
+                        continue;
+                    }
+                    if row_cols[row].insert(col) {
+                        fill += 1;
+                    }
+                    col_rows[col].insert(row);
+                }
+            }
+            // The pivot's row/column die; scrub them from every active set.
+            for &col in &cols_r {
+                col_rows[col].remove(&pivot_row);
+            }
+            for &row in &rows_c {
+                row_cols[row].remove(&pivot_col);
+            }
+            rows_alive[pivot_row] = false;
+            cols_alive[pivot_col] = false;
+            row_cols[pivot_row].clear();
+            col_rows[pivot_col].clear();
+            order.push((pivot_row as u32, pivot_col as u32));
+        }
+        Some(SymbolicOrder { order, fill })
+    }
+
+    /// A tiny deterministic generator (SplitMix64) so the property test needs
+    /// no dependency and reproduces from its seed.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+        fn below(&mut self, n: usize) -> usize {
+            (self.next() % n as u64) as usize
+        }
+    }
+
+    fn random_pattern(rng: &mut Rng, n: usize, kind: usize) -> CompressedPattern {
+        let mut bits = StampBits::zeros(n);
+        match kind {
+            // Unstructured: diagonal-free to dense, any density.
+            0 => {
+                let density = 1 + rng.below(40);
+                for r in 0..n {
+                    for c in 0..n {
+                        if rng.below(100) < density {
+                            bits.visit(r, c);
+                        }
+                    }
+                }
+            }
+            // MNA-shaped: a symmetric node block with a full diagonal, plus
+            // branch rows/columns carrying ±1 stamps and no diagonal.
+            _ => {
+                let nodes = (n * 2 / 3).max(1);
+                for i in 0..nodes {
+                    bits.visit(i, i);
+                    let neighbours = rng.below(3);
+                    for _ in 0..neighbours {
+                        let j = rng.below(nodes);
+                        bits.visit(i, j);
+                        bits.visit(j, i);
+                    }
+                }
+                for b in nodes..n {
+                    let p = rng.below(nodes);
+                    let q = rng.below(nodes);
+                    bits.visit(p, b);
+                    bits.visit(b, p);
+                    if p != q {
+                        bits.visit(q, b);
+                        bits.visit(b, q);
+                    }
+                }
+            }
+        }
+        bits.compress()
+    }
+
+    #[test]
+    fn incremental_ordering_matches_the_scan_oracle_pivot_for_pivot() {
+        let mut rng = Rng(0x5EED_0001);
+        let (mut some, mut none) = (0, 0);
+        for case in 0..1500 {
+            let n = 1 + rng.below(36);
+            let pattern = random_pattern(&mut rng, n, case % 3);
+            let fast = markowitz_ordering(&pattern);
+            let slow = markowitz_ordering_scan(&pattern);
+            assert_eq!(fast, slow, "case {case} (n={n}) diverged");
+            if fast.is_some() {
+                some += 1;
+            } else {
+                none += 1;
+            }
+        }
+        // Both outcomes must be exercised or the equivalence proves little.
+        assert!(some > 200 && none > 50, "weak corpus: {some} orders, {none} stuck");
+    }
+
     use super::*;
 
     /// Compress a record built with individual visits.

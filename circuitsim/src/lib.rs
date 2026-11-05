@@ -33,8 +33,8 @@ pub use analysis::{AcResult, DcResult, DcSweepPoint, DcSweepResult, FourOutput, 
                    TfResult, TranPoint, TranResult};
 pub use netlist::{AcCommand, AcScale, DcCommand, DcSweepSpec, DcSweepValues, MeasAnalysis,
                   FourCommand, NoiseCommand, MeasEdge, MeasFunc, MeasKind, Measurement, NodesetEntry,
-                  ParseOptions, StepSpec, StepValues, TfCommand, TfOutput, parse,
-                  parse_with_options};
+                  ParseOptions, SaveBiasCommand, SaveSpec, StepSpec, StepValues, TfCommand, TfOutput,
+                  parse, parse_with_options};
 pub use circuit::{AbmForm, AbmMeasure, BehavioralKind, BehavioralSource, Circuit, ControlVar,
                   ControlledSource, CurrentSource, Diode, DiodeModel, GenericModel, Jfet,
                   JfetModel, ModelTolerance, Mosfet, MosfetModel, MutualInductance, OpAmp,

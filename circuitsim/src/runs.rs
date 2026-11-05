@@ -17,12 +17,12 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 use crate::analysis::{
-    run_single, sweep_values, AcResult, DcResult, DcSweepResult, FourResult, MeasureResult,
-    NoiseResult, SimulationResult, TfResult, TranResult,
+    run_single, sweep_values, AcResult, DcResult, DcSweepPoint, DcSweepResult, FourResult,
+    MeasureResult, NoiseResult, SimulationResult, TfResult, TranPoint, TranResult,
 };
 use crate::error::{Result, SimError};
 use crate::mc;
-use crate::netlist::{DcSweepValues, Netlist, StepSpec, StepValues};
+use crate::netlist::{DcSweepValues, Netlist, SaveBiasCommand, StepSpec, StepValues};
 
 // ─── Result shape ────────────────────────────────────────────────────────────
 
@@ -89,7 +89,9 @@ pub fn run_with_threads(netlist: &Netlist, threads: usize) -> Result<SimulationR
         // A single `.temp` value simply sets the run temperature; several
         // values are the same thing as `.step temp LIST …`.
         if netlist.analysis.temperatures.len() <= 1 {
-            return run_single(netlist);
+            let result = run_single(netlist)?;
+            write_savebias(netlist, &result)?;
+            return Ok(result);
         }
         specs.push(StepSpec {
             target: "temp".to_string(),
@@ -172,6 +174,141 @@ fn run_mc(netlist: &Netlist, threads: usize) -> Result<SimulationResult> {
         ".mc produced no runs",
         threads,
     )
+}
+
+// ─── `.savebias` ─────────────────────────────────────────────────────────────
+
+/// `.savebias`: once the run finished, write the solved DC snapshot it
+/// named to disk in `.nodeset` text form — the form [`crate::netlist`]`'s `
+/// `.loadbias` reads straight back. Selection mirrors LTspice: a transient
+/// snapshot (`time=`/`repeat`) beats a `.dc` sweep point (`DC1=..DC3=`)
+/// beats the operating point; nothing at all to save leaves any existing
+/// file alone. Without a card this is a no-op, so every driver can call it
+/// at its tail.
+#[cfg(target_arch = "wasm32")]
+fn write_savebias(netlist: &Netlist, _result: &SimulationResult) -> Result<()> {
+    if netlist.analysis.savebias.is_some() {
+        return Err(SimError::Analysis(
+            ".savebias cannot write files on the web build".into(),
+        ));
+    }
+    Ok(())
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+fn write_savebias(netlist: &Netlist, result: &SimulationResult) -> Result<()> {
+    use std::path::{Path, PathBuf};
+
+    let Some(cmd) = netlist.analysis.savebias.as_ref() else {
+        return Ok(());
+    };
+    // Which run to save from: `step=<n>` names the 1-based step run of a
+    // `.step`/`.mc` deck; otherwise the mirrored top-level view (run 0's
+    // copy of a stepped deck, the single run otherwise) — the state
+    // LTspice's most recently solved solution is.
+    let (dc, dc_sweep, tran): (
+        Option<&DcResult>,
+        Option<&DcSweepResult>,
+        Option<&TranResult>,
+    ) = match cmd.step {
+        Some(step) => {
+            let run = result.runs.get(step - 1).ok_or_else(|| {
+                SimError::Analysis(format!(
+                    ".savebias step={step} names a run past the {} runs this deck made",
+                    result.runs.len()
+                ))
+            })?;
+            (run.dc.as_ref(), run.dc_sweep.as_ref(), run.tran.as_ref())
+        }
+        None => (
+            result.dc.as_ref(),
+            result.dc_sweep.as_ref(),
+            result.tran.as_ref(),
+        ),
+    };
+
+    // The snapshot, in order of analysis-kind precedence.
+    let voltages: Option<&[f64]> = if let Some(tran) = tran {
+        let want = tran_point(tran, cmd);
+        want.map(|p| p.node_voltages.as_slice())
+    } else if let Some(sweep) = dc_sweep {
+        let want = sweep_point(sweep, cmd);
+        want.map(|p| p.node_voltages.as_slice())
+    } else {
+        dc.map(|dc| dc.node_voltages.as_slice())
+    };
+    let Some(voltages) = voltages else {
+        return Ok(()); // nothing solved worth writing
+    };
+
+    // One `.nodeset` entry per net, deck-spelled names, finite values — the
+    // exact shape the loader folds back into the deck.
+    let mut text = String::from("* .savebias snapshot (RSpice) — load it back with .loadbias\n");
+    let mut kept = 0;
+    for (i, &v) in voltages.iter().enumerate() {
+        let name = netlist.circuit.node_name(i);
+        if name.is_empty() || !v.is_finite() {
+            continue;
+        }
+        text.push_str(&format!(".nodeset V({name})={v}\n"));
+        kept += 1;
+    }
+    if kept == 0 {
+        return Ok(());
+    }
+
+    // Path: absolute travels as-is; a file-backed deck saves next to
+    // itself; otherwise the working directory spells it.
+    let bare = cmd.file.trim().trim_matches(|c| c == '"' || c == '\'');
+    let bare = bare.trim();
+    if bare.is_empty() {
+        return Err(SimError::Analysis(
+            ".savebias needs a filename to write".into(),
+        ));
+    }
+    let path: PathBuf = match netlist.options.deck_dir.as_deref() {
+        Some(dir) if !Path::new(bare).is_absolute() => dir.join(bare),
+        _ => PathBuf::from(bare),
+    };
+    std::fs::write(&path, text).map_err(|e| {
+        SimError::Analysis(format!(".savebias could not write {}: {e}", path.display()))
+    })
+}
+
+/// The transient snapshot the card names: `time=` without `repeat` saves at
+/// the first sample that reaches the instant (LTspice writes when the run
+/// crosses it); `repeat` (and no `time=` at all) reduces to the same thing
+/// the end-of-run solution is — the file always holds only the most
+/// recently solved point. A run that never reached `time=` falls back to
+/// its own end-of-run solution the same way.
+fn tran_point<'a>(tran: &'a TranResult, cmd: &SaveBiasCommand) -> Option<&'a TranPoint> {
+    let at_want = cmd
+        .time
+        .and_then(|want| tran.points.iter().find(|p| p.time >= want));
+    at_want.or_else(|| tran.points.last())
+}
+
+/// The `.dc` snapshot: `DC1=..DC3=` name the sweep values in spec order,
+/// matched back to front (the most recently solved point of the sweep);
+/// unqualified, that last swept point is what's saved.
+fn sweep_point<'a>(sweep: &'a DcSweepResult, cmd: &SaveBiasCommand) -> Option<&'a DcSweepPoint> {
+    let hit = sweep.points.iter().rev().find(|p| {
+        cmd.dc
+            .iter()
+            .enumerate()
+            .all(|(i, want)| match (want, p.values.get(i)) {
+                (Some(want), Some(got)) => near_eq(*want, *got),
+                (None, _) => true,
+                (Some(_), None) => false,
+            })
+    });
+    hit.or_else(|| sweep.points.last())
+}
+
+/// Two values close enough to name the same sweep point: swept arithmetic
+/// is exact to a rounding, so a relative 1e-9 epsilon decides.
+fn near_eq(want: f64, got: f64) -> bool {
+    (want - got).abs() <= 1e-9 * want.abs().max(got.abs()).max(1.0)
 }
 
 // ─── The mint choreography ───────────────────────────────────────────────────
@@ -272,7 +409,7 @@ fn run_plans(
         .first()
         .cloned()
         .ok_or_else(|| SimError::Analysis(no_runs.to_string()))?;
-    Ok(SimulationResult {
+    let result = SimulationResult {
         dc: first.dc,
         dc_sweep: first.dc_sweep,
         tran: first.tran,
@@ -283,7 +420,12 @@ fn run_plans(
         measurements: first.measurements,
         four: first.four,
         noise: first.noise,
-    })
+    };
+    // The plan-level cleanup of a deck asking to save its solution; runs
+    // land after so a `.savebias` error still reports against a finished
+    // set of runs — matching LTspice writing at the end of the run.
+    write_savebias(netlist, &result)?;
+    Ok(result)
 }
 
 /// One plan: mint its deck, run it, land the `StepRun` — the per-plan body

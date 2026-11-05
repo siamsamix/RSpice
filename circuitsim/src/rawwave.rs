@@ -33,7 +33,7 @@ use crate::analysis::{
 use crate::circuit::{Circuit, CURRENT_FAMILIES};
 use crate::error::{Result, SimError};
 use crate::mna::BranchCurrents;
-use crate::netlist::{AcScale, Netlist};
+use crate::netlist::{AcScale, Netlist, SaveSpec};
 use num_complex::Complex64;
 use std::fmt::Write as _;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -172,7 +172,80 @@ pub fn build(title: &str, netlist: &Netlist, result: &SimulationResult) -> RawFi
             datasets.push(noise_dataset(title, net, noise, step_values));
         }
     }
+    // `.save`: every plot of the file picks its traces from one list,
+    // so a post-build pass covers all output paths the CLI wires through.
+    if !netlist.analysis.save.is_empty() {
+        for dataset in &mut datasets {
+            apply_save_filter(dataset, &netlist.analysis.save);
+        }
+    }
     RawFile { datasets }
+}
+
+/// `.save` trace filter: keep the axis column (0), the step columns, and
+/// the traces the card names — drop the rest, so the file size honors the
+/// card's promise. Runs over whole datasets after the plots were built
+/// (columns were appended, values filled); a card matching nothing leaves
+/// a bare axis plot rather than an error, like LTspice closing the window.
+fn apply_save_filter(dataset: &mut RawDataset, save: &[SaveSpec]) {
+    let step_base = dataset.variables.len() - dataset.steps.len();
+    let keep: Vec<usize> = (0..dataset.variables.len())
+        .filter(|&i| i == 0 || i >= step_base || saved_probe(save, &dataset.variables[i].name))
+        .collect();
+    if keep.len() == dataset.variables.len() {
+        return; // everything stayed saved anyway
+    }
+    let variables: Vec<RawVariable> = keep.iter().map(|&i| dataset.variables[i].clone()).collect();
+    dataset.variables = variables;
+    dataset.values = dataset
+        .values
+        .drain(..)
+        .map(|row| keep.iter().map(|&i| row[i]).collect())
+        .collect();
+}
+
+/// Does a saved probe cover a raw trace name? Trace spellings are the
+/// deck's own (`V(out)`, `I(R1)`, `Ic(Q1)`), so a bare `I(Q1)` covers
+/// every terminal current of Q1 (`Ib`/`Ic`/`Ie` all start with the `I`
+/// family word); a spelling like `Ic(Q2)` names one terminal. Parameter
+/// targets travel as their own columns and survive as step columns.
+fn saved_probe(save: &[SaveSpec], var_name: &str) -> bool {
+    let Some((func, inner)) = var_name.split_once('(') else {
+        return false;
+    };
+    let inner = inner.strip_suffix(')').unwrap_or(inner);
+    let func = func.to_ascii_lowercase();
+    save.iter().any(|spec| {
+        let probe = spec.probe.to_ascii_lowercase();
+        (probe == func || (probe == "i" && func.starts_with('i'))) && glob_match(&spec.name, inner)
+    })
+}
+
+/// Iterative `*`/`?` matcher with per-star backtracking; both sides compare
+/// lowercase, and `:` (hierarchy) is an ordinary character. `*` crosses
+/// everything including nothing, `?` exactly one char.
+fn glob_match(pattern: &str, text: &str) -> bool {
+    let pattern: Vec<char> = pattern.to_ascii_lowercase().chars().collect();
+    let text: Vec<char> = text.to_ascii_lowercase().chars().collect();
+    let (mut pi, mut ti) = (0usize, 0usize);
+    let (mut star, mut star_text) = (None::<usize>, 0usize);
+    while ti < text.len() {
+        if pi < pattern.len() && (pattern[pi] == '?' || pattern[pi] == text[ti]) {
+            pi += 1;
+            ti += 1;
+        } else if pi < pattern.len() && pattern[pi] == '*' {
+            star = Some(pi);
+            star_text = ti;
+            pi += 1;
+        } else if let Some(star) = star {
+            pi = star + 1;
+            star_text += 1;
+            ti = star_text;
+        } else {
+            return false;
+        }
+    }
+    pattern[pi..].iter().all(|&c| c == '*')
 }
 
 /// The analysis plots of one run, borrowing both the top-level result and the
@@ -1419,5 +1492,79 @@ mod tests {
             err.to_string().contains("1 values, expected 2"),
             "loud: {err}"
         );
+    }
+
+    /// `.save` prunes every unsaved trace column, keeping the axis and,
+    /// for stepped decks, the step columns.
+    #[test]
+    fn save_card_prunes_traces() {
+        let raw = sim("V1 in 0 5\n\
+             R1 in out 2.5k\n\
+             R2 out 0 2.5k\n\
+             .save V(out)\n\
+             .tran 100n 1u\n\
+             .end\n");
+        let ds = &raw.datasets[0];
+        let names: Vec<&str> = ds.variables.iter().map(|v| v.name.as_str()).collect();
+        assert_eq!(names, ["time", "V(out)"]);
+        let out = ds.trace("V(out)").unwrap();
+        assert_relative_eq!(out[0].re, 2.5, epsilon = 1e-12);
+    }
+
+    /// `I(Q1)` covers the BJT family spelling `Ic(Q1)`; `V(*)` covers every
+    /// node including ground; step columns stay on stepped decks.
+    #[test]
+    fn save_probe_families_and_step_columns() {
+        // The family word: an I(Q1) selector keeps a BJT's Ic column.
+        let raw = sim(".model np NPN(IS=1e-14)\n\
+             V1 c 0 5\n\
+             V2 b 0 0.7\n\
+             Q1 c b 0 np\n\
+             .save I(Q1)\n\
+             .op\n\
+             .end\n");
+        let names: Vec<&str> = raw.datasets[0]
+            .variables
+            .iter()
+            .map(|v| v.name.as_str())
+            .collect();
+        assert_eq!(names, ["time", "Ic(Q1)"]);
+
+        // The wildcard: every V column survives, no current column does.
+        let raw = sim("V1 in 0 5\n\
+             R1 in out 1k\n\
+             R2 out 0 1k\n\
+             .save V(*)\n\
+             .tran 100n 1u\n\
+             .end\n");
+        let names: Vec<&str> = raw.datasets[0]
+            .variables
+            .iter()
+            .map(|v| v.name.as_str())
+            .collect();
+        assert_eq!(names, ["time", "V(0)", "V(in)", "V(out)"]);
+
+        // Stepped: the step column rides along with the saved traces.
+        let raw = sim(".param r=1k\n\
+             V1 in 0 DC 1\n\
+             R1 in out {r}\n\
+             R2 out 0 1k\n\
+             .step param r 1k 3k 1k\n\
+             .save V(out)\n\
+             .op\n\
+             .end\n");
+        assert_eq!(raw.datasets.len(), 3);
+        for (i, ds) in raw.datasets.iter().enumerate() {
+            let names: Vec<&str> = ds.variables.iter().map(|v| v.name.as_str()).collect();
+            assert_eq!(names, ["time", "V(out)", "r"]);
+            let step = ds.trace("r").unwrap();
+            assert_relative_eq!(step[0].re, 1000.0 * (i + 1) as f64, epsilon = 1e-9);
+            let out = ds.trace("V(out)").unwrap();
+            assert_relative_eq!(
+                out[0].re,
+                1_000.0 / (1_000.0 * (i + 1) as f64 + 1_000.0),
+                epsilon = 1e-9
+            );
+        }
     }
 }

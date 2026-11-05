@@ -77,6 +77,10 @@ pub fn default_threads() -> usize {
 /// in plan order, so the result — and which error surfaces first — never
 /// depends on it.
 pub fn run_with_threads(netlist: &Netlist, threads: usize) -> Result<SimulationResult> {
+    // Intra-run regions (AC points, large device lists) share this count: a
+    // single deck may use all of it; plan workers split it (see
+    // `execute_plans`), so nesting never oversubscribes the machine.
+    let _budget = crate::parallel::with_budget(threads);
     if netlist.analysis.mc.is_some() {
         return run_mc(netlist, threads);
     }
@@ -325,7 +329,12 @@ fn execute_plans(netlist: &Netlist, plans: &[RunPlan], threads: usize) -> Result
     let lowest_failure = AtomicUsize::new(usize::MAX);
     let slots: Vec<Mutex<Option<Result<StepRun>>>> =
         plans.iter().map(|_| Mutex::new(None)).collect();
-    let work = || loop {
+    // Each plan worker gets its share of the thread budget for the regions
+    // inside its run, so `-j N` stays N busy threads in total.
+    let inner = (threads.max(1) / workers).max(1);
+    let work = || {
+        let _budget = crate::parallel::with_budget(inner);
+        loop {
         let i = next.fetch_add(1, Ordering::Relaxed);
         if i >= plans.len() || i > lowest_failure.load(Ordering::Relaxed) {
             break;
@@ -335,6 +344,7 @@ fn execute_plans(netlist: &Netlist, plans: &[RunPlan], threads: usize) -> Result
             lowest_failure.fetch_min(i, Ordering::Relaxed);
         }
         *slots[i].lock().expect("run slot") = Some(outcome);
+        }
     };
     std::thread::scope(|scope| {
         for _ in 1..workers {

@@ -1267,6 +1267,25 @@ pub fn ac_frequencies(cmd: &AcCommand) -> Vec<f64> {
     }
 }
 
+/// Frequency points dealt to a sweep worker per grab: a few solves amortize
+/// the atomic counter without leaving a long tail on the last worker.
+const SWEEP_BLOCK: usize = 4;
+
+/// Workers for a frequency sweep of `points` over an MNA system of `size`
+/// unknowns. A thread spawn costs tens of microseconds, while one point of a
+/// tiny deck costs a few — so small systems need many points per worker
+/// before a second thread repays itself (measured on the benchmark suite).
+fn sweep_workers(points: usize, size: usize) -> usize {
+    let per_worker = if size >= 64 {
+        4
+    } else if size >= 24 {
+        16
+    } else {
+        256
+    };
+    crate::parallel::workers_for(points, per_worker)
+}
+
 /// Run a small-signal AC frequency sweep.
 ///
 /// Steps:
@@ -1308,9 +1327,14 @@ pub fn run_ac_sweep(circuit: &Circuit, cmd: &AcCommand, dc_x: &nalgebra::DVector
 
     // Step 2 — sweep.
     let freqs = ac_frequencies(cmd);
-    let mut points = Vec::with_capacity(freqs.len());
 
-    for &freq in &freqs {
+    // Every frequency is an independent complex solve, so the points ride the
+    // intra-run thread budget (TODO §3 multithreading). Results come back in
+    // frequency order and the first error is the lowest-indexed one, exactly
+    // what the serial loop produced — thread count changes wall time only.
+    let workers = sweep_workers(freqs.len(), circuit.tran_matrix_size());
+    let points = crate::parallel::try_map_ordered(freqs.len(), workers, SWEEP_BLOCK, |i| {
+        let freq = freqs[i];
         let mut sys = build_system::<Complex64>(circuit, Mode::Ac { freq, bias: dc_x })?;
         // Drive the stimulus source with the AC amplitude.
         // All other sources remain at 0 V (short circuit in small-signal model).
@@ -1321,8 +1345,8 @@ pub fn run_ac_sweep(circuit: &Circuit, cmd: &AcCommand, dc_x: &nalgebra::DVector
         let node_voltages = extract_voltages(circuit, &x);
         let branch_currents = compute_ac_branch_currents(circuit, &x, freq, dc_x)?;
 
-        points.push(AcPoint { freq, node_voltages, branch_currents });
-    }
+        Ok(AcPoint { freq, node_voltages, branch_currents })
+    })?;
 
     Ok(AcResult {
         points,
@@ -2150,10 +2174,12 @@ pub fn run_noise_analysis(
         stimulus_source: None,
     });
 
-    let mut points = Vec::with_capacity(freqs.len());
-    let mut output_psds = Vec::with_capacity(freqs.len());
-    let mut input_psds = Vec::with_capacity(freqs.len());
-    for &freq in &freqs {
+    // Frequency points are independent (adjoint solve + gain solve each), so
+    // they ride the thread budget like `.ac`; order and first-error semantics
+    // match the serial loop.
+    let workers = sweep_workers(freqs.len(), circuit.tran_matrix_size());
+    let samples = crate::parallel::try_map_ordered(freqs.len(), workers, SWEEP_BLOCK, |i| {
+        let freq = freqs[i];
         let (output_psd, _) = noise_psd_at(circuit, bias, freq, out_p, out_n)?;
 
         // Gain from the input source to the output: drive 1 V and read the
@@ -2166,7 +2192,12 @@ pub fn run_noise_analysis(
             - node_voltage(&gx, crate::circuit::NodeId(out_n));
         let gain2 = gain.norm_sqr();
         let input_psd = if gain2 > 0.0 { output_psd / gain2 } else { f64::NAN };
-
+        Ok::<_, SimError>((output_psd, input_psd))
+    })?;
+    let mut points = Vec::with_capacity(freqs.len());
+    let mut output_psds = Vec::with_capacity(freqs.len());
+    let mut input_psds = Vec::with_capacity(freqs.len());
+    for (&freq, (output_psd, input_psd)) in freqs.iter().zip(samples) {
         output_psds.push(output_psd);
         input_psds.push(input_psd);
         points.push(NoisePoint {

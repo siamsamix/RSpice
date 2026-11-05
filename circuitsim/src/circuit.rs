@@ -1055,6 +1055,11 @@ pub struct Circuit {
     /// Simulation temperature in °C (`.temp`, default 27). Device equations
     /// read it through the circuit so every analysis sees the same value.
     pub temperature: f64,
+    /// `.options fastmath=1`: let stamp passes evaluate batches of
+    /// transcendentals through the AVX2 kernels in [`crate::fastmath`]
+    /// (≤ 4 ulp from libm) instead of libm itself. Off by default so every
+    /// deck's results stay byte-stable.
+    pub fast_math: bool,
     /// Canonical displayed name of every node, indexed by `NodeId`
     /// (`"0"` for ground). Numeric nodes carry their decimal id so display
     /// and emitted text are unchanged; alphanumeric nodes keep the first

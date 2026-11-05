@@ -46,6 +46,28 @@ pub(crate) fn device_model<'a, M>(
     })
 }
 
+/// Devices per worker below which a device-evaluation pass stays on the
+/// calling thread: one BJT/JFET linearization is ~1 µs and a MOSFET about the
+/// same, while a scoped thread costs tens of microseconds to start. Measured
+/// on the benchmark's device-array decks (see `docs/adr/0005`).
+const PAR_DEVICES_PER_WORKER: usize = 128;
+
+/// Evaluate `f(0..len)` — a *pure* per-device model evaluation — across the
+/// intra-run thread budget and return the results in device order.
+///
+/// This is the parallel half of "evaluate in parallel, stamp serially": the
+/// stamps that consume the results still run in element order on one thread,
+/// so every matrix entry is summed in exactly the order a one-thread build
+/// uses and the system is bit-identical for any worker count.
+fn eval_devices<R, F>(len: usize, f: F) -> Vec<R>
+where
+    R: Send,
+    F: Fn(usize) -> R + Sync,
+{
+    let workers = crate::parallel::workers_for(len, PAR_DEVICES_PER_WORKER);
+    crate::parallel::map_ordered(len, workers, 32, f)
+}
+
 /// Field arithmetic for one MNA system: [`f64`] for DC/transient,
 /// [`Complex64`] for the AC sweep. One stamping implementation serves both.
 ///
@@ -1470,8 +1492,26 @@ fn stamp_diodes<T: Field>(
     mut damp: JunctionDamp,
     gmin: f64,
 ) -> Result<()> {
-    for (index, d) in circuit.diodes.iter().enumerate() {
-        let model = device_model(&circuit.diode_models, "diode", &d.name, &d.model)?;
+    let temp = circuit.temperature;
+    let models: Vec<&crate::model::DiodeModel> = circuit
+        .diodes
+        .iter()
+        .map(|d| device_model(&circuit.diode_models, "diode", &d.name, &d.model))
+        .collect::<Result<_>>()?;
+    // `is_at` is a `powf` and an `exp` that depend only on the model and the
+    // temperature, yet it used to be recomputed per diode per Newton iterate
+    // (twice with the limiter). One value per distinct model card, bit for bit
+    // the same number as before.
+    let mut is_cache: std::collections::HashMap<*const crate::model::DiodeModel, f64> =
+        std::collections::HashMap::new();
+    let mut is_t = |model: &crate::model::DiodeModel| -> f64 {
+        *is_cache.entry(model as *const _).or_insert_with(|| model.is_at(temp))
+    };
+
+    // Phase 1 (serial): each junction's bias, through the limiter whose state
+    // is shared in element order.
+    let mut biases: Vec<f64> = Vec::with_capacity(circuit.diodes.len());
+    for (index, (d, model)) in circuit.diodes.iter().zip(&models).enumerate() {
         let v_anode = node_voltage(guess, d.anode);
         let v_cathode = node_voltage(guess, d.cathode);
         // Linearization, clamp, limit, and companion current all come from
@@ -1490,15 +1530,35 @@ fn stamp_diodes<T: Field>(
             JunctionDamp::Pnjlim { previous, used } => {
                 // The SPICE2 limiter in the emission-coefficient-scaled
                 // thermal voltage, against the previous build's knee point.
-                let vt_j = model.n * thermal_voltage(circuit.temperature);
-                let vcrit = critical_voltage(vt_j, model.is_at(circuit.temperature) * d.area);
+                let vt_j = model.n * thermal_voltage(temp);
+                let vcrit = critical_voltage(vt_j, is_t(model) * d.area);
                 let limited =
                     pnjlim(raw, previous.diode.get(index).copied().unwrap_or(0.0), vt_j, vcrit);
                 record_diode_limit(*used, index, limited);
                 limited
             }
         };
-        let ev = model.eval_for_at(vd, d.area, circuit.temperature);
+        biases.push(vd);
+    }
+
+    // Phase 2: the junction exponentials. By default each is `f64::exp`, the
+    // value the engine has always used; with `.options fastmath=1` the whole
+    // pass is one batch through the AVX2 kernel (≤ 4 ulp from libm, so results
+    // can differ in the last digits — hence opt-in).
+    let args: Vec<(f64, f64)> =
+        models.iter().zip(&biases).map(|(m, &vd)| m.junction_arg(vd, temp)).collect();
+    let exps: Vec<f64> = if circuit.fast_math {
+        let xs: Vec<f64> = args.iter().map(|a| a.1).collect();
+        let mut out = vec![0.0; xs.len()];
+        crate::fastmath::exp(&xs, &mut out);
+        out
+    } else {
+        args.iter().map(|a| a.1.exp()).collect()
+    };
+
+    // Phase 3 (serial): the stamps, in element order.
+    for (((d, model), &(vd, _)), &exp_term) in circuit.diodes.iter().zip(&models).zip(&args).zip(&exps) {
+        let ev = model.finish_eval(vd, temp, is_t(model) * d.area, exp_term);
 
         stamp_admittance(sys, d.anode, d.cathode, T::lift(ev.gd));
         if with_companion {
@@ -1591,9 +1651,16 @@ fn stamp_bjts<T: Field>(
     mut dc_limits: Option<PnjlimIo>,
     gmin: f64,
 ) -> Result<()> {
-    for (index, q) in circuit.bjts.iter().enumerate() {
-        let model = device_model(&circuit.bjt_models, "BJT", &q.name, &q.model)?;
-        let temp = circuit.temperature;
+    let temp = circuit.temperature;
+    let models: Vec<&crate::model::BjtModel> = circuit
+        .bjts
+        .iter()
+        .map(|q| device_model(&circuit.bjt_models, "BJT", &q.name, &q.model))
+        .collect::<Result<_>>()?;
+    // Phase 1 (serial): junction biases, with the DC limiter walking its
+    // shared state in element order.
+    let mut biases: Vec<(f64, f64)> = Vec::with_capacity(circuit.bjts.len());
+    for (index, (q, model)) in circuit.bjts.iter().zip(&models).enumerate() {
         let sign = if model.kind == BjtType::Pnp { -1.0 } else { 1.0 };
         // Normalized junction biases: forward is positive in this space for
         // every polarity, which is what the limiter walks.
@@ -1607,20 +1674,32 @@ fn stamp_bjts<T: Field>(
             norm_bc = pnjlim(norm_bc, bc_old, model.nr * vt, critical_voltage(model.nr * vt, is_area));
             record_bjt_limit(io.used, index, [norm_be, norm_bc]);
         }
-        let vbe = sign * norm_be;
-        let vbc = sign * norm_bc;
+        biases.push((sign * norm_be, sign * norm_bc));
+    }
+    // Phase 2 (parallel): the five terminal-current evaluations per device
+    // (value + central differences) — (I0, dI/dVbe, dI/dVbc) per terminal.
+    let linearized = eval_devices(circuit.bjts.len(), |i| {
+        let q = &circuit.bjts[i];
+        let model = models[i];
+        let (vbe, vbc) = biases[i];
         let current = model.currents(vbe, vbc, q.area, temp);
         let h = 1e-6;
         let plus_be = model.currents(vbe + h, vbc, q.area, temp);
         let minus_be = model.currents(vbe - h, vbc, q.area, temp);
         let plus_bc = model.currents(vbe, vbc + h, q.area, temp);
         let minus_bc = model.currents(vbe, vbc - h, q.area, temp);
-
-        // (I0, dI/dVbe, dI/dVbc) per terminal current.
+        [
+            (current.ic, (plus_be.ic - minus_be.ic) / (2.0 * h), (plus_bc.ic - minus_bc.ic) / (2.0 * h)),
+            (current.ib, (plus_be.ib - minus_be.ib) / (2.0 * h), (plus_bc.ib - minus_bc.ib) / (2.0 * h)),
+            (current.ie, (plus_be.ie - minus_be.ie) / (2.0 * h), (plus_bc.ie - minus_bc.ie) / (2.0 * h)),
+        ]
+    });
+    // Phase 3 (serial): stamps in element order.
+    for ((q, &(vbe, vbc)), lin) in circuit.bjts.iter().zip(&biases).zip(linearized) {
         let terms = [
-            (q.nc, current.ic, (plus_be.ic - minus_be.ic) / (2.0 * h), (plus_bc.ic - minus_bc.ic) / (2.0 * h)),
-            (q.nb, current.ib, (plus_be.ib - minus_be.ib) / (2.0 * h), (plus_bc.ib - minus_bc.ib) / (2.0 * h)),
-            (q.ne, current.ie, (plus_be.ie - minus_be.ie) / (2.0 * h), (plus_bc.ie - minus_bc.ie) / (2.0 * h)),
+            (q.nc, lin[0].0, lin[0].1, lin[0].2),
+            (q.nb, lin[1].0, lin[1].1, lin[1].2),
+            (q.ne, lin[2].0, lin[2].1, lin[2].2),
         ];
         for (node, i0, dbe, dbc) in terms {
             // Chain rule into real terminal voltages.
@@ -1730,9 +1809,15 @@ fn stamp_jfets<T: Field>(
     mut dc_limits: Option<PnjlimIo>,
     gmin: f64,
 ) -> Result<()> {
-    for (index, j) in circuit.jfets.iter().enumerate() {
-        let model = device_model(&circuit.jfet_models, "JFET", &j.name, &j.model)?;
-        let temp = circuit.temperature;
+    let temp = circuit.temperature;
+    let models: Vec<&crate::model::JfetModel> = circuit
+        .jfets
+        .iter()
+        .map(|j| device_model(&circuit.jfet_models, "JFET", &j.name, &j.model))
+        .collect::<Result<_>>()?;
+    // Phase 1 (serial): gate-junction biases, with the DC limiter in order.
+    let mut biases: Vec<(f64, f64)> = Vec::with_capacity(circuit.jfets.len());
+    for (index, (j, model)) in circuit.jfets.iter().zip(&models).enumerate() {
         let sign = if model.kind == JfetType::Pjf { -1.0 } else { 1.0 };
         // Normalized gate-junction biases (forward is positive in this space).
         let mut norm_gs = sign * (node_voltage(guess, j.ng) - node_voltage(guess, j.ns));
@@ -1751,23 +1836,32 @@ fn stamp_jfets<T: Field>(
             norm_gd = pnjlim(norm_gd, gd_old, vt, vcrit);
             record_jfet_limit(io.used, index, [norm_gs, norm_gd]);
         }
-        let vgs = sign * norm_gs;
-        let vgd = sign * norm_gd;
+        biases.push((sign * norm_gs, sign * norm_gd));
+    }
+    // Phase 2 (parallel): terminal currents and their central differences —
+    // (I0, dI/dVgs, dI/dVgd) per terminal.
+    let linearized = eval_devices(circuit.jfets.len(), |i| {
+        let j = &circuit.jfets[i];
+        let model = models[i];
+        let (vgs, vgd) = biases[i];
         let current = model.currents(vgs, vgd, j.area, temp);
         let h = 1e-6;
         let plus_gs = model.currents(vgs + h, vgd, j.area, temp);
         let minus_gs = model.currents(vgs - h, vgd, j.area, temp);
         let plus_gd = model.currents(vgs, vgd + h, j.area, temp);
         let minus_gd = model.currents(vgs, vgd - h, j.area, temp);
-
-        // (I0, dI/dVgs, dI/dVgd) per terminal current.
+        [
+            (current.id, (plus_gs.id - minus_gs.id) / (2.0 * h), (plus_gd.id - minus_gd.id) / (2.0 * h)),
+            (current.ig, (plus_gs.ig - minus_gs.ig) / (2.0 * h), (plus_gd.ig - minus_gd.ig) / (2.0 * h)),
+            (current.is, (plus_gs.is - minus_gs.is) / (2.0 * h), (plus_gd.is - minus_gd.is) / (2.0 * h)),
+        ]
+    });
+    // Phase 3 (serial): stamps in element order.
+    for ((j, &(vgs, vgd)), lin) in circuit.jfets.iter().zip(&biases).zip(linearized) {
         let terms = [
-            (j.nd, current.id,
-             (plus_gs.id - minus_gs.id) / (2.0 * h), (plus_gd.id - minus_gd.id) / (2.0 * h)),
-            (j.ng, current.ig,
-             (plus_gs.ig - minus_gs.ig) / (2.0 * h), (plus_gd.ig - minus_gd.ig) / (2.0 * h)),
-            (j.ns, current.is,
-             (plus_gs.is - minus_gs.is) / (2.0 * h), (plus_gd.is - minus_gd.is) / (2.0 * h)),
+            (j.nd, lin[0].0, lin[0].1, lin[0].2),
+            (j.ng, lin[1].0, lin[1].1, lin[1].2),
+            (j.ns, lin[2].0, lin[2].1, lin[2].2),
         ];
         for (node, i0, dgs, dgd) in terms {
             // Chain rule into real terminal voltages.
@@ -1874,8 +1968,17 @@ fn stamp_mosfets<T: Field>(
     guess: &DVector<f64>,
     with_companion: bool,
 ) -> Result<()> {
-    for m in &circuit.mosfets {
-        let model = device_model(&circuit.mosfet_models, "MOSFET", &m.name, &m.model)?;
+    // Phase 1 (serial): resolve every model card, so an unknown model is the
+    // same first-device error as ever. Phase 2 (parallel): the pure model
+    // evaluations. Phase 3 (serial, below): the stamps, in element order.
+    let models: Vec<&crate::model::MosfetModel> = circuit
+        .mosfets
+        .iter()
+        .map(|m| device_model(&circuit.mosfet_models, "MOSFET", &m.name, &m.model))
+        .collect::<Result<_>>()?;
+    let evals = eval_devices(circuit.mosfets.len(), |i| {
+        let m = &circuit.mosfets[i];
+        let model = models[i];
 
         // Raw node voltages from the current Newton-Raphson guess.
         let vd_raw = node_voltage(guess, m.nd);
@@ -1893,7 +1996,10 @@ fn stamp_mosfets<T: Field>(
         // β = KP·(W/L). The DC/transient stamp linearizes at Vds ≥ 0 — the
         // clamp belongs to this stamp's companion-model convention, not to the
         // model itself.
-        let ev = model.eval_sized(m.w, m.l, vg - vs, (vd - vs).max(0.0), vb - vs, circuit.temperature);
+        model.eval_sized(m.w, m.l, vg - vs, (vd - vs).max(0.0), vb - vs, circuit.temperature)
+    });
+    for ((m, model), ev) in circuit.mosfets.iter().zip(&models).zip(evals) {
+        let sign = if model.kind == MosfetType::Pmos { -1.0 } else { 1.0 };
 
         // ── Linearised companion model (Newton-Raphson stamp) ─────────────
         //

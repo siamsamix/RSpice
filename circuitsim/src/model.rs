@@ -356,6 +356,16 @@ impl DiodeModel {
     /// `Vt = kT/q` is recomputed at the device temperature, and the reverse
     /// breakdown term `−IBV·exp(−(Vd+BV)/(NBV·Vt))` is included.
     pub fn eval_for_at(&self, vd: f64, area: f64, temp_c: f64) -> DiodeEval {
+        let is_eff = self.is_at(temp_c) * area;
+        let (vd, arg) = self.junction_arg(vd, temp_c);
+        self.finish_eval(vd, temp_c, is_eff, arg.exp())
+    }
+
+    /// First half of [`Self::eval_for_at`]: the clamped bias and the junction
+    /// exponential's argument `vd / (n·Vt)`. Split out so a stamp pass over
+    /// many diodes can evaluate all the exponentials as one batch
+    /// ([`crate::fastmath`]) and hand each back to [`Self::finish_eval`].
+    pub(crate) fn junction_arg(&self, vd: f64, temp_c: f64) -> (f64, f64) {
         let vt = thermal_voltage(temp_c);
         // A breakdown diode's current diverges below −BV; stop the
         // linearization a bounded distance past the knee so Newton iterates
@@ -368,8 +378,17 @@ impl DiodeModel {
         };
         let vd = vd.clamp(lower, VD_CLAMP_MAX);
         let vt_n = self.n * vt;
-        let is_eff = self.is_at(temp_c) * area;
-        let exp_term = (vd / vt_n).exp();
+        (vd, vd / vt_n)
+    }
+
+    /// Second half of [`Self::eval_for_at`]: everything after the junction
+    /// exponential. `is_eff` is the area-scaled, temperature-corrected
+    /// saturation current (`is_at(temp_c) · area`, which the caller may cache
+    /// per model) and `exp_term = exp(vd / (n·Vt))` at the clamped `vd` from
+    /// [`Self::junction_arg`].
+    pub(crate) fn finish_eval(&self, vd: f64, temp_c: f64, is_eff: f64, exp_term: f64) -> DiodeEval {
+        let vt = thermal_voltage(temp_c);
+        let vt_n = self.n * vt;
         let mut i_d = is_eff * (exp_term - 1.0);
         let mut gd = (is_eff / vt_n) * exp_term;
 

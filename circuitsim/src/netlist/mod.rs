@@ -344,6 +344,10 @@ pub struct RunConfig {
     /// the expansion-time draws and the runtime keyed draws run off it.
     /// 0 = unseeded; the effective seed is rolled onto [`Netlist::mc_seed`].
     pub mc_seed: u64,
+    /// `.options fastmath=` — evaluate batched transcendentals (diode junction
+    /// exponentials) through the AVX2 kernels when the CPU has them (TODO §3).
+    /// Off by default: the kernels sit within 4 ulp of libm, not on it.
+    pub fast_math: bool,
 }
 
 impl Default for RunConfig {
@@ -366,6 +370,7 @@ impl Default for RunConfig {
             solvehold: false,
             trtol: 2.0,
             mc_seed: 0,
+            fast_math: false,
         }
     }
 }

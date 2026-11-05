@@ -94,7 +94,7 @@ below is written against that state.
   Gilbert–Peierls LU (unit-L columns / U rows) in elimination space — sparse answers, dense LU falls back on any
   sparse failure, zoo-tested sparse-vs-dense in all three arms (`ADR 0003`). Measured A/B on the benchmark suite:
   ladder-200 ~4× faster (778→191 ms), ladder-50 ~1.3×, tiny decks gated back to the dense kernel (`SMALL_SYSTEM`
-  = 16). Remaining open, smaller: mark incremental the O(n·nnz) Markowitz scan, pool the per-solve factor
+  = 16). Remaining open, smaller: *(the O(n·nnz) Markowitz scan is now incremental — ADR 0005)* pool the per-solve factor
   workspace (retires the small-n gate), factor-once/solve-many across NR iterates and timesteps.)*
 - [x] **[P1] (both)** LU factorization reuse across NR iterations and timesteps when the matrix changes
   only by values, not topology — today the matrix is rebuilt and cloned per iterate. *(Dense-buffer
@@ -114,19 +114,21 @@ below is written against that state.
   partial refactor of only the nonlinear rows would change iterate paths and needs its own decision;
   `touched.compress()` still re-runs per solve.)*
 - [x] **[P1] (LT baseline)** Multithreaded matrix assembly/factorization and time-stepping loop;
-  LTspice is threaded today, PSpice multithreading is unclear on this baseline. *(Measured, not
-  asserted. Run-level parallelism is what LTspice's reserve threads (row 5.5.8 in the parity doc) do
-  — per-run work spread over workers — and RSpice already has it for `.step`/`.mc`/`.temp`
-  (`run_with_threads`, `RSPICE_THREADS`, CLI `-j/--jobs`, line 535). The in-loop shares, split by
-  instrumentation on the benchmark (rc-ladder-200, n=201, 203 steps, 1216 builds): assembly
-  stamping is 7–11 ms of a 148–161 ms wall (≈5%; a two-way stamp split pays ≤2.5% before sync
-  overhead); LU is Gilbert–Peierls over a fixed Markowitz column order — inherently sequential —
-  and 593/609 solves are served from cached factorizations (`factor_stats`), leaving ~16
-  refactorizations; the time-step loop consumes each step's accepted state, a hard data
-  dependency. The in-loop cost actually worth killing is not a parallelism problem: per-build
-  `DMatrix::zeros(n²)` churns mmap/munmap — ~68–157 µs spikes on ~55–60% of builds, 58–73 ms of
-  the wall; A/B proof `MALLOC_MMAP_THRESHOLD_`+`MALLOC_TRIM_THRESHOLD_`=1 GiB → wall 73–79 ms.
-  Tracked as the next item.)*
+  LTspice is threaded today, PSpice multithreading is unclear on this baseline. *(done where it can stay
+  bit-identical: `parallel.rs` budgets threads per run — `run_with_threads(n)`/`-j`/`RSPICE_THREADS`, plan
+  workers split it — and `.ac`/`.noise` frequency points plus MOSFET/BJT/JFET model evaluation run
+  across it ("evaluate in parallel, stamp serially" keeps every matrix sum in serial order). Results are
+  identical for any thread count (tests at 1–8 threads; all `examples/*.cir` byte-identical to the
+  previous CLI). Measured: 400-stage device-array `.ac` 4.76→3.36 s on 2 cores. **Found along the way:**
+  the real large-deck cost was the `O(n·nnz)` Markowitz scan, now an incremental heap with the same pivot
+  order (randomized oracle test): `.op` 12.1→1.46 s. Not parallelized: time stepping (inherently serial)
+  and the numeric LU (column dependencies, summation order). **Still open:** sparse assembly/residual
+  (the dense `n²` terms now dominate big decks), parallel factorization. ADR 0005. **Cross-check with the earlier
+  instrumentation (rc-ladder-200, n=201):** stamping is only ≈5% of that wall and the LU is
+  Gilbert–Peierls with 593/609 solves cache-served, so in-loop threads on small ladders buy ≤2.5% —
+  hence the size gates (128 devices/worker, per-point gates for sweeps) keep them off there; they pay
+  for sweep points and device-heavy decks. The dense `n²` per-build cost named above is tracked in the
+  next item.)*
 - [ ] **[P2] (both)** Buffer pool instead of fresh `DMatrix::zeros`/`StampBits::zeros` per build
   (the mmap/munmap churn above costs rc-ladder-200 ~58–73 ms of a ~150 ms wall): thread-local
   spare buffers per type in `MnaSystem::for_circuit`, refill with `fill(T::zero())`, return on
@@ -168,10 +170,19 @@ below is written against that state.
   (non-default only), LTE estimate divided by `trtol` in `transient_error`. Tests: step-count
   coarsening + emit round-trip (`trtol_relaxes_the_step_controller`); jfet assertions loosened
   for the default relaxation (`epsilon 1e-3`, current floor 1e-9).
-- [ ] **[P1] (LT)** AVX2/SIMD-optimized transcendental math — `LTspice.exe` ships `sin_avx2.c`,
+- [x] **[P1] (LT)** AVX2/SIMD-optimized transcendental math — `LTspice.exe` ships `sin_avx2.c`,
   `cos_avx2.c`, `tan_avx2.c`, `exp_avx2.c`, `log_avx2.c`, `log10_avx2.c`, `pow_avx2.c` etc. for
   vectorized device/B-source evaluation; RSpice uses scalar `f64` math. Gate on
-  `target_feature = "avx2"` with scalar fallback. (Same REA source as above.)
+  `target_feature = "avx2"` with scalar fallback. (Same REA source as above.) *(done: `fastmath.rs` —
+  slice kernels `exp ln log10 sin cos tan pow`, 4-lane AVX2+FMA chosen by runtime detection (so a default
+  build benefits; `RSPICE_NO_SIMD` forces scalar) with a libm-exact scalar fallback. Measured ≤ 4 ulp from
+  libm (exp 1, ln 2, sin/cos 2, tan 3, log10 4, `pow` ≤ 4+2·|y·ln x|), position/batch-length independent,
+  libm specials, signed zero, subnormal/overflow edges; 2.2×/1.4×/2.8×/4.4×/5.2× faster than scalar for
+  exp/ln/log10/sin/tan. Not libm-bit-identical, so the engine uses it only under opt-in
+  `.options fastmath=1` (round-trips through emit); default results stay byte-stable. Wired: batched diode
+  junction exponentials (and the per-iterate `is_at` recomputation was cached per model, bit-identical).
+  **Not wired:** BJT/MOSFET/B-source evaluation (per-device, not naturally batched), `asin/acos/atan/
+  sinh/cosh/tanh/log2/exp2` kernels. ADR 0005.)*
 
 ## 4. Analyses
 

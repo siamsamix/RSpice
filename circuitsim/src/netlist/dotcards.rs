@@ -118,6 +118,7 @@ pub(super) fn parse_dot_command(
         }
         ".options" | ".option" => {
             parse_options(&tokens, analysis, warnings, line_no)?;
+            circuit.fast_math = analysis.config.fast_math;
         }
         ".temp" => {
             if tokens.len() < 2 {
@@ -502,6 +503,11 @@ pub(super) fn parse_options(
             // bigger steps.
             "trtol" => {
                 analysis.config.trtol = parse_value(value).map_err(SimError::Parse)?.max(0.01)
+            }
+            // TODO §3: AVX2 batch math for the device passes, opt-in.
+            "fastmath" => {
+                analysis.config.fast_math =
+                    parse_value(value).map_err(SimError::Parse)? != 0.0;
             }
             // TODO §8: `.options seed=` — the deck's base Monte-Carlo seed.
             // Element lines expand (and draw) before dot commands execute,
@@ -1267,6 +1273,9 @@ pub(super) fn emit_commands(analysis: &AnalysisCommands, out: &mut String) {
     }
     if analysis.config.solvehold {
         options.push_str(" solvehold");
+    }
+    if analysis.config.fast_math {
+        options.push_str(" fastmath=1");
     }
     if analysis.config.mc_seed != 0 {
         // TODO §8: the base Monte-Carlo seed round-trips like the knobs.

@@ -375,6 +375,44 @@ impl Default for RunConfig {
     }
 }
 
+/// One `.save` selector, the two halves of `V(out)`/`I(Q1)` kept as written
+/// (`V(*)` carries its wildcard text through). The raw-wave builder does the
+/// matching in deck-spelled trace names, so nothing is resolved here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SaveSpec {
+    /// The function word before the parenthesis (`V`, `I`, `Ic`).
+    pub probe: String,
+    /// The text inside the parenthesis (`out`, `Q1`, `x23:*`).
+    pub name: String,
+}
+
+/// `.savebias <filename> [internal] [temp=<v>] [time=<v> [repeat]] [step=<v>]
+/// [DC1=..DC3=]` — the solved DC point the run driver writes to a
+/// `.nodeset`-shaped text file for a later `.loadbias`.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SaveBiasCommand {
+    /// The file to write, as written (quotes kept; the writer strips them).
+    pub file: String,
+    /// The `[internal]` keyword — LTspice saves internal MOS
+    /// `nd`/`ng`/`ns`/`nb` nodes with it. RSpice has no private nodes, so
+    /// the keyword is carried and re-emitted only.
+    pub internal: bool,
+    /// `temp=` — the model-process sweep point named in the LTspice bias
+    /// file format. RSpice writes the plain form, so it is carried only.
+    pub temp: Option<f64>,
+    /// `time=` — the transient instant whose solution is saved.
+    pub time: Option<f64>,
+    /// `[repeat]` — write again at every `time=`-period crossing; the file
+    /// always holds only the most recently solved point, so this just says
+    /// the end-of-run solution is what survives.
+    pub repeat: bool,
+    /// `step=` — the 1-based run number of a `.step`/`.mc` deck whose
+    /// snapshot is saved. `0` is a parse error.
+    pub step: Option<usize>,
+    /// `DC1=`/`DC2=`/`DC3=` — the sweep values naming one `.dc` point.
+    pub dc: [Option<f64>; 3],
+}
+
 #[derive(Debug, Clone)]
 pub struct AnalysisCommands {
     pub dc_op: bool,
@@ -422,6 +460,25 @@ pub struct AnalysisCommands {
     pub ic: Vec<NodesetEntry>,
     /// `.nodeset V(n)=…` entries: seeds for the DC Newton-Raphson iteration.
     pub nodeset: Vec<NodesetEntry>,
+    /// `.save V(out) I(L1)` selectors, as written — the raw-wave builder
+    /// keeps only the traces the card names (axis and step columns stay
+    /// regardless). Empty list = no filtering; a bare `.save` line warns
+    /// that everything stays saved.
+    pub save: Vec<SaveSpec>,
+    /// `.keep`/`.keepnode n1, n2` node names. LTspice drops unkept nets
+    /// from the netlist once a keep list exists; RSpice never drops nets,
+    /// so the list is recorded and round-tripped verbatim.
+    pub keepnodes: Vec<String>,
+    /// `.savebias <file> …`: the DC snapshot the run driver writes after
+    /// the analysis completes (see `runs::savebias`).
+    pub savebias: Option<SaveBiasCommand>,
+    /// `.loadbias <file>`: its `.nodeset`/`.ic` lines are appended to those
+    /// lists at parse time; the card itself is carried for round-trip.
+    pub loadbias: Option<String>,
+    /// `.tran … nodiscard`: keep the pre-steady-state history of a
+    /// switching-regulator transient. RSpice's transient never discards
+    /// history, so the flag is carried and re-emitted as-is.
+    pub tran_nodiscard: bool,
 }
 
 impl Default for AnalysisCommands {
@@ -447,6 +504,11 @@ impl Default for AnalysisCommands {
             temperatures: Vec::new(),
             ic: Vec::new(),
             nodeset: Vec::new(),
+            save: Vec::new(),
+            keepnodes: Vec::new(),
+            savebias: None,
+            loadbias: None,
+            tran_nodiscard: false,
         }
     }
 }
@@ -613,6 +675,7 @@ fn parse_featured(
                 &mut circuit,
                 &mut warnings,
                 line_no,
+                options,
             )?;
             continue;
         }

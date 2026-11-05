@@ -1881,3 +1881,318 @@ C1 b 0 1p
         flagged.points.len()
     );
 }
+
+// ─── .save / .keep / .savebias / .loadbias ──────────────────────────────────
+
+/// `.save` selectors keep both halves as written, unsupported spellings
+/// warn, and the card reprints verbatim through an emit round trip.
+#[test]
+fn save_card_round_trips_and_warns() {
+    let netlist = parse(
+        "V1 in 0 5\n\
+         R1 in out 1k\n\
+         R2 out 0 1k\n\
+         .save V(out) I(Q1) V(*) oops\n\
+         .op\n\
+         .end\n",
+    )
+    .unwrap();
+    assert_eq!(
+        netlist.analysis.save,
+        vec![
+            SaveSpec {
+                probe: "V".into(),
+                name: "out".into()
+            },
+            SaveSpec {
+                probe: "I".into(),
+                name: "Q1".into()
+            },
+            SaveSpec {
+                probe: "V".into(),
+                name: "*".into()
+            },
+        ]
+    );
+    assert!(
+        netlist
+            .warnings
+            .iter()
+            .any(|w| w.contains("'oops' is not V(name) or I(dev)")),
+        "warnings: {:?}",
+        netlist.warnings
+    );
+
+    let text = emit(&netlist);
+    assert!(text.contains(".save V(out) I(Q1) V(*)\n"), "{text}");
+    assert_eq!(parse(&text).unwrap().analysis.save, netlist.analysis.save);
+
+    // A bare `.save` filters nothing — the deck just gets told.
+    let bare = parse(".op\n.save\n.end\n").unwrap();
+    assert!(bare.analysis.save.is_empty());
+    assert!(
+        bare.warnings
+            .iter()
+            .any(|w| w.contains(".save lists no traces")),
+        "warnings: {:?}",
+        bare.warnings
+    );
+}
+
+/// `.keep`/`.keepnode` collect the named nets (LSB-order preserved, comma
+/// placement flexible) and round-trip; nets are never actually dropped.
+#[test]
+fn keep_card_round_trips() {
+    let netlist = parse(".keep a\n.keepnode a, b , c\n.op\n.end\n").unwrap();
+    assert_eq!(
+        netlist.analysis.keepnodes,
+        ["a", "a", "b", "c"]
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+    );
+    let text = emit(&netlist);
+    assert!(text.contains(".keepnode a, a, b, c\n"), "{text}");
+    assert_eq!(
+        parse(&text).unwrap().analysis.keepnodes,
+        netlist.analysis.keepnodes
+    );
+
+    let bare = parse(".keep\n.op\n.end\n").unwrap();
+    assert!(bare.analysis.keepnodes.is_empty());
+    assert!(
+        bare.warnings.iter().any(|w| w.contains("lists no nodes")),
+        "warnings: {:?}",
+        bare.warnings
+    );
+}
+
+/// `.savebias` argument validation: malformed or nonsensical selectors are
+/// loud, an unknown token only warns.
+#[test]
+fn savebias_card_validates() {
+    let no_file = parse(".op\n.savebias\n.end\n").unwrap_err();
+    assert!(no_file.to_string().contains("needs a filename"));
+
+    for bad_time in ["time=0", "time=-1m"] {
+        let e = parse(&format!(".op\n.savebias snap.txt {bad_time}\n.end\n")).unwrap_err();
+        assert!(e.to_string().contains("must be > 0"), "{e}");
+    }
+
+    let bare_repeat = parse(".op\n.savebias snap.txt repeat\n.end\n").unwrap_err();
+    assert!(
+        bare_repeat
+            .to_string()
+            .contains("repeat only goes with a time="),
+        "{bare_repeat}"
+    );
+
+    for bad_step in ["step=0", "step=1.5"] {
+        let e = parse(&format!(".op\n.savebias snap.txt {bad_step}\n.end\n")).unwrap_err();
+        assert!(e.to_string().contains("must be a whole run number"), "{e}");
+    }
+
+    let malformed = parse(".op\n.savebias snap.txt temp=abc\n.end\n").unwrap_err();
+    assert!(malformed.to_string().contains("temp=abc"), "{malformed}");
+
+    let netlist = parse(".op\n.savebias snap.txt wat time=1m\n.end\n").unwrap();
+    let cmd = netlist.analysis.savebias.as_ref().unwrap();
+    assert_eq!(cmd.file, "snap.txt");
+    assert_relative_eq!(cmd.time.unwrap(), 1e-3, epsilon = 1e-15);
+    assert!(
+        netlist
+            .warnings
+            .iter()
+            .any(|w| w.contains("ignores the extra token 'wat'")),
+        "warnings: {:?}",
+        netlist.warnings
+    );
+}
+
+/// Full `.savebias` selectors survive an emit round trip byte for byte, and
+/// `.loadbias` reads a written bias file's nodeset back into the deck.
+#[test]
+fn savebias_emit_and_loadbias_round_trip() {
+    let dir = std::env::temp_dir().join(format!("rspice_test_{}_bias", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp bias directory");
+    std::fs::write(
+        dir.join("possible.txt"),
+        "* written by an earlier run\n.nodeset V(seed)=1\n",
+    )
+    .expect("writing the bias file");
+
+    let options = ParseOptions {
+        deck_dir: Some(dir.clone()),
+        search_paths: Vec::new(),
+    };
+    let deck = "* bias file round trip\n\
+         .save V(out) I(Q1)\n\
+         .keep a, b\n\
+         .savebias \"snap.txt\" internal temp=27 time=1.5u repeat step=2 DC1=1 DC3=3\n\
+         .loadbias \"possible.txt\"\n\
+         .op\n\
+         .end\n";
+    let netlist = parse_with_options(deck, &options).unwrap();
+    assert!(netlist
+        .analysis
+        .nodeset
+        .iter()
+        .any(|e| e.node == "seed" && e.value == 1.0));
+    assert!(netlist.warnings.is_empty(), "{:?}", netlist.warnings);
+
+    let text = emit(&netlist);
+    assert!(text.contains(".save V(out) I(Q1)\n"), "{text}");
+    assert!(text.contains(".keepnode a, b\n"), "{text}");
+    assert!(
+        text.contains(
+            ".savebias \"snap.txt\" internal temp=27 time=0.0000015 repeat step=2 DC1=1 DC3=3\n"
+        ),
+        "{text}"
+    );
+    assert!(text.contains(".loadbias \"possible.txt\"\n"), "{text}");
+
+    let back = parse_with_options(&text, &options).unwrap();
+    let cmd = back.analysis.savebias.as_ref().unwrap();
+    assert_eq!(cmd.file, "\"snap.txt\"");
+    assert!(cmd.internal);
+    assert_relative_eq!(cmd.temp.unwrap(), 27.0, epsilon = 1e-12);
+    assert_relative_eq!(cmd.time.unwrap(), 1.5e-6, epsilon = 1e-12);
+    assert!(cmd.repeat);
+    assert_eq!(cmd.step, Some(2));
+    assert_eq!(cmd.dc, [Some(1.0), None, Some(3.0)]);
+    assert!(back.warnings.is_empty(), "{:?}", back.warnings);
+
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `.loadbias` on an unresolvable file is a loud parse error — a deck that
+/// silently seeds nothing disagrees with what it asked for.
+#[test]
+fn loadbias_missing_file_is_loud() {
+    let dir = std::env::temp_dir().join(format!("rspice_test_{}_miss", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp deck directory");
+    let deck = ".loadbias absent.txt\n.op\n.end\n";
+    let err = parse_with_options(
+        deck,
+        &ParseOptions {
+            deck_dir: Some(dir.clone()),
+            search_paths: Vec::new(),
+        },
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("not found"), "{err}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The plain operating-point snapshot: `.savebias` writes what the run
+/// solved, and a following deck folds it back in as its nodeset.
+#[test]
+fn savebias_op_snapshot_round_trips() {
+    let dir = std::env::temp_dir().join(format!("rspice_test_{}_op", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp bias directory");
+    let options = ParseOptions {
+        deck_dir: Some(dir.clone()),
+        search_paths: Vec::new(),
+    };
+    let deck = "V1 in 0 5\n\
+         R1 in out 2.5k\n\
+         R2 out 0 2.5k\n\
+         .op\n\
+         .savebias snap.txt\n\
+         .end\n";
+    crate::run(&parse_with_options(deck, &options).unwrap()).expect("deck runs");
+
+    let written = std::fs::read_to_string(dir.join("snap.txt")).expect("reading the snapshot");
+    assert!(written.contains(".nodeset V(out)=2.5\n"), "{written}");
+    assert!(written.starts_with('*'), "writer stamps a comment header");
+
+    let back = parse_with_options(
+        "V1 in 0 5\n\
+         R1 in out 2.5k\n\
+         R2 out 0 2.5k\n\
+         .loadbias snap.txt\n\
+         .op\n\
+         .end\n",
+        &options,
+    )
+    .unwrap();
+    assert!(back
+        .analysis
+        .nodeset
+        .iter()
+        .any(|e| e.node == "out" && e.value == 2.5));
+    assert!(back.warnings.is_empty(), "{:?}", back.warnings);
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// `DC1=` names the sweep point: the divider's output at V1=0.5 is 0.25 V.
+#[test]
+fn savebias_dc_sweep_snapshot() {
+    let dir = std::env::temp_dir().join(format!("rspice_test_{}_dc", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp bias directory");
+    let options = ParseOptions {
+        deck_dir: Some(dir.clone()),
+        search_paths: Vec::new(),
+    };
+    let deck = "V1 in 0 1\n\
+         R1 in out 2k\n\
+         R2 out 0 2k\n\
+         .dc V1 0 1 0.5\n\
+         .savebias snap.txt DC1=0.5\n\
+         .end\n";
+    crate::run(&parse_with_options(deck, &options).unwrap()).expect("deck runs");
+
+    let written = std::fs::read_to_string(dir.join("snap.txt")).expect("reading the snapshot");
+    assert!(written.contains(".nodeset V(out)=0.25\n"), "{written}");
+    assert!(written.contains(".nodeset V(in)=0.5\n"), "{written}");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// A transient `time=` writes the first sample that reaches the instant —
+/// mid-ramp here, so it is distinguishable from the end-of-run solution —
+/// and every written node equals the point the run produced.
+#[test]
+fn savebias_tran_time_snapshot() {
+    let dir = std::env::temp_dir().join(format!("rspice_test_{}_tran", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp bias directory");
+    let options = ParseOptions {
+        deck_dir: Some(dir.clone()),
+        search_paths: Vec::new(),
+    };
+    let deck = "V1 in 0 PULSE(0 5 1u 2u 2u 5u 10u)\n\
+         R1 in out 1k\n\
+         R2 out 0 1k\n\
+         .tran 100n 5u\n\
+         .savebias snap.txt time=2u\n\
+         .end\n";
+    let netlist = parse_with_options(deck, &options).unwrap();
+    let result = crate::run(&netlist).unwrap();
+    let tran = result.tran.as_ref().unwrap();
+    let chosen = tran
+        .points
+        .iter()
+        .find(|p| p.time >= 2e-6)
+        .expect("transient crossed time=");
+    // Mid-ramp at the crossing: half of the 2.5 V steady output, so the
+    // snapshot is distinguishable from the end-of-run solution.
+    let out = node_index(&netlist.circuit.node_names, "out");
+    assert_relative_eq!(chosen.node_voltages[out], 1.25, epsilon = 0.25);
+    assert!(chosen.node_voltages[out] < 2.5);
+
+    let written = std::fs::read_to_string(dir.join("snap.txt")).expect("reading the snapshot");
+    for line in written.lines().filter(|l| l.starts_with(".nodeset")) {
+        let rest = line.strip_prefix(".nodeset ").unwrap();
+        let (spec, value) = rest.rsplit_once('=').unwrap();
+        let name = spec
+            .strip_prefix("V(")
+            .and_then(|s| s.strip_suffix(')'))
+            .expect("`.nodeset V(name)=value` shape");
+        let i = node_index(&netlist.circuit.node_names, name);
+        assert_relative_eq!(
+            value.parse::<f64>().unwrap(),
+            chosen.node_voltages[i],
+            epsilon = 1e-9
+        );
+    }
+    let _ = std::fs::remove_dir_all(&dir);
+}

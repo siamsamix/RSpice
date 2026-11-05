@@ -78,7 +78,11 @@ below is written against that state.
   bounds the DC rung budget, `itl5` the transient Newton budget, `itl6` is the `srcsteps` synonym,
   `maxord` validates 1..=6 (`1` forces Gear1), `accurate` drives trtol to 1.0, `solvehold` is
   accepted/remembered/round-tripped; `itl3` and `method` are recognized-inert, the rest warn.)*
-- [ ] **[P2] (LT)** Waveform/data selection directives: `.save`, `.keep`, `.savebias`, `.loadbias`.
+- [x] **[P2] (LT)** Waveform/data selection directives: `.save`, `.keep`, `.savebias`, `.loadbias` —
+  done: `.save` prunes the raw dataset to listed probes (family words `I(Q1)`→`Ic(Q1)`, glob
+  `*`/`?`), `.keep`/`.keepnode` pin named nodes inside the pruned run, `.tran` emits ` nodiscard`
+  with them, `.loadbias` resolves its deck through the library search and folds its `.nodeset`/`.ic`
+  lines, and `.savebias` writes LTspice-ordered snapshots for `tran`/`dc_sweep`/`op` points.
 - [ ] **[P2] (LT)** `.csparam` support (feeds `.meas` results across stepped runs).
 - [ ] **[P2] (PS)** Node aliasing blocks `.aliases`/`.endaliases` for probe names.
 - [ ] **[P2] (both)** Output-file directives & simulation log: `.probe` (PS), `.out`/`.log` with

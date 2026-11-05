@@ -120,7 +120,19 @@ below is written against that state.
   the real large-deck cost was the `O(n·nnz)` Markowitz scan, now an incremental heap with the same pivot
   order (randomized oracle test): `.op` 12.1→1.46 s. Not parallelized: time stepping (inherently serial)
   and the numeric LU (column dependencies, summation order). **Still open:** sparse assembly/residual
-  (the dense `n²` terms now dominate big decks), parallel factorization. ADR 0005.)*
+  (the dense `n²` terms now dominate big decks), parallel factorization. ADR 0005. **Cross-check with the earlier
+  instrumentation (rc-ladder-200, n=201):** stamping is only ≈5% of that wall and the LU is
+  Gilbert–Peierls with 593/609 solves cache-served, so in-loop threads on small ladders buy ≤2.5% —
+  hence the size gates (128 devices/worker, per-point gates for sweeps) keep them off there; they pay
+  for sweep points and device-heavy decks. The dense `n²` per-build cost named above is tracked in the
+  next item.)*
+- [ ] **[P2] (both)** Buffer pool instead of fresh `DMatrix::zeros`/`StampBits::zeros` per build
+  (the mmap/munmap churn above costs rc-ladder-200 ~58–73 ms of a ~150 ms wall): thread-local
+  spare buffers per type in `MnaSystem::for_circuit`, refill with `fill(T::zero())`, return on
+  drop. Caution (line 96): reuse-`fill(0.0)` inside the NR loop there measured fill 76.2 µs vs
+  fresh calloc-lazy zeros 10.9 µs and regressed ladder-200 — that probe predates the sparse path,
+  so re-probe fill-vs-fresh over `examples/benchmark.rs` end-to-end before committing; the env
+  knobs (1 GiB thresholds, ≈2× wall) are the no-code fallback if pooling loses.
 - [x] **[P1] (both)** Trapezoidal integration as the default companion model with `.options
   method=gear` (Gear I/II) available — done: trapezoidal default, `gear1`/`gear2` selectable,
   variable-step BDF2 coefficients for Gear II.

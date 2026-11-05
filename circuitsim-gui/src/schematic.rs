@@ -9,8 +9,8 @@ use circuitsim::circuit::{
     Resistor as CsResistor, VoltageSource as CsVoltageSource,
 };
 use circuitsim::netlist::{
-    deck_directives, emit as netlist_emit, parse, AcCommand, AcScale, AnalysisCommands, Netlist,
-    ParseOptions,
+    deck_directives, emit as netlist_emit, parse_with_options, AcCommand, AcScale,
+    AnalysisCommands, Netlist, ParseOptions,
 };
 use circuitsim::units::parse_value;
 use egui::{Pos2, Vec2};
@@ -963,6 +963,17 @@ impl SchematicState {
     ///   • A vertical wire runs along each node spine connecting all the pins.
     ///   • Node 0 (ground) gets a Ground symbol instead of a spine wire.
     pub fn from_netlist(text: &str, previous: &SchematicState) -> Result<(SchematicState, String), String> {
+        Self::from_netlist_with_options(text, previous, &ParseOptions::default())
+    }
+
+    /// [`Self::from_netlist`] with library search options: a deck that
+    /// `.include`s a model library imports only when the library resolves
+    /// the way the simulation run will resolve it.
+    pub fn from_netlist_with_options(
+        text: &str,
+        previous: &SchematicState,
+        options: &ParseOptions,
+    ) -> Result<(SchematicState, String), String> {
         // ── 1. Parse the netlist through the one shared grammar ──────────────
         // (The schematic previously re-tokenised the text by hand, silently
         // dropping every diode/MOSFET card and whatever else it misread.)
@@ -974,7 +985,7 @@ impl SchematicState {
             val:    String,
         }
 
-        let netlist = parse(text).map_err(|e| format!("Netlist error: {e}"))?;
+        let netlist = parse_with_options(text, options).map_err(|e| format!("Netlist error: {e}"))?;
         let circuit = &netlist.circuit;
         // Tolerant import reports what it carried over but could not apply
         // (unknown directives, unsupported device families).
@@ -1273,6 +1284,7 @@ impl SchematicState {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use circuitsim::netlist::parse;
 
     fn comp(kind: CompKind, x: i32, y: i32, val: &str) -> Component {
         Component { kind, p1: GridPt(x, y), p2: GridPt(x + 3, y), val: val.to_string() }

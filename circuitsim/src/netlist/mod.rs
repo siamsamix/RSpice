@@ -531,6 +531,58 @@ pub struct ParseOptions {
     pub search_paths: Vec<PathBuf>,
 }
 
+impl ParseOptions {
+    /// The library-search policy every front end shares (CLI and GUI), so a
+    /// deck resolves `.include standard.lib` the same wherever it is opened.
+    ///
+    /// Resolution order: the deck's own directory (`deck_dir`, tried first by
+    /// the resolver), the explicit `extra_dirs` (the CLI's `-I`), the
+    /// `RSPICE_LIB` entries (PATH-style), then the bundled `libs/` tree —
+    /// next to the executable, in the source checkout, or beside the deck's
+    /// directory (the shipped `examples/` + `libs/` layout) — and finally the
+    /// process directory (the resolver's last resort).
+    ///
+    /// `deck_dir` is `None` for pasted text; the search path still carries
+    /// the bundled libraries, so such a deck can `.include` them too.
+    pub fn for_deck(deck_dir: Option<PathBuf>, extra_dirs: &[PathBuf]) -> Self {
+        let mut search_paths: Vec<PathBuf> = extra_dirs.to_vec();
+        if let Some(paths) = std::env::var_os("RSPICE_LIB") {
+            search_paths.extend(std::env::split_paths(&paths));
+        }
+        for bundled in bundled_library_dirs(deck_dir.as_deref()) {
+            if !search_paths.contains(&bundled) {
+                search_paths.push(bundled);
+            }
+        }
+        Self { deck_dir, search_paths }
+    }
+}
+
+/// Candidate directories for the app's bundled model libraries (only those
+/// that exist are returned).
+fn bundled_library_dirs(deck_dir: Option<&Path>) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    // A checkout / installed tree: <exe dir>/libs, <exe dir>/../libs.
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            out.push(dir.join("libs"));
+            if let Some(parent) = dir.parent() {
+                out.push(parent.join("libs"));
+            }
+        }
+    }
+    // The source checkout this library was built from.
+    out.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../libs"));
+    // The shipped layout keeps `examples/` and `libs/` side by side, so a
+    // deck opened from there finds the libraries even when the binary lives
+    // somewhere else.
+    if let Some(parent) = deck_dir.and_then(Path::parent) {
+        out.push(parent.join("libs"));
+    }
+    out.retain(|p| p.is_dir());
+    out
+}
+
 /// `.op` output variants (PSpice's `pon`/`all` spellings): what the
 /// operating-point report prints. `Pon` is the plain bias point;
 /// `All` asks for the annotated device operating-point view on top.

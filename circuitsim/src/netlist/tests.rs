@@ -2196,3 +2196,51 @@ fn savebias_tran_time_snapshot() {
     }
     let _ = std::fs::remove_dir_all(&dir);
 }
+
+/// `ParseOptions::for_deck` is the one library-search policy of every front
+/// end: the bundled `libs/` tree resolves `.include standard.lib` for a deck
+/// with no library beside it, whatever directory the process runs from.
+#[test]
+fn for_deck_finds_the_bundled_libraries() {
+    let dir = std::env::temp_dir().join(format!("rspice_test_{}_bundled", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("temp deck directory");
+    let deck = "* diode\n.include standard.lib\nV1 in 0 DC 1\nD1 in out D1N4148\nR1 out 0 1k\n.op\n.end\n";
+
+    // Bare defaults know no library directory — the failure the GUI showed.
+    let err = parse_with_options(deck, &ParseOptions::default()).unwrap_err();
+    assert!(err.to_string().contains("file not found in search paths"), "{err}");
+
+    let options = ParseOptions::for_deck(Some(dir.clone()), &[]);
+    let netlist = parse_with_options(deck, &options).expect("bundled standard.lib resolves");
+    assert_eq!(netlist.circuit.diodes.len(), 1);
+
+    // Pasted text has no deck directory; the bundled tree still resolves.
+    assert!(parse_with_options(deck, &ParseOptions::for_deck(None, &[])).is_ok());
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// The shipped layout keeps `examples/` and `libs/` side by side: a deck
+/// opened from a sibling-of-`libs` directory finds its library there, and an
+/// explicit extra directory is searched too.
+#[test]
+fn for_deck_searches_the_libs_beside_the_deck_directory_and_extra_dirs() {
+    let root = std::env::temp_dir().join(format!("rspice_test_{}_layout", std::process::id()));
+    let examples = root.join("examples");
+    let libs = root.join("libs");
+    let extra = root.join("extra");
+    for d in [&examples, &libs, &extra] {
+        std::fs::create_dir_all(d).expect("temp directory");
+    }
+    std::fs::write(libs.join("sib_only.lib"), "R9 a b 1k\n").unwrap();
+    std::fs::write(extra.join("extra_only.lib"), "R8 b c 2k\n").unwrap();
+
+    let deck = "V1 a 0 DC 1\n.include sib_only.lib\n.include extra_only.lib\nR1 c 0 1k\n.op\n.end\n";
+    let options = ParseOptions::for_deck(Some(examples.clone()), &[extra.clone()]);
+    let netlist = parse_with_options(deck, &options).expect("both libraries resolve");
+    assert_eq!(netlist.circuit.resistors.len(), 3);
+
+    // Without the extra directory only the sibling library resolves.
+    let options = ParseOptions::for_deck(Some(examples), &[]);
+    assert!(parse_with_options(deck, &options).is_err());
+    let _ = std::fs::remove_dir_all(&root);
+}

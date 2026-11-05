@@ -1,7 +1,10 @@
 use circuitsim::circuit::{CURRENT_FAMILIES, Circuit as CsCircuit, ElementFamily, Pulse, Sine, Waveform};
-use circuitsim::netlist::{emit as netlist_emit, emit_source_value, parse_source_value, ParseOptions, SourceValue};
+use circuitsim::netlist::{
+    emit as netlist_emit, emit_source_value, parse_source_value, parse_with_options, ParseOptions,
+    SourceValue,
+};
 use circuitsim::units::parse_value;
-use circuitsim::{parse, run, AcResult, DcResult, DcSweepResult, SimulationResult, TranResult};
+use circuitsim::{run, AcResult, DcResult, DcSweepResult, SimulationResult, TranResult};
 use egui;
 use egui_plot::Plot;
 use std::collections::HashMap;
@@ -345,6 +348,11 @@ pub struct CircuitSimApp {
     /// Axis scales, bounds, and apply-flags for every plot (one owner).
     plot: PlotState,
 
+    /// Directory of the open deck file, where relative `.include`/`.lib`
+    /// paths are tried first. `None` for pasted text, built-in examples and
+    /// unsaved documents (the bundled libraries still resolve for those).
+    deck_dir: Option<std::path::PathBuf>,
+
     // Differential voltage plot node selectors
     diff_node_a: usize,
     diff_node_b: usize,
@@ -410,6 +418,7 @@ impl Default for CircuitSimApp {
             editor_mode: EditorMode::Text,
             schematic: SchematicState::default(),
             plot: PlotState::default(),
+            deck_dir: None,
 
             diff_node_a: 1,
             diff_node_b: 2,
@@ -462,7 +471,9 @@ impl CircuitSimApp {
     /// the column/interval layout lives with the IR in [`crate::schematic`].
     /// `Ok` carries the import summary; on `Err` the schematic is untouched.
     fn import_schematic(&mut self) -> Result<String, String> {
-        let (schematic, status) = SchematicState::from_netlist(&self.netlist, &self.schematic)?;
+        let options = self.parse_options();
+        let (schematic, status) =
+            SchematicState::from_netlist_with_options(&self.netlist, &self.schematic, &options)?;
         self.schematic = schematic;
         Ok(status)
     }
@@ -482,8 +493,14 @@ impl CircuitSimApp {
         }
     }
 
+    /// How the open deck resolves `.include`/`.lib`: its own directory, then
+    /// `RSPICE_LIB` and the bundled `libs/` — the same policy as the CLI.
+    fn parse_options(&self) -> ParseOptions {
+        ParseOptions::for_deck(self.deck_dir.clone(), &[])
+    }
+
     fn run_simulation(&mut self) {
-        match parse(&self.netlist) {
+        match parse_with_options(&self.netlist, &self.parse_options()) {
             Ok(netlist) => {
                 let mut summary = format!(
                     "{} nodes · {} R · {} C · {} L · {} V · {} I",
@@ -605,6 +622,7 @@ impl CircuitSimApp {
 
     fn load_example(&mut self, ex: Example) {
         self.netlist = ex.netlist().to_string();
+        self.deck_dir = None; // built-in text: no file behind it
         self.file_label = format!("{}.cir", ex.label().to_lowercase().replace(' ', "_"));
         self.status = Some((true, format!("Loaded example: {}", ex.label())));
         if !self.generate_schematic_from_netlist() {
@@ -646,6 +664,9 @@ impl CircuitSimApp {
                         .file_name()
                         .map(|s| s.to_string_lossy().into_owned())
                         .unwrap_or_else(|| "circuit.cir".into());
+                        // Set before adopting: the schematic import parses the
+                        // deck and must resolve its `.include`s from here.
+                        self.deck_dir = path.parent().map(std::path::Path::to_path_buf);
                         self.adopt_document(text, label);
                     }
                     Err(e) => self.status = Some((false, e.to_string())),
@@ -663,6 +684,8 @@ impl CircuitSimApp {
             {
                 match std::fs::write(&path, &self.netlist) {
                     Ok(()) => {
+                        // Relative `.include`s now resolve from the saved location.
+                        self.deck_dir = path.parent().map(std::path::Path::to_path_buf);
                         self.file_label = path
                         .file_name()
                         .map(|s| s.to_string_lossy().into_owned())
@@ -3434,6 +3457,60 @@ impl CircuitSimApp {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use circuitsim::netlist::parse;
+
+    /// Every shipped `examples/*.cir` must open and run in the GUI, the ones
+    /// that `.include` a bundled library (`standard.lib`, `opamps.lib`)
+    /// included: the deck's directory plus the bundled `libs/` tree resolve
+    /// them, not the process directory.
+    #[test]
+    fn shipped_example_decks_open_and_run() {
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../examples");
+        let mut checked = 0;
+        for entry in std::fs::read_dir(&dir).expect("examples directory") {
+            let path = entry.expect("dir entry").path();
+            if path.extension().and_then(|e| e.to_str()) != Some("cir") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("example deck");
+            let mut app = CircuitSimApp::default();
+            // What `open_file` does, minus the file dialog.
+            app.deck_dir = path.parent().map(std::path::Path::to_path_buf);
+            app.adopt_document(text, path.file_name().unwrap().to_string_lossy().into_owned());
+            match &app.status {
+                Some((true, msg)) => {
+                    assert!(!msg.contains("not found"), "{}: {msg}", path.display())
+                }
+                other => panic!("{}: unexpected open status {other:?}", path.display()),
+            }
+            app.run_simulation();
+            assert!(
+                matches!(&app.status, Some((true, m)) if m == "Simulation finished"),
+                "{}: {:?}",
+                path.display(),
+                app.status
+            );
+            checked += 1;
+        }
+        assert!(checked >= 10, "only {checked} example decks found");
+    }
+
+    /// Pasted text has no directory behind it, yet the bundled libraries
+    /// still resolve for it.
+    #[test]
+    fn pasted_deck_includes_a_bundled_library() {
+        let mut app = CircuitSimApp::default();
+        assert!(app.deck_dir.is_none());
+        app.netlist = "* rectifier\n.include standard.lib\nV1 in 0 DC 1\n\
+                       D1 in out D1N4148\nR1 out 0 1k\n.op\n.end\n"
+            .into();
+        app.run_simulation();
+        assert!(
+            matches!(&app.status, Some((true, m)) if m == "Simulation finished"),
+            "{:?}",
+            app.status
+        );
+    }
 
     /// V(2) of the RC-charging decks must be a real 0 V → 5 V charge. Started
     /// from the DC operating point instead, the capacitor is already charged,

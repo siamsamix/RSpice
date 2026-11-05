@@ -309,6 +309,31 @@ pub struct RunConfig {
     /// point. Default 100 (kept from the pre-options engine; the SPICE
     /// classic default of 10 starved the damped-Newton line search).
     pub itl4: usize,
+    /// `.options itl2=` — Newton-Raphson iteration budget for the DC retry
+    /// rungs (the gmin/source-stepping ladders and every `.dc` sweep point
+    /// that fell through its warm start). `None` keeps the historical
+    /// behavior: the rungs ride the plain [`RunConfig::itl1`] budget.
+    pub itl2: Option<usize>,
+    /// `.options itl3=` — the "lower transient iteration limit". Recognized
+    /// and round-tripped but inert: the engine has no separate per-point
+    /// iteration *floor* under [`RunConfig::itl4`] — ngspice has not
+    /// implemented it in Spice3 either.
+    pub itl3: Option<usize>,
+    /// `.options itl5=` — total transient Newton iteration budget across the
+    /// whole analysis. `None` (and 0) = no limit.
+    pub itl5: Option<usize>,
+    /// `.options maxord=` — integration order cap, 1..=6. 1 forces backward
+    /// Euler; 2..6 are accepted and honored as far as the engine reaches —
+    /// trapezoidal and Gear-2 already top out at order 2.
+    pub maxord: Option<u32>,
+    /// PSpice `.options accurate` style flag: a tightened LTE budget. The
+    /// truncation-error overestimation factor ([`RunConfig::trtol`]) slack
+    /// closes to 1.0.
+    pub accurate: bool,
+    /// PSpice `.options solvehold` style flag: accepted and re-emitted but
+    /// inert — no documented semantics anywhere (PSpice's flag table does
+    /// not even carry it).
+    pub solvehold: bool,
     /// `.options trtol=` — the transient truncation-error overestimation
     /// factor (TODO §3). The LTE estimate is divided by it before the
     /// accept/reject comparison, so the shipped LTspice default of 2.0
@@ -333,6 +358,12 @@ impl Default for RunConfig {
             srcsteps: 10,
             itl1: 100,
             itl4: 100,
+            itl2: None,
+            itl3: None,
+            itl5: None,
+            maxord: None,
+            accurate: false,
+            solvehold: false,
             trtol: 2.0,
             mc_seed: 0,
         }

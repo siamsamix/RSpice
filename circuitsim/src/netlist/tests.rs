@@ -121,23 +121,42 @@
     fn options_convergence_knobs_round_trip() {
         let netlist = parse(
             "* stepped convergence knobs\n\
-             V1 a 0 DC 1\n\
-             R1 a b 1k\n\
-             .options gmin=1e-10 gminsteps=12 srcsteps=3 itl1=200 itl4=5\n\
-             .op\n\
-             .end\n",
+              V1 a 0 DC 1\n\
+              R1 a b 1k\n\
+              .options gmin=1e-10 gminsteps=12 srcsteps=3 itl1=200 itl4=5\n\
+              .options itl2=50 itl3=4 itl5=20000 maxord=1 accurate solvehold itl6=7\n\
+              .op\n\
+              .end\n",
         )
         .unwrap();
         assert_eq!(netlist.analysis.config.gmin, 1e-10);
         assert_eq!(netlist.analysis.config.gminsteps, 12);
-        assert_eq!(netlist.analysis.config.srcsteps, 3);
+        assert_eq!(netlist.analysis.config.srcsteps, 7);
         assert_eq!(netlist.analysis.config.itl1, 200);
         assert_eq!(netlist.analysis.config.itl4, 5);
+        assert_eq!(netlist.analysis.config.itl2, Some(50));
+        assert_eq!(netlist.analysis.config.itl3, Some(4));
+        assert_eq!(netlist.analysis.config.itl5, Some(20000));
+        assert_eq!(netlist.analysis.config.maxord, Some(1));
+        assert!(netlist.analysis.config.accurate);
+        assert!(netlist.analysis.config.solvehold);
 
         let text = emit(&netlist);
-        for knob in ["gmin=", "gminsteps=", "srcsteps=", "itl1=", "itl4="] {
+        for knob in [
+            "gmin=",
+            "gminsteps=",
+            "srcsteps=",
+            "itl1=",
+            "itl4=",
+            "itl2=",
+            "itl3=",
+            "itl5=",
+            "maxord=",
+        ] {
             assert!(text.contains(knob), "emit lost {knob}: {text}");
         }
+        assert!(text.contains(" accurate"), "emit lost accurate: {text}");
+        assert!(text.contains(" solvehold"), "emit lost solvehold: {text}");
         let reparsed = parse(&text).unwrap();
         assert_eq!(reparsed.analysis.config.gmin, netlist.analysis.config.gmin);
         assert_eq!(
@@ -150,13 +169,44 @@
         );
         assert_eq!(reparsed.analysis.config.itl1, netlist.analysis.config.itl1);
         assert_eq!(reparsed.analysis.config.itl4, netlist.analysis.config.itl4);
+        assert_eq!(reparsed.analysis.config.itl2, netlist.analysis.config.itl2);
+        assert_eq!(reparsed.analysis.config.itl3, netlist.analysis.config.itl3);
+        assert_eq!(reparsed.analysis.config.itl5, netlist.analysis.config.itl5);
+        assert_eq!(reparsed.analysis.config.maxord, netlist.analysis.config.maxord);
+        assert_eq!(reparsed.analysis.config.accurate, netlist.analysis.config.accurate);
+        assert_eq!(reparsed.analysis.config.solvehold, netlist.analysis.config.solvehold);
 
-        // Default knobs stay silent in the emitted options line.
+        // `itl6` is LTspice's `srcsteps` synonym: it lands in the same knob.
+        let srcsteps_alias = parse("* srcsteps synonym\n.op\n.options itl6=25\n.end\n").unwrap();
+        assert_eq!(srcsteps_alias.analysis.config.srcsteps, 25);
+        assert_eq!(srcsteps_alias.analysis.config.itl2, None);
+
+        // Default knobs (and the flags) stay silent in the emitted options line.
         let plain = parse("* plain deck\n.op\n.end\n").unwrap();
         let text = emit(&plain);
-        for knob in ["gmin=", "gminsteps=", "srcsteps=", "itl1=", "itl4="] {
+        for knob in [
+            "gmin=", "gminsteps=", "srcsteps=", "itl1=", "itl4=", "itl5=", "maxord=",
+        ] {
             assert!(!text.contains(knob), "default deck emitted {knob}: {text}");
         }
+        assert!(!text.contains("accurate"), "default deck emitted accurate: {text}");
+        assert!(!text.contains("solvehold"), "default deck emitted solvehold: {text}");
+    }
+
+    /// `maxord` outside 1..=6 errors instead of half-applying, and the
+    /// still-not-honored knobs (e.g. `tnom`) keep warning.
+    #[test]
+    fn options_reject_out_of_range_maxord_and_warn_unknown_knobs() {
+        let err = parse(".options maxord=7\n.op\n.end\n").unwrap_err().to_string();
+        assert!(err.contains("maxord=7"), "unexpected error: {err}");
+        let err = parse(".options maxord=0\n.op\n.end\n").unwrap_err().to_string();
+        assert!(err.contains("maxord=0"), "unexpected error: {err}");
+        let netlist = parse("* warn-listed knob\n.op\n.options tnom=27\nV1 a 0 DC 1\nR1 a 0 1k\n.end\n")
+            .unwrap();
+        assert!(
+            netlist.warnings.iter().any(|w| w.contains("tnom")),
+            "{:?}", netlist.warnings
+        );
     }
 
     /// TODO §8: `.options seed=` raises the deck's base draw seed. It must
@@ -1636,4 +1686,198 @@ fn directive_words_match_case_insensitively() {
         .expect("directives");
     assert_eq!(cards.len(), 2);
     assert!(cards[1].starts_with(".OPTIONS"));
+}
+
+// ─── `.options` engine honoring (TODO §2) ───────────────────────────────────
+
+fn node_index(names: &[String], wanted: &str) -> usize {
+    names
+        .iter()
+        .position(|n| n.eq_ignore_ascii_case(wanted))
+        .unwrap_or_else(|| panic!("net '{wanted}' is not a circuit node"))
+}
+
+/// TODO §2: `itl2` — the DC *retry rung* budget. The plain stage rides
+/// `itl1`, and the gmin/source-stepping rungs ride `itl2` (defaulting to
+/// the plain `itl1`). When the rungs are starved tighter than the plain
+/// stage, a deck that fails plain can still converge on a ladder rung and
+/// run to completion.
+#[test]
+fn itl2_budget_governs_the_dc_retry_rungs() {
+    let deck = |options: &str| {
+        format!(
+            r#"
+* diode node the plain stage exhausts at itl1=3
+.options itl1=3 {options}
+.op
+.model dmod D(IS=1e-14)
+V1 a 0 DC 3
+D1 a k dmod
+C1 k 0 1n
+.end
+"#
+        )
+    };
+    // Rungs starved as hard as the plain stage: the whole ladder fails.
+    let still_fails = parse(&deck("itl2=3")).unwrap();
+    let err = crate::run(&still_fails).unwrap_err().to_string();
+    assert!(
+        err.contains("DC operating point failed to converge"),
+        "expected the DC exhaust error, got {err}"
+    );
+    // Rungs given a real budget: a gmin-stepped rung lands somewhere the
+    // starved plain stage could not, and the deck completes.
+    let rescued = parse(&deck("itl2=8")).unwrap();
+    let dc = crate::run(&rescued).unwrap().dc.unwrap();
+    let k = node_index(&rescued.circuit.node_names, "k");
+    // The gmin-balance fixed point the plain solve reaches with a full
+    // budget (IS·exp(vd/vt) ≈ gmin·(3−2·vd)).
+    assert_relative_eq!(dc.node_voltages[k], 2.855006, epsilon = 1e-5);
+}
+
+/// TODO §2: `itl5` — the total transient Newton iteration budget across the
+/// whole analysis. A budget of 2 starves past the first accepted point (one
+/// step-doubling attempt spends three or more builds); 0 reverts to the
+/// engine's unrestricted default.
+#[test]
+fn itl5_budget_governs_the_total_transient_iterations() {
+    let deck = |options: &str| {
+        format!(
+            r#"
+* sharp-edged diode transient under a total-iteration budget
+.model dmod D(IS=1e-14)
+V1 a 0 PULSE(0 3 2n 0 0 8n 20n)
+D1 a k dmod
+C1 k 0 1u
+.tran 1n 20n
+{options}
+.end
+"#
+        )
+    };
+    let starved = parse(&deck(".options itl5=2")).unwrap();
+    let err = crate::run(&starved).unwrap_err().to_string();
+    assert!(
+        err.contains("itl5=2"),
+        "expected the itl5 budget error, got {err}"
+    );
+
+    // 0 = omit limit: the run completes exactly as it does unset.
+    for options in [".options itl5=0", ""] {
+        let free = parse(&deck(options)).unwrap();
+        let tran = crate::run(&free).unwrap().tran.unwrap();
+        assert_relative_eq!(tran.points.last().unwrap().time, 2e-8, epsilon = 1e-9);
+    }
+}
+
+/// TODO §2: `maxord` caps the integration order. `maxord=1` forces backward
+/// Euler — the same trajectory the deck's own `method=gear1` produces and a
+/// different one from the default trapezoidal — while 2..6 widens only and
+/// leaves the default (trapezoidal/Gear-2) run unchanged.
+#[test]
+fn maxord_caps_the_integration_order() {
+    let deck = |options: &str| {
+        format!(
+            r#"
+* rising edge on an RC where the integrator order is visible
+V1 a 0 PULSE(0 3 2n 0 0 8n 20n)
+R1 a b 1k
+C1 b 0 100n
+.tran 1n 20n
+{options}
+.end
+"#
+        )
+    };
+    let forced = parse(&deck(".options maxord=1")).unwrap();
+    let as_method = parse(&deck(".options method=gear1")).unwrap();
+    let plain = parse(&deck("")).unwrap();
+    let forced = crate::run(&forced).unwrap().tran.unwrap();
+    let as_method = crate::run(&as_method).unwrap().tran.unwrap();
+    let plain = crate::run(&plain).unwrap().tran.unwrap();
+    assert_eq!(forced.points.len(), as_method.points.len());
+    for (a, b) in forced.points.iter().zip(&as_method.points) {
+        assert_relative_eq!(a.time, b.time, epsilon = 1e-15);
+        for (va, vb) in a.node_voltages.iter().zip(&b.node_voltages) {
+            assert_relative_eq!(*va, *vb, epsilon = 1e-12);
+        }
+    }
+    // Backward Euler genuinely differs from trapezoidal somewhere: either a
+    // shared grid sample reads different voltages (edge ramps) or even the
+    // accepted-step cadence changed.
+    let same_len = forced.points.len() == plain.points.len();
+    let max_diff = same_len.then(|| {
+        forced
+            .points
+            .iter()
+            .zip(&plain.points)
+            .flat_map(|(e, p)| {
+                e.node_voltages
+                    .iter()
+                    .zip(&p.node_voltages)
+                    .map(|(a, b)| (a - b).abs())
+            })
+            .fold(0.0f64, f64::max)
+    });
+    assert!(
+        max_diff.is_none_or(|d| d > 1e-6) || !same_len,
+        "orders came out identical"
+    );
+
+    // Orders 2..6 are accepted and cannot widen past the deck's method.
+    for order in 2..=6 {
+        let widened = format!(".options maxord={order}");
+        let widened = parse(&deck(&widened)).unwrap();
+        let widened = crate::run(&widened).unwrap().tran.unwrap();
+        assert_eq!(widened.points.len(), plain.points.len(), "maxord={order}");
+        for (a, b) in widened.points.iter().zip(&plain.points) {
+            assert_relative_eq!(a.time, b.time, epsilon = 1e-15);
+        }
+    }
+}
+
+/// TODO §2: `accurate` closes the LTE slack — the effective truncation-error
+/// factor becomes 1.0, so a deck that claims `trtol=2` alongside it steps
+/// exactly as tight as `trtol=1` does, while plain `trtol=2` rides measurably
+/// coarser steps.
+#[test]
+fn accurate_flag_closes_the_lte_slack() {
+    // integration.rs trtol deck shape: a 1 pF edge cap plus a printed grid
+    // coarser than the accepted steps, so points count accepted-step cadence.
+    let deck = |options: &str| {
+        format!(
+            r#"
+* pulse edges drive the LTE estimate
+V1 a 0 PULSE(0 1 1n 1n 1n 4n 10n)
+R1 a b 1k
+C1 b 0 1p
+.tran 1m 10n
+{options}
+.end
+"#
+        )
+    };
+    let b = node_index(&parse(&deck("")).unwrap().circuit.node_names, "b");
+    let run = |options: &str| {
+        crate::run(&parse(&deck(options)).unwrap())
+            .unwrap()
+            .tran
+            .unwrap()
+    };
+    let tight = run(".options trtol=1");
+    // A trtol inflated to 2 cannot re-loosen a slack that is already closed.
+    let flagged = run(".options trtol=2 accurate");
+    let loose = run(".options trtol=2");
+
+    assert_eq!(tight.points.len(), flagged.points.len());
+    for (a, p) in tight.points.iter().zip(&flagged.points) {
+        assert_relative_eq!(a.time, p.time, epsilon = 1e-12);
+        assert_relative_eq!(a.node_voltages[b], p.node_voltages[b], epsilon = 1e-12);
+    }
+    assert!(
+        loose.points.len() < flagged.points.len(),
+        "trtol=2 should ride coarser steps than the slackless runs: {} vs {}",
+        loose.points.len(),
+        flagged.points.len()
+    );
 }

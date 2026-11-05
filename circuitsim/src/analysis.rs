@@ -200,11 +200,15 @@ fn newton_raphson(
     seed: &nalgebra::DVector<f64>,
     failure: &str,
     max_iters: usize,
-) -> Result<nalgebra::DVector<f64>> {
+) -> Result<(nalgebra::DVector<f64>, usize)> {
     let mut x = seed.clone();
+    // Number of build-and-solve NR iterations spent so far — the transient
+    // path sums these against the `.options itl5=` total budget.
+    let mut iters = 0usize;
     // Current linearization. The system is rebuilt after every accepted
     // iterate; the line search below reuses it when possible.
     for _ in 0..max_iters {
+        iters += 1;
         let sys = build(&x)?;
         let x_raw = sys.solve()?;
         let res0 = sys.residual(&x);
@@ -227,7 +231,7 @@ fn newton_raphson(
         let converged = diff < NR_TOLERANCE;
         x = x_next;
         if converged {
-            return Ok(x);
+            return Ok((x, iters));
         }
     }
     Err(SimError::Analysis(failure.into()))
@@ -453,6 +457,10 @@ pub struct DcConvergence {
     srcsteps: usize,
     /// Newton-Raphson iteration budget per DC solve.
     itl1: usize,
+    /// Newton-Raphson iteration budget per DC *retry rung* (the ladder
+    /// stages). `.options itl2=` overrides what used to be the plain
+    /// `itl1` budget.
+    itl2: usize,
 }
 
 impl DcConvergence {
@@ -462,6 +470,7 @@ impl DcConvergence {
             gminsteps: analysis.config.gminsteps,
             srcsteps: analysis.config.srcsteps,
             itl1: analysis.config.itl1,
+            itl2: analysis.config.itl2.unwrap_or(analysis.config.itl1),
         }
     }
 }
@@ -474,7 +483,7 @@ fn dc_stage(
     x_seed: &nalgebra::DVector<f64>,
     gmin: f64,
     src_scale: f64,
-    conv: DcConvergence,
+    iters: usize,
 ) -> Result<nalgebra::DVector<f64>> {
     let mut prev = DcJunctionLimits::seed(circuit, x_seed);
     // Fresh table with one slot per element so the stamps can record the
@@ -500,8 +509,9 @@ fn dc_stage(
         },
         x_seed,
         "DC operating point failed to converge",
-        conv.itl1,
+        iters,
     )
+    .map(|(x, _)| x)
 }
 
 /// Solve the DC operating point and return both the summary struct and the
@@ -541,7 +551,9 @@ fn solve_dc_op(
     };
 
     // Stage 1: the plain operating point (the overwhelmingly common path).
-    if let Ok(x) = dc_stage(circuit, &plain, conv.gmin, 1.0, conv) {
+    // The plain attempt rides `itl1`; the ladder rungs below ride `itl2`
+    // (the `.options itl2=` DC transfer-curve budget, defaulting to `itl1`).
+    if let Ok(x) = dc_stage(circuit, &plain, conv.gmin, 1.0, conv.itl1) {
         let result = extract_dc(circuit, &x)?;
         return Ok((result, x));
     }
@@ -551,11 +563,11 @@ fn solve_dc_op(
     let mut x = plain.clone();
     for rung in (1..=conv.gminsteps.max(1)).rev() {
         let gmin_rung = conv.gmin * 10f64.powi(rung as i32);
-        if let Ok(solved) = dc_stage(circuit, &x, gmin_rung, 1.0, conv) {
+        if let Ok(solved) = dc_stage(circuit, &x, gmin_rung, 1.0, conv.itl2) {
             x = solved;
         }
     }
-    if let Ok(x) = dc_stage(circuit, &x, conv.gmin, 1.0, conv) {
+    if let Ok(x) = dc_stage(circuit, &x, conv.gmin, 1.0, conv.itl2) {
         let result = extract_dc(circuit, &x)?;
         return Ok((result, x));
     }
@@ -568,7 +580,7 @@ fn solve_dc_op(
     let mut x = plain.clone();
     for k in 1..=steps {
         let scale = k as f64 / steps as f64;
-        if let Ok(solved) = dc_stage(circuit, &x, conv.gmin, scale, conv) {
+        if let Ok(solved) = dc_stage(circuit, &x, conv.gmin, scale, conv.itl2) {
             x = solved;
             if k == steps {
                 let result = extract_dc(circuit, &x)?;
@@ -1036,7 +1048,14 @@ fn run_transient(
         return Err(SimError::Analysis("tstop must be >= tstart".into()));
     }
 
-    let method = analysis.config.method;
+    // `.options maxord=` caps the integration order: 1 forces backward Euler
+    // (an order the deck's own method cannot already be below); 2..6 are
+    // accepted and can only widen — trapezoidal/Gear-2 top out at order 2.
+    let method = if analysis.config.maxord == Some(1) {
+        IntegrationMethod::Gear1
+    } else {
+        analysis.config.method
+    };
     let max_step = analysis.tran_maxstep.unwrap_or(dt_out).min(t_stop.max(dt_out));
     let min_step = (t_stop * 1e-12).max(1e-18);
 
@@ -1070,10 +1089,21 @@ fn run_transient(
     // The transient path's iteration budget: `.options itl4=` (per time
     // point; the defaults keep the pre-options 100).
     let max_iters = analysis.config.itl4;
+    // `.options itl5=` — the total Newton iteration budget across the whole
+    // analysis (successful solves counted; 0/unset = no limit).
+    let itl5_budget = analysis.config.itl5;
+    let mut nr_iterations = 0usize;
 
     while t < t_stop - eps {
         if iterations > MAX_STEPS {
             return Err(SimError::Analysis("transient exceeded maximum steps".into()));
+        }
+        if let Some(limit) = itl5_budget {
+            if nr_iterations >= limit {
+                return Err(SimError::Analysis(format!(
+                    "transient exceeded the .options itl5={limit} total iteration budget"
+                )));
+            }
         }
         iterations += 1;
 
@@ -1089,13 +1119,16 @@ fn run_transient(
 
         // Step doubling: one full step and two half steps. Their difference
         // estimates the local truncation error; the half-step solution (the
-        // more accurate one) is what we advance with.
-        let attempt = (|| -> Result<(nalgebra::DVector<f64>, TransientState, f64)> {
-            let (x_full, s_full) =
+        // more accurate one) is what we advance with. Each transient_step
+        // also returns the Newton iterations it spent, summed against the
+        // total `itl5` budget.
+        let attempt = (|| -> Result<(nalgebra::DVector<f64>, TransientState, f64, usize)> {
+            let (x_full, s_full, used) =
                 transient_step(circuit, &x, &state, t, h_try, method, startup, max_iters)?;
-            let (x1, s1) =
-                transient_step(circuit, &x, &state, t, h_try * 0.5, method, startup, max_iters)?;
-            let (x2, _s2) = transient_step(
+            let (x1, s1, used) =
+                transient_step(circuit, &x, &state, t, h_try * 0.5, method, startup, max_iters)
+                    .map(|(a, b, c)| (a, b, used + c))?;
+            let (x2, _s2, used) = transient_step(
                 circuit,
                 &x1,
                 &s1,
@@ -1104,16 +1137,18 @@ fn run_transient(
                 method,
                 startup,
                 max_iters,
-            )?;
+            )
+            .map(|(a, b, c)| (a, b, used + c))?;
             let err = transient_error(&x_full, &x2, circuit, analysis);
             if x_full.iter().any(|v| !v.is_finite()) {
-                return Ok((x_full, s_full, f64::INFINITY));
+                return Ok((x_full, s_full, f64::INFINITY, used));
             }
-            Ok((x_full, s_full, err))
+            Ok((x_full, s_full, err, used))
         })();
 
         match attempt {
-            Ok((x2, s2, err)) if err <= 1.0 || h_try <= min_step * 1.01 => {
+            Ok((x2, s2, err, used)) if err <= 1.0 || h_try <= min_step * 1.01 => {
+                nr_iterations += used;
                 x = x2;
                 state = s2;
                 t += h_try;
@@ -1132,7 +1167,7 @@ fn run_transient(
                 }
                 h = (h_try * factor).clamp(min_step, max_step);
             }
-            Ok((_, _, err)) => {
+            Ok((_, _, err, _used)) => {
                 // Rejected: shrink from the attempted step, not from the
                 // (possibly clipped) proposal.
                 let factor = growth_factor(err, order).min(0.5);
@@ -1163,11 +1198,11 @@ fn transient_step(
     method: IntegrationMethod,
     startup: bool,
     max_iters: usize,
-) -> Result<(nalgebra::DVector<f64>, TransientState)> {
+) -> Result<(nalgebra::DVector<f64>, TransientState, usize)> {
     // The step solves for the *end* of the interval; sources must be
     // evaluated there (the previous code sampled the start time).
     let t_new = t + dt;
-    let x = newton_raphson(
+    let (x, iters) = newton_raphson(
         |guess| {
             build_system::<f64>(
                 circuit,
@@ -1179,7 +1214,7 @@ fn transient_step(
         max_iters,
     )?;
     let state = advance_transient_state(circuit, &x, state, dt, method, t_new);
-    Ok((x, state))
+    Ok((x, state, iters))
 }
 
 /// Normalised LTE estimate between the full step and the two half steps.
@@ -1205,7 +1240,13 @@ fn transient_error(
     // `.options trtol=` is the truncation-error overestimation factor: the
     // estimate deliberately over-tightens, so the shipped LTspice default
     // 2.0 (and the knob) relaxes the accept/reject threshold that uses it.
-    worst / analysis.config.trtol.max(1e-9)
+    // The PSpice `accurate` flag closes the slack: effective factor 1.0.
+    let trtol = if analysis.config.accurate {
+        1.0
+    } else {
+        analysis.config.trtol
+    };
+    worst / trtol.max(1e-9)
 }
 
 fn growth_factor(err: f64, order: f64) -> f64 {

@@ -73,8 +73,11 @@ below is written against that state.
 - [x] **[P1] (both)** Initial-condition directives: `.ic` (bias/transient startup) and `.nodeset` —
   done: both parse (fused/split spellings), node names resolve loudly; `.ic` pins a `UIC` transient's
   t=0 state, `.nodeset` seeds (never forces) the DC iteration.
-- [ ] **[P2] (both)** Full `.options` surface: `reltol`, `vntol`, `abstol`, `gmin`, `itl1..itl6`,
-  `maxord`, `method`, PSpice `accurate`/`solvehold` style flags — parsed and honored.
+- [x] **[P2] (both)** Full `.options` surface: `reltol`, `vntol`, `abstol`, `gmin`, `itl1..itl6`,
+  `maxord`, `method`, PSpice `accurate`/`solvehold` style flags — parsed and honored. *(done: `itl2`
+  bounds the DC rung budget, `itl5` the transient Newton budget, `itl6` is the `srcsteps` synonym,
+  `maxord` validates 1..=6 (`1` forces Gear1), `accurate` drives trtol to 1.0, `solvehold` is
+  accepted/remembered/round-tripped; `itl3` and `method` are recognized-inert, the rest warn.)*
 - [ ] **[P2] (LT)** Waveform/data selection directives: `.save`, `.keep`, `.savebias`, `.loadbias`.
 - [ ] **[P2] (LT)** `.csparam` support (feeds `.meas` results across stepped runs).
 - [ ] **[P2] (PS)** Node aliasing blocks `.aliases`/`.endaliases` for probe names.

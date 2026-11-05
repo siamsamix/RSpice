@@ -401,9 +401,15 @@ pub(super) fn parse_options(
     }
     for tok in &tokens[1..] {
         let Some((key, value)) = tok.split_once('=') else {
-            warnings.push(format!(
-                "line {line_no}: .options token '{tok}' is not KEY=VALUE — ignored"
-            ));
+            // PSpice's boolean flag options are bare words (`accurate`,
+            // `solvehold`), not KEY=VALUE.
+            match tok.to_ascii_lowercase().as_str() {
+                "accurate" => analysis.config.accurate = true,
+                "solvehold" => analysis.config.solvehold = true,
+                _ => warnings.push(format!(
+                    "line {line_no}: .options token '{tok}' is not KEY=VALUE — ignored"
+                )),
+            }
             continue;
         };
         let key = key.to_ascii_lowercase();
@@ -447,6 +453,50 @@ pub(super) fn parse_options(
                 analysis.config.itl4 =
                     parse_value(value).map_err(SimError::Parse)?.max(1.0) as usize
             }
+            // DC retry-rung budget (the gmin/source ladders and swept points
+            // that fell through their warm start). Unset keeps the plain
+            // `itl1` budget on those rungs.
+            "itl2" => {
+                analysis.config.itl2 =
+                    Some(parse_value(value).map_err(SimError::Parse)?.max(1.0) as usize)
+            }
+            // Lower transient iteration limit: recognized-inert (ngspice has
+            // not implemented it in Spice3 either), round-tripped.
+            "itl3" => {
+                analysis.config.itl3 =
+                    Some(parse_value(value).map_err(SimError::Parse)?.max(1.0) as usize)
+            }
+            // Total transient iteration budget; 0 = no limit (the default).
+            "itl5" => {
+                let n = parse_value(value).map_err(SimError::Parse)?.max(0.0) as usize;
+                analysis.config.itl5 = if n == 0 { None } else { Some(n) };
+            }
+            // Integration order cap: 1 forces backward Euler, 2..6 can only
+            // widen (the engine tops out at trapezoidal/Gear-2).
+            "maxord" => {
+                let n = parse_value(value).map_err(SimError::Parse)?;
+                if n < 0.5 || n > 6.5 {
+                    return Err(SimError::Parse(format!(
+                        "line {line_no}: .options maxord={value} must be 1..=6"
+                    )));
+                }
+                analysis.config.maxord = Some(n.round() as u32);
+            }
+            // The KEY=VALUE spellings of the bare boolean flags above.
+            "accurate" => {
+                analysis.config.accurate =
+                    parse_value(value).map_err(SimError::Parse)? > 0.0
+            }
+            "solvehold" => {
+                analysis.config.solvehold =
+                    parse_value(value).map_err(SimError::Parse)? > 0.0
+            }
+            // LTspice's `srcsteps` synonym (default 25 there; 0 stops the
+            // source-stepping ladder).
+            "itl6" => {
+                analysis.config.srcsteps =
+                    parse_value(value).map_err(SimError::Parse)?.max(0.0) as usize
+            }
             // LTspice's truncated-error overestimation factor in the
             // adaptive stepper (TODO §3): the LTE estimate rides ~trtol
             // bigger steps.
@@ -466,8 +516,7 @@ pub(super) fn parse_options(
             }
             // Parsed but not applied yet; keep them as warnings instead of
             // pretending the engine honours them.
-            "itl2" | "itl6" | "maxord" | "tnom" | "temp"
-            | "accurate" | "solvehold" | "plotwinsize" | "numdgt" => {
+            "tnom" | "temp" | "plotwinsize" | "numdgt" => {
                 warnings.push(format!(
                     "line {line_no}: .options {key}={value} is parsed but not applied yet"
                 ));
@@ -1199,6 +1248,25 @@ pub(super) fn emit_commands(analysis: &AnalysisCommands, out: &mut String) {
     }
     if analysis.config.trtol != 2.0 {
         options.push_str(&format!(" trtol={}", analysis.config.trtol));
+    }
+    if let Some(itl2) = analysis.config.itl2 {
+        options.push_str(&format!(" itl2={itl2}"));
+    }
+    if let Some(itl3) = analysis.config.itl3 {
+        options.push_str(&format!(" itl3={itl3}"));
+    }
+    if let Some(itl5) = analysis.config.itl5 {
+        options.push_str(&format!(" itl5={itl5}"));
+    }
+    if let Some(maxord) = analysis.config.maxord {
+        options.push_str(&format!(" maxord={maxord}"));
+    }
+    // Flag options re-emit bare, as PSpice spells them.
+    if analysis.config.accurate {
+        options.push_str(" accurate");
+    }
+    if analysis.config.solvehold {
+        options.push_str(" solvehold");
     }
     if analysis.config.mc_seed != 0 {
         // TODO §8: the base Monte-Carlo seed round-trips like the knobs.

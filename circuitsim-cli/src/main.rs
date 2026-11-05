@@ -222,22 +222,13 @@ fn run_cli() -> Result<(), CliError> {
     let source = fs::read_to_string(&args.netlist)
         .map_err(|e| SimError::Parse(format!("{}: {e}", args.netlist.display())))?;
 
-    // Library resolution order: the deck's own directory, explicit -I paths,
-    // `RSPICE_LIB` (PATH-style), the bundled `libs/` next to the checkout (or
-    // the installed executable), and the process directory.
-    let mut search_paths: Vec<PathBuf> = args.include.clone();
-    if let Ok(paths) = std::env::var("RSPICE_LIB") {
-        search_paths.extend(std::env::split_paths(&paths));
-    }
-    for bundled in bundled_library_dirs() {
-        if !search_paths.contains(&bundled) {
-            search_paths.push(bundled);
-        }
-    }
-    let options = ParseOptions {
-        deck_dir: args.netlist.parent().map(std::path::Path::to_path_buf),
-        search_paths,
-    };
+    // Library resolution order (shared with the GUI): the deck's own
+    // directory, explicit -I paths, `RSPICE_LIB` (PATH-style), the bundled
+    // `libs/` tree, and the process directory.
+    let options = ParseOptions::for_deck(
+        args.netlist.parent().map(std::path::Path::to_path_buf),
+        &args.include,
+    );
 
     let netlist = circuitsim::parse_with_options(&source, &options)?;
     if !args.no_warnings {
@@ -378,24 +369,6 @@ fn run_cli() -> Result<(), CliError> {
         Some(message) => Err(SimError::Analysis(message).into()),
         None => Ok(()),
     }
-}
-
-/// Candidate directories for the app's bundled model libraries.
-fn bundled_library_dirs() -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    // A checkout / installed tree: <exe dir>/../libs, <exe dir>/libs.
-    if let Ok(exe) = std::env::current_exe() {
-        if let Some(dir) = exe.parent() {
-            out.push(dir.join("libs"));
-            if let Some(parent) = dir.parent() {
-                out.push(parent.join("libs"));
-            }
-        }
-    }
-    // The source checkout this binary was built from.
-    out.push(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../libs"));
-    out.retain(|p| p.is_dir());
-    out
 }
 
 fn print_summary(report: &mut String, netlist: &Netlist) {

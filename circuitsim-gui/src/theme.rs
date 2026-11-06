@@ -12,51 +12,59 @@ use egui::{Color32, FontData, FontDefinitions, FontFamily, FontId, Rounding, Str
 /// Menu bar, toolbar and the selected tab — pure white.
 pub const LT_WHITE: Color32 = Color32::from_rgb(255, 255, 255);
 /// Tab strip and status bar.
-pub const LT_STRIP: Color32 = Color32::from_rgb(245, 245, 245);
+pub const LT_STRIP: Color32 = Color32::from_rgb(246, 247, 249);
 /// MDI workspace and the schematic canvas.
-pub const LT_WORKSPACE: Color32 = Color32::from_rgb(192, 192, 192);
+pub const LT_WORKSPACE: Color32 = Color32::from_rgb(232, 235, 240);
 /// Workspace / child-window border.
-pub const LT_FRAME: Color32 = Color32::from_rgb(106, 106, 106);
+pub const LT_FRAME: Color32 = Color32::from_rgb(196, 202, 212);
 /// Title bar of the active child window.
-pub const LT_TITLE_ACTIVE: Color32 = Color32::from_rgb(50, 150, 250);
+pub const LT_TITLE_ACTIVE: Color32 = Color32::from_rgb(37, 99, 235);
 /// Title bar of an inactive child window.
-pub const LT_TITLE_INACTIVE: Color32 = Color32::from_rgb(128, 128, 128);
+pub const LT_TITLE_INACTIVE: Color32 = Color32::from_rgb(238, 240, 244);
 /// Title text of an inactive child window.
-pub const LT_TITLE_INACTIVE_TEXT: Color32 = Color32::from_rgb(192, 192, 192);
+pub const LT_TITLE_INACTIVE_TEXT: Color32 = Color32::from_rgb(120, 128, 142);
+/// Title bar fill of the active child window (soft blue tint; the strong
+/// blue is drawn as an underline).
+pub const TITLE_ACTIVE_BG: Color32 = Color32::from_rgb(229, 238, 255);
 /// Waveform viewer background.
-pub const LT_PLOT_BG: Color32 = Color32::BLACK;
+pub const LT_PLOT_BG: Color32 = Color32::from_rgb(13, 15, 19);
 /// Waveform viewer frame, tick marks and axis text.
-pub const LT_PLOT_FRAME: Color32 = Color32::from_rgb(175, 175, 175);
+pub const LT_PLOT_FRAME: Color32 = Color32::from_rgb(150, 158, 172);
 /// Schematic wires and symbols.
-pub const LT_WIRE: Color32 = Color32::from_rgb(0, 0, 255);
+pub const LT_WIRE: Color32 = Color32::from_rgb(29, 78, 216);
 /// Schematic text (names, values, directives).
-pub const LT_SCHEM_TEXT: Color32 = Color32::BLACK;
+pub const LT_SCHEM_TEXT: Color32 = Color32::from_rgb(24, 28, 36);
 
 /// Primary interactive accent — the active-title blue.
 pub const ACCENT: Color32 = LT_TITLE_ACTIVE;
-pub const ACCENT_DIM: Color32 = Color32::from_rgb(30, 110, 200);
+/// Corner radius of buttons and inputs.
+pub const RADIUS: f32 = 5.0;
+/// Selection / pressed fill.
+pub const SELECT_FILL: Color32 = Color32::from_rgb(191, 214, 253);
+
+pub const ACCENT_DIM: Color32 = Color32::from_rgb(29, 78, 216);
 
 /// Surface hierarchy.
 pub const BG_BASE: Color32 = LT_WHITE;                            // Text editors, input fields
 pub const BG_PANEL: Color32 = LT_STRIP;                           // Bars, panels
 pub const BG_SURFACE: Color32 = LT_WHITE;                         // Cards
-pub const BG_CONTROL: Color32 = Color32::from_rgb(225, 225, 225); // Buttons
-pub const BG_HOVER: Color32 = Color32::from_rgb(214, 232, 251);   // Hovered controls
+pub const BG_CONTROL: Color32 = Color32::from_rgb(238, 240, 244); // Buttons
+pub const BG_HOVER: Color32 = Color32::from_rgb(219, 230, 252);   // Hovered controls
 
 /// Borders — structural and subtle.
 pub const BORDER: Color32 = LT_FRAME;
-pub const BORDER_SUBTLE: Color32 = Color32::from_rgb(200, 200, 200);
+pub const BORDER_SUBTLE: Color32 = Color32::from_rgb(220, 224, 231);
 
 /// Text — black primary, two muted levels.
-pub const TEXT_PRIMARY: Color32 = Color32::BLACK;
-pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(80, 80, 80);
-pub const TEXT_DISABLED: Color32 = Color32::from_rgb(144, 144, 144);
+pub const TEXT_PRIMARY: Color32 = Color32::from_rgb(24, 28, 36);
+pub const TEXT_SECONDARY: Color32 = Color32::from_rgb(88, 96, 110);
+pub const TEXT_DISABLED: Color32 = Color32::from_rgb(158, 165, 177);
 
 /// Status — readable on the light chrome.
-pub const STATUS_OK: Color32 = Color32::from_rgb(20, 130, 60);
+pub const STATUS_OK: Color32 = Color32::from_rgb(22, 140, 72);
 pub const STATUS_WARN: Color32 = Color32::from_rgb(180, 110, 0);
 pub const STATUS_ERROR: Color32 = Color32::from_rgb(190, 30, 30);
-pub const STATUS_INFO: Color32 = Color32::from_rgb(30, 110, 200);
+pub const STATUS_INFO: Color32 = Color32::from_rgb(37, 99, 235);
 
 // ---------------------------------------------------------------------------
 // Waveform Trace Colors — bright on the black viewer. The first trace is
@@ -64,14 +72,14 @@ pub const STATUS_INFO: Color32 = Color32::from_rgb(30, 110, 200);
 // high-luminance colors in a fixed order.
 // ---------------------------------------------------------------------------
 pub const PLOT_COLORS: [Color32; 8] = [
-    Color32::from_rgb(0, 255, 0),     // 1 — LTspice green (reference)
-    Color32::from_rgb(255, 60, 60),   // 2 — red
-    Color32::from_rgb(70, 130, 255),  // 3 — blue
-    Color32::from_rgb(255, 230, 0),   // 4 — yellow
-    Color32::from_rgb(0, 230, 230),   // 5 — cyan
-    Color32::from_rgb(255, 80, 255),  // 6 — magenta
-    Color32::from_rgb(255, 255, 255), // 7 — white
-    Color32::from_rgb(255, 150, 40),  // 8 — orange
+    Color32::from_rgb(52, 232, 112),  // 1 — green (LTspice-style first trace)
+    Color32::from_rgb(255, 99, 99),   // 2 — red
+    Color32::from_rgb(96, 150, 255),  // 3 — blue
+    Color32::from_rgb(255, 214, 64),  // 4 — yellow
+    Color32::from_rgb(45, 212, 224),  // 5 — cyan
+    Color32::from_rgb(240, 110, 240), // 6 — magenta
+    Color32::from_rgb(240, 242, 245), // 7 — white
+    Color32::from_rgb(255, 159, 67),  // 8 — orange
 ];
 
 // ---------------------------------------------------------------------------
@@ -126,16 +134,16 @@ pub fn apply(ctx: &egui::Context) {
     visuals.panel_fill = BG_PANEL;
     visuals.window_fill = LT_WHITE;
     visuals.extreme_bg_color = BG_BASE;          // Text editors, input fields
-    visuals.faint_bg_color = Color32::from_rgb(238, 238, 238);
-    visuals.code_bg_color = Color32::from_rgb(235, 235, 235);
+    visuals.faint_bg_color = Color32::from_rgb(241, 243, 246);
+    visuals.code_bg_color = Color32::from_rgb(236, 239, 244);
 
     // Structural chrome — flat, light shadows.
     visuals.window_stroke = Stroke::new(1.0, BORDER);
     let shadow = egui::epaint::Shadow {
-        offset: egui::vec2(1.0, 2.0),
-        blur: 6.0,
+        offset: egui::vec2(0.0, 4.0),
+        blur: 16.0,
         spread: 0.0,
-        color: Color32::from_black_alpha(60),
+        color: Color32::from_black_alpha(40),
     };
     visuals.window_shadow = shadow;
     visuals.popup_shadow = shadow;
@@ -146,38 +154,38 @@ pub fn apply(ctx: &egui::Context) {
     visuals.widgets.noninteractive.weak_bg_fill = BG_PANEL;
     visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, BORDER_SUBTLE);
     visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
-    visuals.widgets.noninteractive.rounding = Rounding::same(0.0);
+    visuals.widgets.noninteractive.rounding = Rounding::same(RADIUS);
 
     // inactive: default clickable controls
     visuals.widgets.inactive.bg_fill = BG_CONTROL;
     visuals.widgets.inactive.weak_bg_fill = BG_CONTROL;
-    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(150, 150, 150));
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, Color32::from_rgb(205, 210, 219));
     visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
-    visuals.widgets.inactive.rounding = Rounding::same(1.0);
+    visuals.widgets.inactive.rounding = Rounding::same(RADIUS);
 
     // hovered
     visuals.widgets.hovered.bg_fill = BG_HOVER;
     visuals.widgets.hovered.weak_bg_fill = BG_HOVER;
     visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, ACCENT_DIM);
     visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
-    visuals.widgets.hovered.rounding = Rounding::same(1.0);
+    visuals.widgets.hovered.rounding = Rounding::same(RADIUS);
 
     // active (pressed / toggled on)
-    visuals.widgets.active.bg_fill = Color32::from_rgb(184, 217, 252);
-    visuals.widgets.active.weak_bg_fill = Color32::from_rgb(184, 217, 252);
+    visuals.widgets.active.bg_fill = SELECT_FILL;
+    visuals.widgets.active.weak_bg_fill = SELECT_FILL;
     visuals.widgets.active.bg_stroke = Stroke::new(1.0, ACCENT_DIM);
     visuals.widgets.active.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
-    visuals.widgets.active.rounding = Rounding::same(1.0);
+    visuals.widgets.active.rounding = Rounding::same(RADIUS);
 
     // open (combo boxes, drop-downs)
-    visuals.widgets.open.bg_fill = Color32::from_rgb(184, 217, 252);
-    visuals.widgets.open.weak_bg_fill = Color32::from_rgb(184, 217, 252);
+    visuals.widgets.open.bg_fill = SELECT_FILL;
+    visuals.widgets.open.weak_bg_fill = SELECT_FILL;
     visuals.widgets.open.bg_stroke = Stroke::new(1.0, ACCENT_DIM);
     visuals.widgets.open.fg_stroke = Stroke::new(1.0, TEXT_PRIMARY);
-    visuals.widgets.open.rounding = Rounding::same(1.0);
+    visuals.widgets.open.rounding = Rounding::same(RADIUS);
 
     // Selection / highlight
-    visuals.selection.bg_fill = Color32::from_rgb(184, 217, 252);
+    visuals.selection.bg_fill = SELECT_FILL;
     visuals.selection.stroke = Stroke::new(1.0, ACCENT_DIM);
 
     // Semantic colors
@@ -186,9 +194,10 @@ pub fn apply(ctx: &egui::Context) {
     visuals.error_fg_color = STATUS_ERROR;
     visuals.override_text_color = Some(TEXT_PRIMARY);
 
-    // Geometry — square, like the reference's native widgets.
-    visuals.window_rounding = Rounding::same(0.0);
-    visuals.menu_rounding = Rounding::same(0.0);
+    // Geometry — softly rounded controls and floating surfaces; the MDI
+    // child windows stay square so their bodies clip cleanly.
+    visuals.window_rounding = Rounding::same(10.0);
+    visuals.menu_rounding = Rounding::same(8.0);
 
     ctx.set_visuals(visuals);
 
@@ -197,15 +206,15 @@ pub fn apply(ctx: &egui::Context) {
     // -----------------------------------------------------------------------
     let mut style = (*ctx.style()).clone();
 
-    style.spacing.scroll.bar_width = 8.0;
+    style.spacing.scroll.bar_width = 9.0;
     style.spacing.scroll.handle_min_length = 24.0;
 
-    style.spacing.item_spacing = egui::vec2(6.0, 4.0);
-    style.spacing.button_padding = egui::vec2(8.0, 3.0);
-    style.spacing.window_margin = egui::Margin::same(8.0);
-    style.spacing.menu_margin = egui::Margin::same(2.0);
+    style.spacing.item_spacing = egui::vec2(7.0, 4.0);
+    style.spacing.button_padding = egui::vec2(10.0, 3.0);
+    style.spacing.window_margin = egui::Margin::same(10.0);
+    style.spacing.menu_margin = egui::Margin::same(4.0);
     style.spacing.indent = 14.0;
-    style.spacing.interact_size.y = 20.0;
+    style.spacing.interact_size.y = 22.0;
 
     // Font scale: small and data-dense like the reference.
     style.text_styles.insert(TextStyle::Heading, FontId::new(13.0, FontFamily::Proportional));
@@ -226,8 +235,8 @@ pub fn card_frame() -> egui::Frame {
     egui::Frame::none()
         .fill(BG_SURFACE)
         .stroke(Stroke::new(1.0, BORDER))
-        .rounding(Rounding::same(0.0))
-        .inner_margin(egui::Margin::same(10.0))
+        .rounding(Rounding::same(8.0))
+        .inner_margin(egui::Margin::same(12.0))
 }
 
 /// Flat bar (menu bar, toolbar, tab strip, status bar): fill + margin, no outline.
@@ -273,8 +282,8 @@ pub fn status_chip(ui: &mut egui::Ui, label: &str, color: Color32) {
     egui::Frame::none()
         .fill(bg)
         .stroke(Stroke::new(1.0, color))
-        .rounding(Rounding::same(2.0))
-        .inner_margin(egui::Margin::symmetric(6.0, 2.0))
+        .rounding(Rounding::same(10.0))
+        .inner_margin(egui::Margin::symmetric(8.0, 2.0))
         .show(ui, |ui| {
             ui.label(egui::RichText::new(label).color(color).size(10.5).strong());
         });

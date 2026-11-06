@@ -1,7 +1,9 @@
 use circuitsim::circuit::{CURRENT_FAMILIES, Circuit as CsCircuit, ElementFamily, Pulse, Sine, Waveform};
-use circuitsim::netlist::{emit as netlist_emit, emit_source_value, parse_source_value, ParseOptions, SourceValue};
+use circuitsim::netlist::{emit as netlist_emit, emit_source_value, parse_source_value, parse_with_options, ParseOptions, SourceValue};
 use circuitsim::units::parse_value;
-use circuitsim::{parse, run, AcResult, DcResult, DcSweepResult, SimulationResult, TranResult};
+#[cfg(test)]
+use circuitsim::parse;
+use circuitsim::{run, AcResult, DcResult, DcSweepResult, SimulationResult, TranResult};
 use egui;
 use egui_plot::Plot;
 use std::collections::HashMap;
@@ -9,6 +11,7 @@ use egui::{Color32, Pos2, Rect, Stroke, Vec2};
 
 use crate::chrome;
 use crate::icons::{icon_button, Icon};
+use crate::parts::{self, PartPicker, PickerEvent};
 use crate::plot::{
     ac_current_series, ac_plot_frame, ac_voltage_series, current_slots, dc_sweep_series, draw,
     first_transient_plot, plot_frame, plot_frame_hover, tran_current_series, tran_diff_series,
@@ -279,6 +282,84 @@ enum ProbeTarget {
     Wire(usize),
 }
 
+/// Where a run of the editor's deck finds `.include` / `.lib` files: the
+/// `RSPICE_LIB` directories first, then the `libs/` shipped with the program
+/// or the source checkout — the same places the CLI searches, so a placed
+/// library part's `.include standard.lib` resolves.
+fn run_parse_options() -> ParseOptions {
+    let mut search_paths: Vec<std::path::PathBuf> = Vec::new();
+    if let Some(var) = std::env::var_os("RSPICE_LIB") {
+        search_paths.extend(std::env::split_paths(&var));
+    }
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            search_paths.push(dir.join("libs"));
+            if let Some(parent) = dir.parent() {
+                search_paths.push(parent.join("libs"));
+            }
+        }
+    }
+    search_paths.push(std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../libs"));
+    search_paths.retain(|p| p.is_dir());
+    ParseOptions { search_paths, ..ParseOptions::default() }
+}
+
+/// The properties popup body of a library part: its instance name, the
+/// attached model/subckt reference, the library that supplies it, and the
+/// spiceline — the data the part's card is written from. Edits write
+/// straight into the component, exactly like a resistor's value field; a bad
+/// one is reported when the netlist is generated.
+fn part_properties(
+    ui: &mut egui::Ui,
+    c: &mut crate::schematic::Component,
+    symbols: &circuitsim::symbols::SymbolLibrary,
+    auto_name: &str,
+) {
+    use circuitsim::symbols::RefKind;
+    let Some(part) = c.part.as_mut() else { return };
+    let symbol = symbols.get(&part.symbol);
+    let row = |ui: &mut egui::Ui, label: &str, add: &mut dyn FnMut(&mut egui::Ui)| {
+        ui.horizontal(|ui| {
+            ui.label(egui::RichText::new(format!("{label:<10}")).size(11.0).color(TEXT_SECONDARY));
+            add(ui);
+        });
+    };
+    ui.label(
+        egui::RichText::new(match symbol {
+            Some(s) if !s.description.is_empty() => s.description.clone(),
+            Some(s) => s.name.clone(),
+            None => format!("{} (not in the library)", part.symbol),
+        })
+        .size(11.0)
+        .color(TEXT_SECONDARY),
+    );
+    ui.add_space(4.0);
+    row(ui, "Name", &mut |ui| {
+        ui.add(egui::TextEdit::singleline(&mut part.name).hint_text(auto_name).desired_width(150.0));
+    });
+    let ref_label = match symbol.map(|s| s.ref_kind) {
+        Some(RefKind::Subckt) => "Subckt",
+        _ => "Model",
+    };
+    row(ui, ref_label, &mut |ui| {
+        ui.add(egui::TextEdit::singleline(&mut c.val).desired_width(150.0));
+    });
+    row(ui, "SpiceLine", &mut |ui| {
+        ui.add(egui::TextEdit::singleline(&mut part.spiceline).desired_width(150.0));
+    });
+    if let Some(lib) = symbol.and_then(|s| s.lib.as_deref()) {
+        row(ui, "Library", &mut |ui| {
+            ui.label(egui::RichText::new(format!(".include {lib}")).size(11.0).color(TEXT_SECONDARY));
+        });
+    }
+    if let Some(symbol) = symbol {
+        if ui.small_button("Reset to library defaults").clicked() {
+            c.val = symbol.reference.clone();
+            part.spiceline = symbol.spiceline.clone();
+        }
+    }
+}
+
 /// The printed family a canvas part kind reports its current under; `Ground`
 /// carries none.
 fn canvas_family(kind: CompKind) -> Option<ElementFamily> {
@@ -287,7 +368,7 @@ fn canvas_family(kind: CompKind) -> Option<ElementFamily> {
         CompKind::Capacitor => Some(ElementFamily::Capacitors),
         CompKind::Inductor => Some(ElementFamily::Inductors),
         CompKind::Voltage => Some(ElementFamily::VoltageSources),
-        CompKind::Ground => None,
+        CompKind::Ground | CompKind::Part => None,
     }
 }
 
@@ -368,6 +449,8 @@ pub struct CircuitSimApp {
     canvas_rect: Rect,
     /// The open Label Net / SPICE Directive dialog, if any.
     note_dialog: Option<NoteDialog>,
+    /// The open component picker (Edit ▸ Component, F2), if any.
+    part_picker: Option<PartPicker>,
     /// The popup's edit buffer for the selected annotation (which one, text).
     note_edit: Option<(Note, String)>,
     /// The deck text the shown results were simulated from. Wire probing
@@ -425,6 +508,7 @@ impl Default for CircuitSimApp {
             plot_grid: false,
             canvas_rect: Rect::NOTHING,
             note_dialog: None,
+            part_picker: None,
             note_edit: None,
             run_text: None,
 
@@ -483,7 +567,7 @@ impl CircuitSimApp {
     }
 
     fn run_simulation(&mut self) {
-        match parse(&self.netlist) {
+        match parse_with_options(&self.netlist, &run_parse_options()) {
             Ok(netlist) => {
                 let mut summary = format!(
                     "{} nodes · {} R · {} C · {} L · {} V · {} I",
@@ -725,6 +809,7 @@ impl eframe::App for CircuitSimApp {
 
         self.about_window(ctx);
         self.note_dialog_window(ctx);
+        self.part_picker_window(ctx);
     }
 }
 
@@ -745,10 +830,11 @@ impl CircuitSimApp {
         // plain letter, so it must never fire while a text field has focus or
         // a dialog is already collecting text).
         if self.schematic_active() && self.note_dialog.is_none() && !ctx.wants_keyboard_input() {
-            let (label, directive) = ctx.input_mut(|i| {
+            let (label, directive, component) = ctx.input_mut(|i| {
                 (
                     i.consume_key(Modifiers::NONE, Key::F4),
                     i.consume_key(Modifiers::NONE, Key::S),
+                    i.consume_key(Modifiers::NONE, Key::F2),
                 )
             });
             if label {
@@ -756,6 +842,9 @@ impl CircuitSimApp {
             }
             if directive {
                 self.open_note_dialog(true);
+            }
+            if component && self.part_picker.is_none() {
+                self.open_part_picker();
             }
         }
         if run {
@@ -830,6 +919,71 @@ impl CircuitSimApp {
                 self.status = Some((true, format!("Probing V({})", self.node_names[id])));
             }
             Err(e) => self.status = Some((false, e)),
+        }
+    }
+
+    // ── Component picker ────────────────────────────────────────────────────
+
+    /// Edit ▸ Component: open the symbol picker (schematic window only).
+    fn open_part_picker(&mut self) {
+        if !self.schematic_active() {
+            return;
+        }
+        self.part_picker = Some(PartPicker::new(self.schematic.armed_part.as_deref()));
+    }
+
+    /// The picker window. OK / a double click arms the Part tool with the
+    /// chosen symbol — the next canvas clicks drop it, each placement
+    /// carrying the symbol's default model/subckt and spiceline.
+    fn part_picker_window(&mut self, ctx: &egui::Context) {
+        let Some(mut picker) = self.part_picker.take() else {
+            return;
+        };
+        match picker.show(ctx, &self.schematic.symbols) {
+            PickerEvent::None => self.part_picker = Some(picker),
+            PickerEvent::Cancel => {}
+            PickerEvent::LoadLibrary => {
+                self.load_symbol_library();
+                self.part_picker = Some(picker);
+            }
+            PickerEvent::Place(name) => match self.schematic.arm_part(&name) {
+                Ok(()) => {
+                    self.status = Some((
+                        true,
+                        format!("Click the schematic to place {name} · Space rotates · edit its model in the part's popup"),
+                    ));
+                    self.show_schematic();
+                }
+                Err(e) => {
+                    self.status = Some((false, e));
+                    self.part_picker = Some(picker);
+                }
+            },
+        }
+    }
+
+    /// Load a `.sym` symbol library from disk and add its symbols to the
+    /// picker (a same-named symbol replaces the shipped one).
+    fn load_symbol_library(&mut self) {
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let Some(path) = rfd::FileDialog::new()
+                .add_filter("Symbol library", &["sym"])
+                .pick_file()
+            else {
+                return;
+            };
+            let loaded = std::fs::read_to_string(&path)
+                .map_err(|e| e.to_string())
+                .and_then(|text| circuitsim::symbols::SymbolLibrary::parse(&text).map_err(|e| e.to_string()));
+            match loaded {
+                Ok(lib) => {
+                    let n = lib.symbols.len();
+                    self.schematic.symbols.extend(lib);
+                    self.status = Some((true, format!("Loaded {n} symbol(s) from {}", path.display())));
+                }
+                Err(e) => self.status = Some((false, e)),
+            }
         }
     }
 
@@ -1241,6 +1395,10 @@ impl CircuitSimApp {
                     }
                 }
                 ui.separator();
+                if ui.add(egui::Button::new("Component…").shortcut_text("F2")).clicked() {
+                    self.open_part_picker();
+                    ui.close_menu();
+                }
                 if ui.add(egui::Button::new("Label Net…").shortcut_text("F4")).clicked() {
                     self.open_note_dialog(false);
                     ui.close_menu();
@@ -1736,7 +1894,11 @@ impl CircuitSimApp {
             }
             for c in &self.schematic.components {
                 *degree.entry(c.p1).or_default() += 1;
-                if c.kind != CompKind::Ground {
+                if c.kind == CompKind::Part {
+                    for pin in c.pin_points().into_iter().skip(1) {
+                        *degree.entry(pin).or_default() += 1;
+                    }
+                } else if c.kind != CompKind::Ground {
                     *degree.entry(c.p2).or_default() += 1;
                 }
             }
@@ -1777,6 +1939,15 @@ impl CircuitSimApp {
                                                         if is_h { Vec2::new(28.0 * z, 16.0 * z) } else { Vec2::new(16.0 * z, 28.0 * z) });
                 painter.rect_stroke(ghost_rect, 0.0, Stroke::new(1.0 * z, theme::LT_WIRE.gamma_multiply(0.5)));
                 painter.circle_filled(to_screen(hover_grid), 3.0 * z, theme::LT_WIRE);
+            } else if self.schematic.tool == Tool::Part {
+                // Ghost symbol at the cursor, turned the way a click would place it.
+                if let Some(symbol) = self.schematic.armed_part.as_deref().and_then(|n| self.schematic.symbols.get(n)) {
+                    let unit = (to_screen(GridPt(1, 0)) - to_screen(GridPt(0, 0))).x;
+                    let ghost = Stroke::new(1.0 * z, theme::LT_WIRE.gamma_multiply(0.5));
+                    let rot = self.schematic.current_dir_turns();
+                    parts::paint_body(&painter, symbol, to_screen(hover_grid), unit, rot, ghost);
+                    parts::paint_pin_dots(&painter, symbol, to_screen(hover_grid), unit, rot, theme::LT_WIRE);
+                }
             }
         }
 
@@ -1952,6 +2123,34 @@ impl CircuitSimApp {
                                  label_font.clone(), theme::LT_SCHEM_TEXT);
                     painter.text(center - off * 0.8, name_anchor, &names[i],
                                  label_font.clone(), theme::LT_SCHEM_TEXT);
+                }
+
+                CompKind::Part => {
+                    let symbol = c.part.as_ref().and_then(|p| self.schematic.symbols.get(&p.symbol));
+                    let stroke = if is_selected { selected_stroke } else { comp_stroke };
+                    parts::paint_part(&painter, c, symbol, to_screen, stroke, Color32::from_rgb(200, 60, 30));
+                    // Name, attached model/subckt and spiceline, stacked to the
+                    // right of the body so none of them runs across a pin.
+                    let bounds = parts::part_bounds(c, symbol, &to_screen);
+                    let mut y = bounds.top();
+                    let x = bounds.right() + 6.0;
+                    let extra = c.part.as_ref().map_or("", |p| p.spiceline.as_str());
+                    for text in [names[i].as_str(), c.val.as_str(), extra] {
+                        if text.is_empty() {
+                            continue;
+                        }
+                        let r = painter.text(
+                            Pos2::new(x, y),
+                            egui::Align2::LEFT_TOP,
+                            text,
+                            label_font.clone(),
+                            theme::LT_SCHEM_TEXT,
+                        );
+                        y = r.bottom() + 1.0;
+                    }
+                    if is_selected {
+                        painter.rect_stroke(bounds.expand(4.0), 0.0, selected_stroke);
+                    }
                 }
 
                 CompKind::Ground => {
@@ -2175,12 +2374,8 @@ impl CircuitSimApp {
                 if let Some(interact_pos) = response.interact_pointer_pos() {
                     let mut hit = None;
                     for (i, c) in self.schematic.components.iter().enumerate() {
-                        let p1 = to_screen(c.p1);
-                        let p2 = to_screen(c.p2);
-                        let center = p1 + (p2 - p1) / 2.0;
-                        let is_horizontal = c.p1.1 == c.p2.1;
-                        let box_size = if is_horizontal { Vec2::new(24.0, 16.0) } else { Vec2::new(16.0, 24.0) };
-                        let click_rect = Rect::from_center_size(center, box_size + Vec2::new(12.0, 12.0));
+                        let symbol = c.part.as_ref().and_then(|p| self.schematic.symbols.get(&p.symbol));
+                        let click_rect = parts::component_hit_rect(c, symbol, to_screen);
                         if click_rect.contains(interact_pos) {
                             hit = Some(i);
                             break;
@@ -2230,7 +2425,7 @@ impl CircuitSimApp {
 
                 match self.schematic.tool {
                     Tool::Wire => self.schematic.wire_click(grid_pt),
-                    Tool::R | Tool::C | Tool::L | Tool::V | Tool::Gnd => {
+                    Tool::R | Tool::C | Tool::L | Tool::V | Tool::Gnd | Tool::Part => {
                         self.schematic.place_at(grid_pt);
                     }
                     Tool::Label | Tool::Directive => {
@@ -2239,14 +2434,9 @@ impl CircuitSimApp {
                     Tool::Select => {
                         let mut selected = None;
                         for (i, c) in self.schematic.components.iter().enumerate() {
-                            let p1 = to_screen(c.p1);
-                            let p2 = to_screen(c.p2);
-                            let center = p1 + (p2 - p1) / 2.0;
-                            let is_horizontal = c.p1.1 == c.p2.1;
-                            let box_size = if is_horizontal { Vec2::new(24.0, 16.0) } else { Vec2::new(16.0, 24.0) };
-
-                            // Make click area slightly larger than visual box
-                            let click_rect = Rect::from_center_size(center, box_size + Vec2::new(12.0, 12.0));
+                            // Click area is slightly larger than the visual box
+                            let symbol = c.part.as_ref().and_then(|p| self.schematic.symbols.get(&p.symbol));
+                            let click_rect = parts::component_hit_rect(c, symbol, to_screen);
                             if click_rect.contains(interact_pos) {
                                 selected = Some(i);
                                 break;
@@ -2539,7 +2729,11 @@ impl CircuitSimApp {
         // --- ADD THIS AT THE END OF schematic_panel ---
         // Show Editor Window for selected component
         let mut delete_idx = None;
+        // The auto-names parts will carry, for the popup's name hint (taken
+        // before the selected component is borrowed mutably).
+        let auto_names = instance_names(&self.schematic.components);
         if let Some(idx) = self.schematic.selected_component {
+            let symbols = &self.schematic.symbols;
             if let Some(c) = self.schematic.components.get_mut(idx) {
                 let p1 = to_screen(c.p1);
                 let p2 = to_screen(c.p2);
@@ -2554,6 +2748,7 @@ impl CircuitSimApp {
                     CompKind::Inductor  => ("Inductor",  Color32::from_rgb(170, 90, 0)),
                     CompKind::Voltage   => ("Voltage Source", Color32::from_rgb(150, 100, 0)),
                     CompKind::Ground    => ("Ground",    Color32::from_rgb(70, 70, 70)),
+                    CompKind::Part      => ("Component", Color32::from_rgb(0, 110, 90)),
                 };
 
                 egui::Window::new("")
@@ -2699,7 +2894,9 @@ impl CircuitSimApp {
 
                         ui.data_mut(|d| d.insert_temp(mem_id, cache));
 
-                                        } else if c.kind != CompKind::Ground {
+                                        } else if c.kind == CompKind::Part {
+                        part_properties(ui, c, symbols, auto_names.get(idx).map_or("", |n| n.as_str()));
+                    } else if c.kind != CompKind::Ground {
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new("Value").size(11.0).color(TEXT_SECONDARY));
                             ui.add_space(4.0);
@@ -3495,7 +3692,7 @@ mod tests {
     const BAD_DECK: &str = "R1 1\n.end\n";
 
     fn resistor(val: &str) -> Component {
-        Component { kind: CompKind::Resistor, p1: GridPt(2, 2), p2: GridPt(5, 2), val: val.into() }
+        Component { kind: CompKind::Resistor, p1: GridPt(2, 2), p2: GridPt(5, 2), val: val.into(), part: None }
     }
 
     fn status_is_error(app: &CircuitSimApp) -> bool {
@@ -3641,6 +3838,7 @@ mod tests {
             p1: GridPt(p1.0, p1.1),
             p2: GridPt(p2.0, p2.1),
             val: val.to_string(),
+            part: None,
         };
         app.schematic.components = vec![
             comp(CompKind::Voltage, (0, 0), (0, 3), "5"),
@@ -3735,5 +3933,12 @@ mod tests {
             Some((false, msg)) => assert!(msg.contains("changed since the last run"), "{msg}"),
             other => panic!("expected a refusal, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn the_editors_run_finds_the_shipped_libraries() {
+        let deck = "* lib\n.include standard.lib\nR1 1 0 1k\nV1 1 0 DC 1\n.op\n.end\n";
+        assert!(parse(deck).is_err(), "no search path: the include cannot resolve");
+        assert!(parse_with_options(deck, &run_parse_options()).is_ok());
     }
 }

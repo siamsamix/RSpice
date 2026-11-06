@@ -5,16 +5,19 @@
 //! netlist are one round trip apart, and both directions live in this module.
 
 use circuitsim::circuit::{
-    Capacitor as CsCapacitor, Circuit as CsCircuit, Inductor as CsInductor, NodeId,
-    Resistor as CsResistor, VoltageSource as CsVoltageSource,
+    Ac as CsAc, BehavioralKind, Capacitor as CsCapacitor, Circuit as CsCircuit, ControlVar,
+    Inductor as CsInductor, NodeId, Resistor as CsResistor, SwitchControl,
+    VoltageSource as CsVoltageSource,
 };
+use circuitsim::model::{BjtType, JfetType, MosfetType};
 use circuitsim::netlist::{
-    deck_directives, emit as netlist_emit, parse_with_options, AcCommand, AcScale,
-    AnalysisCommands, Netlist, ParseOptions,
+    deck_directives, emit as netlist_emit, emit_source_value, parse, parse_source_value,
+    parse_with_options, AcCommand, AcScale, AnalysisCommands, Netlist, ParseOptions, SourceValue,
 };
 use circuitsim::units::parse_value;
 use crate::autolayout::{ORIGIN_X, ORIGIN_Y};
 use egui::{Pos2, Vec2};
+use crate::symbols;
 use std::collections::{HashMap, HashSet};
 
 /// Canvas grid pitch in screen pixels.
@@ -43,13 +46,59 @@ impl GridPt {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+/// Every part the editor can place. R/C/L/V/Ground are the original
+/// two-terminal set; the rest come from the symbol library
+/// ([`crate::symbols`]), which owns their pins, drawings and card layout.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum CompKind {
     Resistor,
     Capacitor,
     Inductor,
     Voltage,
     Ground,
+    Diode,
+    Current,
+    Nmos,
+    Pmos,
+    Npn,
+    Pnp,
+    Njf,
+    Pjf,
+    /// `E` — voltage-controlled voltage source.
+    Vcvs,
+    /// `G` — voltage-controlled current source.
+    Vccs,
+    /// `H` — current-controlled voltage source.
+    Ccvs,
+    /// `F` — current-controlled current source.
+    Cccs,
+    /// `B` — behavioral source.
+    Behavioral,
+    /// `S` — voltage-controlled switch.
+    Switch,
+    /// `W` — current-controlled switch.
+    CSwitch,
+    /// Two coupled inductors (`L`, `L`, `K`).
+    Transformer,
+    /// `T` — lossless transmission line.
+    Tline,
+    /// `U` — op-amp.
+    Opamp,
+}
+
+impl CompKind {
+    /// Whether the element is written as a text card beside the typed
+    /// R/C/L/V netlist (every library device is).
+    pub fn is_device(self) -> bool {
+        !matches!(
+            self,
+            CompKind::Resistor
+                | CompKind::Capacitor
+                | CompKind::Inductor
+                | CompKind::Voltage
+                | CompKind::Ground
+        )
+    }
 }
 
 #[derive(Clone)]
@@ -58,6 +107,14 @@ pub struct Component {
     pub p1: GridPt,
     pub p2: GridPt,
     pub val: String,
+}
+
+impl Component {
+    /// Every pin, in the symbol's pin order (`p1`, `p2`, then the kind's
+    /// extra pins). A ground has the one pin.
+    pub fn pins(&self) -> Vec<GridPt> {
+        symbols::pins(self.kind, self.p1, self.p2)
+    }
 }
 
 /// A value in SPICE engineering notation (`1k`, `4.7u`, `100n`) when that
@@ -90,19 +147,23 @@ pub fn fmt_si(v: f64) -> String {
 }
 
 /// Instance names in component order — the exact `R1`, `C1`, `L1`, `V1`
-/// numbering [`SchematicState::build_netlist`] assigns (counted per kind), so
+/// numbering [`SchematicState::build_netlist`] assigns (counted per letter), so
 /// the canvas can label parts with the names the netlist will carry. Ground
 /// symbols are not elements and get an empty name.
 pub fn instance_names(components: &[Component]) -> Vec<String> {
-    let (mut r, mut c, mut l, mut v) = (0, 0, 0, 0);
+    // Counted per SPICE letter: an N- and a P-channel MOSFET share `M`,
+    // exactly as their cards do.
+    let mut counts: HashMap<char, usize> = HashMap::new();
     components
         .iter()
-        .map(|comp| match comp.kind {
-            CompKind::Resistor => { r += 1; format!("R{r}") }
-            CompKind::Capacitor => { c += 1; format!("C{c}") }
-            CompKind::Inductor => { l += 1; format!("L{l}") }
-            CompKind::Voltage => { v += 1; format!("V{v}") }
-            CompKind::Ground => String::new(),
+        .map(|comp| {
+            if comp.kind == CompKind::Ground {
+                return String::new();
+            }
+            let letter = symbols::spec_of(comp.kind).letter;
+            let n = counts.entry(letter).or_insert(0);
+            *n += 1;
+            format!("{letter}{n}")
         })
         .collect()
 }
@@ -218,6 +279,7 @@ impl NodeAssignment {
         for c in components {
             points.insert(c.p1);
             points.insert(c.p2);
+            points.extend(c.pins());
         }
         for w in wires {
             points.insert(w.p1);
@@ -313,6 +375,15 @@ impl NodeAssignment {
         self.pt_to_node[&pt]
     }
 
+    /// How the deck spells a node in a text card: its label, else its number
+    /// (`0` for ground) — the same spelling the typed netlist writer prints.
+    pub fn spelling(&self, node: usize) -> String {
+        match self.name_of(node) {
+            Some(name) if node != 0 => name.to_string(),
+            _ => node.to_string(),
+        }
+    }
+
     /// The label name of a node (its first one, if two disagree — see
     /// [`Self::conflicts`]); `None` for unlabeled nets and for ground.
     pub fn name_of(&self, node: usize) -> Option<&str> {
@@ -375,6 +446,30 @@ impl Dsu {
     }
 }
 
+/// A transformer's `Lp=… Ls=… k=…` value text as the three card tokens,
+/// defaults filling what the text omits; each number is checked now, so a bad
+/// literal names its part instead of surfacing as a parse error far away.
+fn transformer_params(name: &str, val: &str) -> Result<(String, String, String), String> {
+    let mut lp = "10m".to_string();
+    let mut ls = "10m".to_string();
+    let mut k = "0.99".to_string();
+    for word in val.split_whitespace() {
+        let Some((key, value)) = word.split_once('=') else {
+            return Err(format!("{name} value '{val}': expected Lp=… Ls=… k=…, got '{word}'"));
+        };
+        match key.to_ascii_lowercase().as_str() {
+            "lp" => lp = value.to_string(),
+            "ls" => ls = value.to_string(),
+            "k" => k = value.to_string(),
+            other => return Err(format!("{name} value '{val}': unknown parameter '{other}' (use Lp, Ls, k)")),
+        }
+    }
+    for (what, text) in [("Lp", &lp), ("Ls", &ls), ("k", &k)] {
+        parse_value(text).map_err(|e| format!("{name} {what} '{text}': {e}"))?;
+    }
+    Ok((lp, ls, k))
+}
+
 // ─── Editor state machine ───────────────────────────────────────────────────
 
 /// Placement carpet: the facing a fresh component drops in, stepping
@@ -404,7 +499,7 @@ impl Direction {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Tool { Select, Wire, R, C, L, V, Gnd, Label, Directive }
+pub enum Tool { Select, Wire, R, C, L, V, Gnd, Label, Directive, Part(CompKind) }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AnalysisType { Tran, Ac }
@@ -485,33 +580,37 @@ impl SchematicState {
     /// Rotate the selected component 90 degrees around `p1`, re-attaching
     /// the wires that touch its rotated pin. True if something rotated.
     pub fn rotate_selected(&mut self) -> bool {
-        let Some((old_p2, new_p2)) = self
+        let Some((old_pins, new_pins)) = self
             .selected_component
             .and_then(|idx| self.components.get_mut(idx))
             .map(|c| {
-                let old_p2 = c.p2;
+                let old_pins = c.pins();
                 let dx = c.p2.0 - c.p1.0;
                 let dy = c.p2.1 - c.p1.1;
                 // 90-degree rotation formula: (x, y) -> (-y, x)
                 c.p2 = GridPt(c.p1.0 - dy, c.p1.1 + dx);
-                (old_p2, c.p2)
+                (old_pins, c.pins())
             })
         else {
             return false;
         };
-        // Keep wires and labels attached to the rotated pin
+        // Keep wires and labels attached to every pin that moved (all but
+        // p1, the centre of the turn). One snapshot, one pass: no endpoint
+        // is moved twice.
+        let moved: Vec<(GridPt, GridPt)> = old_pins
+            .iter()
+            .zip(&new_pins)
+            .skip(1)
+            .filter(|(o, n)| o != n)
+            .map(|(&o, &n)| (o, n))
+            .collect();
+        let remap = |pt: GridPt| moved.iter().find(|(o, _)| *o == pt).map_or(pt, |&(_, n)| n);
         for w in self.wires.iter_mut() {
-            if w.p1 == old_p2 {
-                w.p1 = new_p2;
-            }
-            if w.p2 == old_p2 {
-                w.p2 = new_p2;
-            }
+            w.p1 = remap(w.p1);
+            w.p2 = remap(w.p2);
         }
         for l in self.labels.iter_mut() {
-            if l.at == old_p2 {
-                l.at = new_p2;
-            }
+            l.at = remap(l.at);
         }
         true
     }
@@ -520,7 +619,7 @@ impl SchematicState {
     /// of its pins stretch by the same delta. True if the component moved.
     pub fn drag_component(&mut self, idx: usize, dx: i32, dy: i32) -> bool {
         let Some(pins) = self.components.get_mut(idx).map(|c| {
-            let pins = (c.p1, c.p2);
+            let pins = c.pins();
             // Move component endpoints
             c.p1.0 += dx;
             c.p1.1 += dy;
@@ -532,18 +631,18 @@ impl SchematicState {
         };
         // Stretch wires attached to the component's pins
         for w in self.wires.iter_mut() {
-            if w.p1 == pins.0 || w.p1 == pins.1 {
+            if pins.contains(&w.p1) {
                 w.p1.0 += dx;
                 w.p1.1 += dy;
             }
-            if w.p2 == pins.0 || w.p2 == pins.1 {
+            if pins.contains(&w.p2) {
                 w.p2.0 += dx;
                 w.p2.1 += dy;
             }
         }
         // A label sitting on a pin names that pin's net: it travels with it.
         for l in self.labels.iter_mut() {
-            if l.at == pins.0 || l.at == pins.1 {
+            if pins.contains(&l.at) {
                 l.at.0 += dx;
                 l.at.1 += dy;
             }
@@ -572,20 +671,21 @@ impl SchematicState {
                 });
                 return;
             }
-            Tool::R | Tool::C | Tool::L | Tool::V => {}
+            Tool::R | Tool::C | Tool::L | Tool::V | Tool::Part(_) => {}
             _ => return,
         }
         let kind = match self.tool {
             Tool::R => CompKind::Resistor, Tool::C => CompKind::Capacitor,
-            Tool::L => CompKind::Inductor, _ => CompKind::Voltage,
+            Tool::L => CompKind::Inductor, Tool::Part(kind) => kind,
+            _ => CompKind::Voltage,
         };
-        let val = match kind {
-            CompKind::Resistor => "1k", CompKind::Capacitor => "1u",
-            CompKind::Inductor => "1m", _ => "DC 5",
-        }.to_string();
+        // Every kind's value and axis length come from its spec (the
+        // original R/C/L/V rows read 1k / 1u / 1m / DC 5 over 3 cells).
+        let spec = symbols::spec_of(kind);
+        let val = spec.default_val.to_string();
 
         // Calculate P2 based on current rotation direction
-        let (dx, dy) = self.current_dir.offset(3);
+        let (dx, dy) = self.current_dir.offset(spec.axis_len);
         self.components.push(Component {
             kind,
             p1: at,
@@ -759,7 +859,8 @@ impl SchematicState {
         let mut pts = self
             .components
             .iter()
-            .flat_map(|c| [c.p1, c.p2])
+            .flat_map(|c| c.pins())
+            .chain(self.components.iter().flat_map(|c| [c.p1, c.p2]))
             .chain(self.wires.iter().flat_map(|w| [w.p1, w.p2]))
             .chain(self.labels.iter().map(|l| l.at))
             .chain(self.directives.iter().map(|d| d.at))
@@ -806,7 +907,9 @@ impl SchematicState {
         let mut r_idx = 1; let mut c_idx = 1; let mut l_idx = 1; let mut v_idx = 1;
 
         for c in &self.components {
-            if c.kind == CompKind::Ground { continue; }
+            // Grounds are pins, and library devices are written as text cards
+            // by `deck_text` — the typed netlist is the R/C/L/V core.
+            if c.kind == CompKind::Ground || c.kind.is_device() { continue; }
 
             let n1 = NodeId(assignment.node_of(c.p1));
             let n2 = NodeId(assignment.node_of(c.p2));
@@ -843,16 +946,27 @@ impl SchematicState {
                     l_idx += 1;
                 }
                 CompKind::Voltage => {
-                    let voltage = parse_value(&c.val)
-                        .map_err(|e| format!("V{v_idx} value '{}': {e}", c.val))?;
+                    // A source's text is the card's value grammar (`5`,
+                    // `DC 5`, `AC 1 0`, `PULSE(…)`): the popup writes `DC 5`
+                    // and a fresh part drops with it, which the plain number
+                    // parser rejected — no placed source could build.
+                    let (voltage, waveform, ac) = match parse_source_value(&c.val, &ParseOptions::default())
+                        .map_err(|e| format!("V{v_idx} value '{}': {e}", c.val))?
+                    {
+                        SourceValue::Dc { value } => (value, None, None),
+                        SourceValue::Ac { magnitude, phase } => {
+                            (0.0, None, Some(CsAc { mag: magnitude, phase }))
+                        }
+                        SourceValue::Waveform(w) => (0.0, Some(w), None),
+                    };
                     circuit.voltage_sources.push(CsVoltageSource {
                         name: format!("V{v_idx}"),
                         n1, n2, voltage,
-                        waveform: None, ac: None,
+                        waveform, ac,
                     });
                     v_idx += 1;
                 }
-                CompKind::Ground => unreachable!(),
+                _ => unreachable!(),
             }
         }
 
@@ -937,18 +1051,80 @@ impl SchematicState {
     /// of the schematic simulates.
     pub fn deck_text(&self) -> Result<String, String> {
         let mut text = netlist_emit(&self.build_netlist()?);
-        if self.directives.is_empty() {
+        let (cards, default_models) = self.device_cards()?;
+        if !cards.is_empty() {
+            // Device cards ride just ahead of the terminator; the grammar
+            // does not care about card order.
+            let block: String = cards.iter().map(|c| format!("{c}\n")).collect();
+            let end = text.rfind("\n.end").map_or(text.len(), |i| i + 1);
+            text.insert_str(end, &block);
+        }
+        let mut block: String = default_models.iter().map(|c| format!("{c}\n")).collect();
+        block.extend(self.directives.iter().map(|d| format!("{}\n", d.text.trim())));
+        if block.is_empty() {
             return Ok(text);
         }
-        let block: String = self
-            .directives
-            .iter()
-            .map(|d| format!("{}\n", d.text.trim()))
-            .collect();
         // The writer opens with a `* Canonical netlist` comment line.
         let after_title = text.find('\n').map_or(text.len(), |i| i + 1);
         text.insert_str(after_title, &block);
         Ok(text)
+    }
+
+    /// The text cards of every library device, in component order, plus the
+    /// stock `.model` cards the parts lean on. A default model (`NMOS`, `D`,
+    /// …) is only added when no directive on the canvas defines that name, so
+    /// a user's own `.model NMOS …` always wins and nothing is defined twice.
+    fn device_cards(&self) -> Result<(Vec<String>, Vec<String>), String> {
+        if !self.components.iter().any(|c| c.kind.is_device()) {
+            return Ok((Vec::new(), Vec::new()));
+        }
+        let assignment = NodeAssignment::of(&self.components, &self.wires, &self.labels);
+        let names = instance_names(&self.components);
+        let defined: HashSet<String> = self
+            .directives
+            .iter()
+            .flat_map(|d| d.text.lines())
+            .filter_map(|line| {
+                let mut w = line.split_whitespace();
+                (w.next()?.eq_ignore_ascii_case(".model")).then(|| w.next().map(str::to_ascii_lowercase))?
+            })
+            .collect();
+
+        let mut cards = Vec::new();
+        let mut models: Vec<String> = Vec::new();
+        for (c, name) in self.components.iter().zip(&names) {
+            if !c.kind.is_device() {
+                continue;
+            }
+            let spec = symbols::spec_of(c.kind);
+            let pin_nodes: Vec<String> = c.pins().iter().map(|&p| assignment.spelling(assignment.node_of(p))).collect();
+            let val = c.val.trim();
+            if c.kind == CompKind::Transformer {
+                let (lp, ls, k) = transformer_params(name, val)?;
+                cards.push(format!("L{name}p {} {} {lp}", pin_nodes[0], pin_nodes[1]));
+                cards.push(format!("L{name}s {} {} {ls}", pin_nodes[2], pin_nodes[3]));
+                cards.push(format!("{name} L{name}p L{name}s {k}"));
+                continue;
+            }
+            let slots: Vec<&str> = spec.card_order.iter().map(|&i| pin_nodes[i].as_str()).collect();
+            let mut card = format!("{name} {}", slots.join(" "));
+            if !val.is_empty() {
+                card.push(' ');
+                card.push_str(val);
+            }
+            cards.push(card);
+            if let Some(model) = symbols::model_token(c.kind, val) {
+                let key = model.to_ascii_lowercase();
+                if !defined.contains(&key) {
+                    if let Some(card) = symbols::default_model_card(model) {
+                        if !models.iter().any(|m| m == card) {
+                            models.push(card.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        Ok((cards, models))
     }
 
     /// Parse a netlist text and lay a schematic out from it: `Ok` carries
@@ -992,8 +1168,201 @@ impl SchematicState {
         // round trip never loses the number.
         let fmt_val = fmt_si;
 
+        // A device whose model carries series resistance (`RS`, `RD`, `RE`, …)
+        // was split at parse time into the bare device plus a `<name>_R?`
+        // resistor and an internal node. The `.model` card rides along as
+        // text and will split the device again on the way out, so the pair is
+        // folded back into the one device here — drawing the resistor too
+        // would double the resistance on the first round trip.
+        let series_arms: HashMap<&str, (usize, usize)> =
+            circuit.resistors.iter().map(|r| (r.name.as_str(), (r.n1.0, r.n2.0))).collect();
+        let mut folded: HashSet<String> = HashSet::new();
+        let mut outer = |device: &str, arm: &str, node: usize| -> usize {
+            let name = format!("{device}_R{arm}");
+            match series_arms.get(name.as_str()) {
+                Some(&(external, internal)) if internal == node => {
+                    folded.insert(name);
+                    external
+                }
+                _ => node,
+            }
+        };
+
+        // Devices first: folding has to see every device before the passive
+        // loop decides which resistors are real.
+        struct ParsedDevice {
+            kind:  CompKind,
+            /// Node per pin, in the symbol's pin order.
+            nodes: Vec<usize>,
+            val:   String,
+        }
+        let mut devices: Vec<ParsedDevice> = vec![];
+        let mut two_pin: Vec<ParsedComp> = vec![];
+        // Elements the schematic has no symbol (or no faithful symbol) for;
+        // counted, never dropped silently.
+        let mut not_drawn: Vec<String> = vec![];
+
+        // The sensing source an `F`/`H`/`W` card names will be renumbered
+        // like every drawn source (`V1`, `V2`, … in deck order); rename the
+        // reference with it so the regenerated deck still resolves.
+        let source_names: HashMap<String, String> = circuit
+            .voltage_sources
+            .iter()
+            .enumerate()
+            .map(|(i, v)| (v.name.to_ascii_lowercase(), format!("V{}", i + 1)))
+            .collect();
+        let sensed = |name: &str| -> String {
+            source_names.get(&name.to_ascii_lowercase()).cloned().unwrap_or_else(|| name.to_string())
+        };
+        let with_area = |model: &str, area: f64| -> String {
+            if area == 1.0 { model.to_string() } else { format!("{model} AREA={}", fmt_si(area)) }
+        };
+
+        for d in &circuit.diodes {
+            let anode = outer(&d.name, "S", d.anode.0);
+            two_pin.push(ParsedComp {
+                kind: CompKind::Diode, node_a: anode, node_b: d.cathode.0,
+                val: with_area(&d.model, d.area),
+            });
+        }
+        for m in &circuit.mosfets {
+            let kind = match circuit.mosfet_type(&m.model) {
+                Some(MosfetType::Nmos) => CompKind::Nmos,
+                Some(MosfetType::Pmos) => CompKind::Pmos,
+                None => { not_drawn.push(m.name.clone()); continue; }
+            };
+            if m.nb != m.ns {
+                // The 3-pin symbol ties the bulk to the source.
+                not_drawn.push(m.name.clone());
+                continue;
+            }
+            let mut val = format!("{} W={} L={}", m.model, fmt_si(m.w), fmt_si(m.l));
+            for (key, v) in [("AD", m.ad), ("AS", m.asr), ("PD", m.pd), ("PS", m.ps)] {
+                if v != 0.0 {
+                    val.push_str(&format!(" {key}={}", fmt_si(v)));
+                }
+            }
+            let (d, g, s) = (m.nd.0, m.ng.0, m.ns.0);
+            let nodes = if kind == CompKind::Nmos { vec![d, s, g] } else { vec![s, d, g] };
+            devices.push(ParsedDevice { kind, nodes, val });
+        }
+        for q in &circuit.bjts {
+            let kind = match circuit.bjt_type(&q.model) {
+                Some(BjtType::Npn) => CompKind::Npn,
+                Some(BjtType::Pnp) => CompKind::Pnp,
+                None => { not_drawn.push(q.name.clone()); continue; }
+            };
+            if q.ns.is_some() {
+                not_drawn.push(q.name.clone());
+                continue;
+            }
+            let c = outer(&q.name, "C", q.nc.0);
+            let b = outer(&q.name, "B", q.nb.0);
+            let e = outer(&q.name, "E", q.ne.0);
+            let nodes = if kind == CompKind::Npn { vec![c, e, b] } else { vec![e, c, b] };
+            devices.push(ParsedDevice { kind, nodes, val: with_area(&q.model, q.area) });
+        }
+        for j in &circuit.jfets {
+            let kind = match circuit.jfet_type(&j.model) {
+                Some(JfetType::Njf) => CompKind::Njf,
+                Some(JfetType::Pjf) => CompKind::Pjf,
+                None => { not_drawn.push(j.name.clone()); continue; }
+            };
+            let d = outer(&j.name, "D", j.nd.0);
+            let sr = outer(&j.name, "S", j.ns.0);
+            devices.push(ParsedDevice {
+                kind, nodes: vec![d, sr, j.ng.0], val: with_area(&j.model, j.area),
+            });
+        }
+        for i in &circuit.current_sources {
+            let val = match (&i.waveform, &i.ac) {
+                (Some(w), _) => emit_source_value(&SourceValue::Waveform(w.clone())),
+                (None, Some(ac)) => format!("DC {} AC {} {}", i.current, ac.mag, ac.phase),
+                (None, None) => emit_source_value(&SourceValue::Dc { value: i.current }),
+            };
+            two_pin.push(ParsedComp { kind: CompKind::Current, node_a: i.n1.0, node_b: i.n2.0, val });
+        }
+        // Controlled sources draw only in their plain gain form; POLY and
+        // multi-term cards stay in the netlist text editor.
+        let gain = |src: &circuitsim::circuit::ControlledSource| -> Option<f64> {
+            (src.controls.len() == 1 && src.coeffs.len() == 2 && src.coeffs[0] == 0.0)
+                .then(|| src.coeffs[1])
+        };
+        for (family, list) in [(CompKind::Vcvs, circuit.vcvs()), (CompKind::Vccs, circuit.vccs())] {
+            for src in list {
+                match (gain(src), src.controls.first()) {
+                    (Some(g), Some(ControlVar::Voltage(cp, cn))) => devices.push(ParsedDevice {
+                        kind: family,
+                        nodes: vec![src.out_p.0, src.out_n.0, cp.0, cn.0],
+                        val: fmt_si(g),
+                    }),
+                    _ => not_drawn.push(src.name.clone()),
+                }
+            }
+        }
+        for (family, list) in [(CompKind::Ccvs, circuit.ccvs()), (CompKind::Cccs, circuit.cccs())] {
+            for src in list {
+                match (gain(src), src.controls.first()) {
+                    (Some(g), Some(ControlVar::Current(by))) => two_pin.push(ParsedComp {
+                        kind: family, node_a: src.out_p.0, node_b: src.out_n.0,
+                        val: format!("{} {}", sensed(by), fmt_si(g)),
+                    }),
+                    _ => not_drawn.push(src.name.clone()),
+                }
+            }
+        }
+        for b in &circuit.behavioral {
+            let drawable = b.abm.is_none() && b.name.to_ascii_uppercase().starts_with('B');
+            if !drawable {
+                not_drawn.push(b.name.clone());
+                continue;
+            }
+            let lead = if b.kind == BehavioralKind::Voltage { "V" } else { "I" };
+            two_pin.push(ParsedComp {
+                kind: CompKind::Behavioral, node_a: b.out_p.0, node_b: b.out_n.0,
+                val: format!("{lead}={}", b.expr),
+            });
+        }
+        for sw in &circuit.switches {
+            let initial = match sw.initial {
+                Some(true) => " ON",
+                Some(false) => " OFF",
+                None => "",
+            };
+            match &sw.control {
+                SwitchControl::Voltage(cp, cn) => devices.push(ParsedDevice {
+                    kind: CompKind::Switch,
+                    nodes: vec![sw.n1.0, sw.n2.0, cp.0, cn.0],
+                    val: format!("{}{initial}", sw.model),
+                }),
+                SwitchControl::Current(by) => two_pin.push(ParsedComp {
+                    kind: CompKind::CSwitch, node_a: sw.n1.0, node_b: sw.n2.0,
+                    val: format!("{} {}{initial}", sensed(by), sw.model),
+                }),
+            }
+        }
+        for t in &circuit.tlines {
+            devices.push(ParsedDevice {
+                kind: CompKind::Tline,
+                nodes: vec![t.n1.0, t.n2.0, t.n3.0, t.n4.0],
+                val: format!("Z0={} TD={}", fmt_si(t.z0), fmt_si(t.delay)),
+            });
+        }
+        for u in &circuit.opamps {
+            devices.push(ParsedDevice {
+                kind: CompKind::Opamp,
+                nodes: vec![u.in_p.0, u.in_n.0, u.out_p.0, u.out_n.0],
+                val: u.model.clone(),
+            });
+        }
+        // Coupled inductors (`K`) draw as two inductors with no coupling:
+        // the pair is never recognised as a transformer, so say so.
+        for k in circuit.mutual_inductances() {
+            not_drawn.push(k.name.clone());
+        }
+
         let mut parsed: Vec<ParsedComp> = vec![];
-        for r in &circuit.resistors {
+        for r in circuit.resistors.iter().filter(|r| !folded.contains(&r.name)) {
             parsed.push(ParsedComp {
                 kind:   CompKind::Resistor,
                 node_a: r.n1.0,
@@ -1027,20 +1396,17 @@ impl SchematicState {
                 val:    fmt_val(v.voltage),
             });
         }
-        // Diodes, MOSFETs and current sources have no schematic symbol yet —
-        // count them instead of silently dropping them like the old
-        // hand-parser did.
-        let skipped =
-            circuit.diodes.len() + circuit.mosfets.len() + circuit.current_sources.len();
+        parsed.extend(two_pin);
 
-        if parsed.is_empty() {
-            let msg = if skipped > 0 {
-                format!(
-                    "No supported components (R/C/L/V) found in netlist — {} diode/MOSFET/current-source element(s) have no schematic symbol",
-                    skipped
-                )
+        if parsed.is_empty() && devices.is_empty() {
+            let msg = if not_drawn.is_empty() {
+                "No drawable components found in netlist".to_string()
             } else {
-                "No supported components (R/C/L/V) found in netlist".into()
+                format!(
+                    "No drawable components found in netlist — {} element(s) have no faithful schematic symbol ({})",
+                    not_drawn.len(),
+                    not_drawn.join(", ")
+                )
             };
             return Err(msg);
         }
@@ -1057,8 +1423,50 @@ impl SchematicState {
             })
             .collect();
         let layout = crate::autolayout::layout(&parts);
-        let new_components = layout.components;
-        let new_wires = layout.wires;
+        let mut new_components = layout.components.clone();
+        let mut new_wires = layout.wires.clone();
+
+        // ── 3. Multi-pin devices: a band below the routed circuit ────────────
+        // The layout draws two-pin parts only. Each multi-pin device drops
+        // facing down in its own band under everything else, and each of its
+        // pins joins its net by *name*: a label sitting on a pin names that
+        // pin's net, and labels of one name are one net with or without
+        // wires. A ground pin gets a short stub and a ground symbol instead.
+        // Electrically exact by construction; a named net keeps its name, and
+        // an unnamed (numeric) net a device touches is named `_n<N>` on both
+        // sides, as the layout's own unrouted ties are.
+        let mut device_pins: Vec<(usize, GridPt)> = Vec::new();
+        let mut band_y = new_components
+            .iter()
+            .flat_map(|c| [c.p1.1, c.p2.1])
+            .chain(new_wires.iter().flat_map(|w| [w.p1.1, w.p2.1]))
+            .max()
+            .map_or(ORIGIN_Y, |bottom| bottom + 5);
+        for dev in &devices {
+            let spec = symbols::spec_of(dev.kind);
+            let p1 = GridPt(ORIGIN_X + 8, band_y);
+            let p2 = GridPt(p1.0, p1.1 + spec.axis_len);
+            let comp = Component { kind: dev.kind, p1, p2, val: dev.val.clone() };
+            let (lo, hi) = symbols::local_bounds(dev.kind, spec.axis_len as f32);
+            let (u, v) = symbols::frame(p1, p2);
+            let rows = [lo.1, hi.1].map(|b| b * v.1 as f32).into_iter().chain([lo.0, hi.0].map(|a| a * u.1 as f32));
+            let (top, bottom) = rows.fold((f32::MAX, f32::MIN), |(t, b), y| (t.min(y), b.max(y)));
+            let pins = comp.pins();
+            let mid_x = pins.iter().map(|p| p.0).sum::<i32>() as f32 / pins.len() as f32;
+            for (&pin, &node) in pins.iter().zip(&dev.nodes) {
+                if node == 0 {
+                    // Stub away from the symbol's middle, then ground.
+                    let dx = if pin.0 as f32 >= mid_x { 2 } else { -2 };
+                    let stub = GridPt(pin.0 + dx, pin.1);
+                    new_wires.push(Wire { p1: pin, p2: stub });
+                    new_components.push(Component { kind: CompKind::Ground, p1: stub, p2: stub, val: "".into() });
+                } else {
+                    device_pins.push((node, pin));
+                }
+            }
+            new_components.push(comp);
+            band_y += (bottom - top).ceil() as i32 + 5;
+        }
 
         // ── 4b. Net labels: every named net keeps its name ──────────────────
         // The label sits on a pin of the net, which the layout guarantees is
@@ -1077,18 +1485,33 @@ impl SchematicState {
                 });
             }
         }
-        // Connections the router could not draw are joined by name instead.
-        for &(node, at) in &layout.ties {
-            let name = if is_named(node) {
+        // The name a net is joined by when wires don't do it: its own name,
+        // else a fresh `_n<N>` (never one a real net already uses).
+        let tie_name = |node: usize| -> String {
+            if is_named(node) {
                 circuit.node_name(node).to_string()
             } else {
                 let mut cand = format!("_n{node}");
-                while node_set.iter().any(|&m| circuit.node_name(m).eq_ignore_ascii_case(&cand)) {
+                while (0..circuit.nodes).any(|m| circuit.node_name(m).eq_ignore_ascii_case(&cand)) {
                     cand.push('_');
                 }
                 cand
-            };
-            new_labels.push(NetLabel { at, name });
+            }
+        };
+        // Connections the router could not draw are joined by name instead.
+        for &(node, at) in &layout.ties {
+            new_labels.push(NetLabel { at, name: tie_name(node) });
+        }
+        // Device pins join their nets by name. An unnamed net also needs the
+        // name on its wired side (a pin of the net, hence a wire end), once.
+        let mut named_at_anchor: HashSet<usize> = HashSet::new();
+        for &(node, pin) in &device_pins {
+            if !is_named(node) && named_at_anchor.insert(node) {
+                if let Some(&at) = layout.anchors.get(&node) {
+                    new_labels.push(NetLabel { at, name: tie_name(node) });
+                }
+            }
+            new_labels.push(NetLabel { at: pin, name: tie_name(node) });
         }
 
         // ── 4c. SPICE directives: the cards the schematic cannot draw ───────
@@ -1157,10 +1580,14 @@ impl SchematicState {
         state.labels     = new_labels;
         state.directives = new_directives;
 
-        let n = parsed.len();
+        let n = parsed.len() + devices.len();
         let mut status = format!("Imported {} component(s) from netlist", n);
-        if skipped > 0 {
-            status.push_str(&format!(" ({} D/M/I element(s) not drawn)", skipped));
+        if !not_drawn.is_empty() {
+            status.push_str(&format!(
+                " ({} element(s) not drawn: {})",
+                not_drawn.len(),
+                not_drawn.join(", ")
+            ));
         }
         if !state.directives.is_empty() {
             status.push_str(&format!(" · {} SPICE directive(s) kept as text", state.directives.len()));
@@ -1583,5 +2010,410 @@ mod tests {
         }
         assert!(assignment.conflicts().is_empty());
         assert_eq!(st.labels.len(), 2);
+    }
+
+    // ── Symbol library: placement, cards, motion, import ────────────────────
+
+    /// Solve a deck's operating point; node voltage by node name.
+    fn op_by_name(deck: &str) -> HashMap<String, f64> {
+        let net = parse(deck).unwrap_or_else(|e| panic!("deck does not parse: {e}\n{deck}"));
+        let dc = circuitsim::run(&net)
+            .unwrap_or_else(|e| panic!("deck does not solve: {e}\n{deck}"))
+            .dc
+            .expect("operating point");
+        (1..net.circuit.nodes)
+            .map(|i| (net.circuit.node_name(i).to_string(), dc.node_voltages[i]))
+            .collect()
+    }
+
+    /// A schematic builder for tests: parts drop facing down; nets are tied
+    /// by label (a label on a pin names its net, no wire needed).
+    struct Bench {
+        st: SchematicState,
+    }
+
+    impl Bench {
+        fn new() -> Self {
+            Self { st: SchematicState::default() }
+        }
+
+        /// Place a part (tool, value) at `at`; returns its pins.
+        fn part(&mut self, tool: Tool, at: (i32, i32), val: Option<&str>) -> Vec<GridPt> {
+            self.st.tool = tool;
+            self.st.current_dir = Direction::Down;
+            self.st.place_at(GridPt(at.0, at.1));
+            let c = self.st.components.last_mut().unwrap();
+            if let Some(v) = val {
+                c.val = v.to_string();
+            }
+            c.pins()
+        }
+
+        fn tie(&mut self, pin: GridPt, net: &str) {
+            self.st.labels.push(NetLabel { at: pin, name: net.to_string() });
+        }
+
+        fn deck(&self) -> String {
+            self.st.deck_text().expect("deck")
+        }
+    }
+
+    #[test]
+    fn a_fresh_part_of_every_family_writes_a_card_the_parser_accepts() {
+        for &kind in symbols::PICKER {
+            let mut b = Bench::new();
+            let v = b.part(Tool::V, (0, 0), Some("1"));
+            b.tie(v[0], "a");
+            b.tie(v[1], "0");
+            let pins = b.part(Tool::Part(kind), (10, 10), None);
+            for (i, &pin) in pins.iter().enumerate() {
+                b.tie(pin, if i == 0 { "a" } else { "0" });
+            }
+            let deck = b.deck();
+            parse(&deck).unwrap_or_else(|e| panic!("{kind:?}: {e}\n{deck}"));
+        }
+    }
+
+    #[test]
+    fn instance_names_count_per_spice_letter() {
+        let mut b = Bench::new();
+        b.part(Tool::Part(CompKind::Nmos), (0, 0), None);
+        b.part(Tool::Part(CompKind::Pmos), (10, 0), None);
+        b.part(Tool::Part(CompKind::Transformer), (20, 0), None);
+        b.part(Tool::R, (30, 0), None);
+        b.part(Tool::Part(CompKind::Tline), (40, 0), None);
+        assert_eq!(instance_names(&b.st.components), ["M1", "M2", "K1", "R1", "T1"]);
+    }
+
+    #[test]
+    fn a_diode_clamps_a_resistor_fed_node_near_a_diode_drop() {
+        let mut b = Bench::new();
+        let v = b.part(Tool::V, (0, 0), Some("5"));
+        let r = b.part(Tool::R, (10, 0), Some("1k"));
+        let d = b.part(Tool::Part(CompKind::Diode), (20, 0), None);
+        b.tie(v[0], "in");
+        b.tie(v[1], "0");
+        b.tie(r[0], "in");
+        b.tie(r[1], "d");
+        b.tie(d[0], "d");
+        b.tie(d[1], "0");
+        let deck = b.deck();
+        assert!(deck.contains("D1 d 0 D"), "{deck}");
+        assert!(deck.contains(".model D D"), "default model supplied:\n{deck}");
+        let vd = op_by_name(&deck)["d"];
+        assert!((0.5..0.9).contains(&vd), "diode drop {vd}");
+    }
+
+    #[test]
+    fn mosfet_pins_land_on_the_cards_drain_gate_and_source_slots() {
+        for (kind, model) in [(CompKind::Nmos, "NMOS"), (CompKind::Pmos, "PMOS")] {
+            let mut b = Bench::new();
+            let m = b.part(Tool::Part(kind), (0, 0), None);
+            // Pin order differs (P puts the source on top); name each by role.
+            let roles = symbols::spec_of(kind).pin_names;
+            for (pin, role) in m.iter().zip(roles) {
+                b.tie(*pin, role);
+            }
+            let deck = b.deck();
+            let card = deck.lines().find(|l| l.starts_with("M1")).expect("M1 card");
+            assert!(card.starts_with("M1 drain gate source source"), "{kind:?} wired as {card}");
+            assert!(card.contains(model), "{card}");
+        }
+    }
+
+    #[test]
+    fn an_nmos_common_source_stage_pulls_its_drain_down() {
+        let drain = |vg_val: &str| {
+            let mut b = Bench::new();
+            let vdd = b.part(Tool::V, (0, 0), Some("5"));
+            let vg = b.part(Tool::V, (6, 0), Some(vg_val));
+            let rl = b.part(Tool::R, (12, 0), Some("1k"));
+            let m = b.part(Tool::Part(CompKind::Nmos), (20, 0), None);
+            b.tie(vdd[0], "vdd");
+            b.tie(vdd[1], "0");
+            b.tie(vg[0], "g");
+            b.tie(vg[1], "0");
+            b.tie(rl[0], "vdd");
+            b.tie(rl[1], "d");
+            b.tie(m[0], "d"); // drain
+            b.tie(m[1], "0"); // source
+            b.tie(m[2], "g"); // gate
+            op_by_name(&b.deck())["d"]
+        };
+        let (off, on) = (drain("0"), drain("3"));
+        assert!((off - 5.0).abs() < 1e-3, "gate at 0 V leaves the drain at the rail: {off}");
+        assert!(on < off - 0.1, "gate at 3 V conducts: {on} vs {off}");
+    }
+
+    #[test]
+    fn an_opamp_with_feedback_amplifies_by_one_plus_rf_over_rg() {
+        let mut b = Bench::new();
+        let vin = b.part(Tool::V, (0, 0), Some("0.1"));
+        let rf = b.part(Tool::R, (6, 0), Some("9k"));
+        let rg = b.part(Tool::R, (12, 0), Some("1k"));
+        let u = b.part(Tool::Part(CompKind::Opamp), (20, 10), None);
+        b.tie(vin[0], "in");
+        b.tie(vin[1], "0");
+        b.tie(rf[0], "out");
+        b.tie(rf[1], "fb");
+        b.tie(rg[0], "fb");
+        b.tie(rg[1], "0");
+        b.tie(u[0], "in"); // in+
+        b.tie(u[1], "fb"); // in-
+        b.tie(u[2], "out"); // out+
+        b.tie(u[3], "0"); // out-
+        let v = op_by_name(&b.deck());
+        assert!((v["out"] - 1.0).abs() < 1e-3, "gain stage output {}", v["out"]);
+    }
+
+    #[test]
+    fn the_transformer_writes_two_inductors_and_a_coupling_card() {
+        let mut b = Bench::new();
+        let k = b.part(Tool::Part(CompKind::Transformer), (0, 0), Some("Lp=1m Ls=4m k=0.9"));
+        for (pin, net) in k.iter().zip(["p", "0", "s", "0"]) {
+            b.tie(*pin, net);
+        }
+        let deck = b.deck();
+        assert!(deck.contains("LK1p p 0 1m"), "{deck}");
+        assert!(deck.contains("LK1s s 0 4m"), "{deck}");
+        assert!(deck.contains("K1 LK1p LK1s 0.9"), "{deck}");
+        parse(&deck).expect("parses");
+
+        b.st.components[0].val = "Lp=oops".into();
+        let err = b.st.deck_text().unwrap_err();
+        assert!(err.contains("K1 Lp"), "{err}");
+        b.st.components[0].val = "Q=1".into();
+        assert!(b.st.deck_text().unwrap_err().contains("unknown parameter"));
+    }
+
+    #[test]
+    fn a_users_own_model_card_replaces_the_default_one() {
+        let mut b = Bench::new();
+        let m = b.part(Tool::Part(CompKind::Nmos), (0, 0), None);
+        for (pin, net) in m.iter().zip(["d", "0", "g"]) {
+            b.tie(*pin, net);
+        }
+        b.st.directives.push(Directive { at: GridPt(0, 20), text: ".model NMOS NMOS(VTO=0.5)".into() });
+        let deck = b.deck();
+        assert_eq!(deck.matches(".model NMOS").count(), 1, "{deck}");
+        assert!(deck.contains("VTO=0.5"));
+    }
+
+    #[test]
+    fn rotating_a_multi_pin_part_drags_every_wire_with_its_pin() {
+        let mut b = Bench::new();
+        let m = b.part(Tool::Part(CompKind::Nmos), (10, 10), None);
+        // A stub wire on each of the three pins.
+        for &pin in &m {
+            b.st.wires.push(Wire { p1: pin, p2: GridPt(pin.0 - 1, pin.1 - 1) });
+        }
+        b.st.select(Some(0), None);
+        for _ in 0..4 {
+            assert!(b.st.rotate_selected());
+            let pins = b.st.components[0].pins();
+            for (w, pin) in b.st.wires.iter().zip(&pins) {
+                assert_eq!(w.p1, *pin, "wire left behind its pin");
+            }
+        }
+        // Four quarter turns come home.
+        assert_eq!(b.st.components[0].pins(), m);
+    }
+
+    #[test]
+    fn dragging_a_multi_pin_part_stretches_wires_on_all_its_pins() {
+        let mut b = Bench::new();
+        let m = b.part(Tool::Part(CompKind::Vcvs), (10, 10), None);
+        for &pin in &m {
+            b.st.wires.push(Wire { p1: pin, p2: GridPt(0, pin.1) });
+        }
+        assert!(b.st.drag_component(0, 2, 3));
+        for ((w, pin), old) in b.st.wires.iter().zip(b.st.components[0].pins()).zip(&m) {
+            assert_eq!(w.p1, pin);
+            assert_eq!(w.p2, GridPt(0, old.1), "the far end stays put");
+        }
+    }
+
+    /// Import a deck, regenerate its text, and require the same operating
+    /// point on every named node — the round trip may renumber and relayout,
+    /// never change the circuit.
+    fn assert_round_trip(deck: &str) -> String {
+        let (st, status) = SchematicState::from_netlist(deck, &SchematicState::default()).expect("imports");
+        let again = st.deck_text().expect("regenerates");
+        let (before, after) = (op_by_name(deck), op_by_name(&again));
+        assert_eq!(
+            before.keys().collect::<std::collections::BTreeSet<_>>(),
+            after.keys().collect::<std::collections::BTreeSet<_>>(),
+            "node sets differ\n--- original\n{deck}\n--- regenerated\n{again}"
+        );
+        for (node, v) in &before {
+            assert!(
+                (v - after[node]).abs() <= 1e-6 * v.abs().max(1.0),
+                "node {node}: {v} before, {} after\n{again}\n{status}",
+                after[node]
+            );
+        }
+        status
+    }
+
+    #[test]
+    fn a_node_with_three_pins_survives_import() {
+        // The importer used to draw one spine wire per node, end to end, and a
+        // wire joins a net only at its endpoints: the middle pin floated and
+        // the regenerated deck was a different circuit.
+        assert_round_trip("V1 a 0 DC 1\nR1 a b 1k\nR2 b 0 1k\nR3 a b 2k\n.end\n");
+    }
+
+    const EVERY_FAMILY: &str = "\
+.model dm D(RS=10)
+.model nm NMOS
+.model pm PMOS
+.model qn NPN
+.model qp PNP
+.model jn NJF
+.model jp PJF
+.model sw1 SW
+V1 vdd 0 DC 5
+V2 g 0 DC 3
+R1 vdd d 1k
+M1 d g 0 0 nm W=10u L=1u
+M2 pd g vdd vdd pm W=10u L=1u
+R2 pd 0 1k
+R3 vdd bb 100k
+Q1 vdd bb e qn
+R4 e 0 1k
+Q2 0 g e2 qp
+R5 e2 vdd 1k
+D1 vdd dk dm
+R6 dk 0 1k
+J1 vdd gj sj jn
+V3 gj 0 DC -1
+R7 sj 0 1k
+I1 0 x DC 1m
+R8 x 0 1k
+E1 eo 0 vdd 0 2
+R9 eo 0 1k
+G1 0 go vdd 0 1m
+R10 go 0 1k
+H1 ho 0 V1 2k
+R11 ho 0 1k
+F1 fo 0 V1 2
+R12 fo 0 1k
+B1 bo 0 V=V(vdd)*2
+R13 bo 0 1k
+S1 vdd sa g 0 sw1
+R14 sa 0 1k
+W1 vdd wa V1 sw1
+R15 wa 0 1k
+T1 t1 0 t3 0 Z0=50 TD=1n
+V4 t1 0 DC 1
+R16 t3 0 50
+U1 uo 0 up un
+V5 up 0 DC 1m
+R17 uo un 9k
+R18 un 0 1k
+.op
+.end
+";
+
+    #[test]
+    fn a_deck_with_every_device_family_round_trips_through_the_schematic() {
+        let status = assert_round_trip(EVERY_FAMILY);
+        assert!(!status.contains("not drawn"), "{status}");
+        let (st, _) = SchematicState::from_netlist(EVERY_FAMILY, &SchematicState::default()).unwrap();
+        let kinds: HashSet<CompKind> = st.components.iter().map(|c| c.kind).collect();
+        for kind in [
+            CompKind::Diode, CompKind::Current, CompKind::Nmos, CompKind::Pmos, CompKind::Npn,
+            CompKind::Pnp, CompKind::Njf, CompKind::Vcvs, CompKind::Vccs, CompKind::Ccvs,
+            CompKind::Cccs, CompKind::Behavioral, CompKind::Switch, CompKind::CSwitch,
+            CompKind::Tline, CompKind::Opamp,
+        ] {
+            assert!(kinds.contains(&kind), "{kind:?} was not drawn");
+        }
+        // Imported parts wire only where pins meet: no two distinct nets
+        // share a grid point, so the node count matches the deck's.
+        let a = NodeAssignment::of(&st.components, &st.wires, &st.labels);
+        let nodes: HashSet<usize> = a.pt_list.iter().map(|&p| a.node_of(p)).collect();
+        // One fewer than the parsed deck: D1's series-resistance node exists
+        // only after parse splits the diode, never on the canvas.
+        let want = parse(EVERY_FAMILY).unwrap().circuit.nodes - 1;
+        assert_eq!(nodes.len(), want, "regenerated nets");
+    }
+
+    #[test]
+    fn sensing_source_names_follow_the_renumbering() {
+        // The deck lists V2 before V1; the schematic renumbers sources in
+        // deck order, so `F1 … V1` must now name the second source it drew.
+        assert_round_trip(
+            "V2 a 0 DC 2\nV1 b 0 DC 1\nR1 a 0 1k\nR2 b 0 1k\nF1 f 0 V1 2\nR3 f 0 1k\n.end\n",
+        );
+    }
+
+    #[test]
+    fn series_resistance_is_not_doubled_by_the_round_trip() {
+        // `RS` splits the diode into a resistor and an internal node at parse
+        // time; the model card rides along as text and splits it again.
+        let deck = ".model dm D(RS=100)\nV1 a 0 DC 5\nR1 a b 1k\nD1 b 0 dm\n.end\n";
+        assert_round_trip(deck);
+        let (st, _) = SchematicState::from_netlist(deck, &SchematicState::default()).unwrap();
+        let resistors = st.components.iter().filter(|c| c.kind == CompKind::Resistor).count();
+        assert_eq!(resistors, 1, "the folded RS arm must not be drawn");
+    }
+
+    #[test]
+    fn what_has_no_faithful_symbol_is_named_not_dropped() {
+        let deck = "\
+.model nm NMOS
+V1 a 0 DC 1
+R1 a b 1k
+L1 b c 1m
+L2 c 0 1m
+K1 L1 L2 0.9
+M1 a b 0 c nm
+.end
+";
+        let (st, status) = SchematicState::from_netlist(deck, &SchematicState::default()).unwrap();
+        assert!(status.contains("not drawn") && status.contains("K1") && status.contains("M1"), "{status}");
+        assert!(!st.components.iter().any(|c| c.kind.is_device()));
+    }
+
+    #[test]
+    fn an_only_device_deck_imports_instead_of_reporting_nothing_drawable() {
+        let (st, _) = SchematicState::from_netlist(
+            ".model d D\nI1 0 a DC 1m\nD1 a 0 d\n.end\n",
+            &SchematicState::default(),
+        )
+        .unwrap();
+        assert_eq!(st.components.iter().filter(|c| c.kind.is_device()).count(), 2);
+    }
+
+    #[test]
+    fn a_freshly_placed_source_builds_and_keeps_its_waveform() {
+        let mut st = SchematicState::default();
+        st.tool = Tool::V;
+        st.place_at(GridPt(0, 0));
+        assert_eq!(st.components[0].val, "DC 5");
+        let net = st.build_netlist().expect("the default value builds");
+        assert_eq!(net.circuit.voltage_sources[0].voltage, 5.0);
+
+        st.components[0].val = "PULSE(0 5 1m 1u 1u 5m 10m)".into();
+        let deck = st.deck_text().expect("a waveform builds");
+        assert!(deck.contains("PULSE"), "{deck}");
+        st.components[0].val = "AC 1 0".into();
+        assert!(st.deck_text().unwrap().contains("AC"));
+        st.components[0].val = "5".into();
+        assert!(st.build_netlist().is_ok(), "a bare number still reads as DC");
+    }
+
+    #[test]
+    fn a_numeric_net_a_device_touches_is_named_on_both_sides() {
+        // Device pins join their nets by label, and a label cannot be a bare
+        // number: net 3 comes back as `_n3`, on the wired side too, with the
+        // same voltage.
+        let deck = ".model nm NMOS\nV1 1 0 DC 5\nV2 2 0 DC 3\nR1 1 3 1k\nM1 3 2 0 0 nm W=10u L=1u\n.end\n";
+        let (st, _) = SchematicState::from_netlist(deck, &SchematicState::default()).unwrap();
+        let again = st.deck_text().unwrap();
+        let (before, after) = (op_by_name(deck), op_by_name(&again));
+        assert!((before["3"] - after["_n3"]).abs() < 1e-9, "{again}");
+        assert!(st.labels.iter().filter(|l| l.name == "_n3").count() >= 2, "both sides labelled");
     }
 }

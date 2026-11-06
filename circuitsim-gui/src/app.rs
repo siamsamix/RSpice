@@ -10,6 +10,7 @@ use egui_plot::Plot;
 use std::collections::HashMap;
 use egui::{Color32, Pos2, Rect, Stroke, Vec2};
 
+use crate::symbols;
 use crate::chrome;
 use crate::icons::{icon_button, Icon};
 use crate::plot::{
@@ -18,7 +19,7 @@ use crate::plot::{
     tran_voltage_series, AcCursor, AcMagScale, AcQuantity, ExpressionTraces, PlotState,
 };
 use crate::schematic::{
-    instance_names, AnalysisType, CompKind, GridPt, NodeAssignment, Note, SchematicState, Tool,
+    instance_names, AnalysisType, CompKind, Component, GridPt, NodeAssignment, Note, SchematicState, Tool,
     GRID_SIZE,
 };
 
@@ -300,8 +301,48 @@ fn canvas_family(kind: CompKind) -> Option<ElementFamily> {
         CompKind::Capacitor => Some(ElementFamily::Capacitors),
         CompKind::Inductor => Some(ElementFamily::Inductors),
         CompKind::Voltage => Some(ElementFamily::VoltageSources),
-        CompKind::Ground => None,
+        CompKind::Diode => Some(ElementFamily::Diodes),
+        CompKind::Nmos | CompKind::Pmos => Some(ElementFamily::Mosfets),
+        CompKind::Npn | CompKind::Pnp => Some(ElementFamily::Bjts),
+        CompKind::Njf | CompKind::Pjf => Some(ElementFamily::Jfets),
+        CompKind::Current => Some(ElementFamily::CurrentSources),
+        CompKind::Behavioral => Some(ElementFamily::Behavioral),
+        CompKind::Opamp => Some(ElementFamily::OpAmps),
+        CompKind::Tline => Some(ElementFamily::Tlines),
+        // Dependent sources, switches and the transformer print no branch
+        // current of their own family on the canvas.
+        CompKind::Ground
+        | CompKind::Vcvs
+        | CompKind::Vccs
+        | CompKind::Ccvs
+        | CompKind::Cccs
+        | CompKind::Switch
+        | CompKind::CSwitch
+        | CompKind::Transformer => None,
     }
+}
+
+/// The screen rectangle that counts as "on" a part for clicks, drags and
+/// probes. The original two-terminal parts keep their fixed body box around
+/// the midpoint; a multi-pin symbol is hit anywhere on its drawing's bounds.
+fn part_hit_rect(c: &Component, to_screen: &impl Fn(GridPt) -> Pos2) -> Rect {
+    let p1 = to_screen(c.p1);
+    let p2 = to_screen(c.p2);
+    if c.pins().len() <= 2 {
+        let center = p1 + (p2 - p1) / 2.0;
+        let box_size = if c.p1.1 == c.p2.1 { Vec2::new(24.0, 16.0) } else { Vec2::new(16.0, 24.0) };
+        return Rect::from_center_size(center, box_size + Vec2::new(12.0, 12.0));
+    }
+    let len = ((c.p2.0 - c.p1.0).abs() + (c.p2.1 - c.p1.1).abs()) as f32;
+    let (lo, hi) = symbols::local_bounds(c.kind, len);
+    let (u, v) = symbols::frame(c.p1, c.p2);
+    let su = to_screen(GridPt(c.p1.0 + u.0, c.p1.1 + u.1)) - p1;
+    let sv = to_screen(GridPt(c.p1.0 + v.0, c.p1.1 + v.1)) - p1;
+    let mut rect = Rect::NOTHING;
+    for (a, b) in [(lo.0, lo.1), (lo.0, hi.1), (hi.0, lo.1), (hi.0, hi.1)] {
+        rect.extend_with(p1 + su * a + sv * b);
+    }
+    rect.expand(6.0)
 }
 
 /// The emitted order of the branch-current walk, expanded to one entry per
@@ -586,7 +627,11 @@ impl CircuitSimApp {
         // Voltage pass treats a missing/none flag as off only by position),
         // so keep the historical behavior here.
         self.plot_currents = match &self.tran {
-            Some(tran) => vec![true; current_slots(tran).len()],
+            // One flag per plotted series (per element), the same
+            // count `current_slot_targets` walks — sized by family it ran
+            // short, and a probe on any element past the family count
+            // flagged nothing.
+            Some(tran) => vec![true; current_slot_targets(tran).len()],
             None => Vec::new(),
         };
         self.last_probe_click = None;
@@ -1020,6 +1065,27 @@ impl CircuitSimApp {
         self.show_schematic();
     }
 
+    /// The symbol library as a menu: one entry per placeable device family
+    /// (grouped by a separator between families), arming the Part tool.
+    fn part_picker(&mut self, ui: &mut egui::Ui) {
+        let armed = match self.schematic.tool {
+            Tool::Part(kind) => Some(kind),
+            _ => None,
+        };
+        let mut prev: Option<char> = None;
+        for &kind in symbols::PICKER {
+            let spec = symbols::spec_of(kind);
+            if prev.is_some_and(|p| p != spec.letter) && !matches!(spec.letter, 'M' | 'Q' | 'J') {
+                ui.separator();
+            }
+            prev = Some(spec.letter);
+            if ui.selectable_label(armed == Some(kind), spec.label).clicked() {
+                self.pick_tool(Tool::Part(kind));
+                ui.close_menu();
+            }
+        }
+    }
+
     /// Rotate the selected part (or the next placement). Schematic edits act
     /// only while the schematic window is the active one: with Results
     /// focused, Space or the Edit menu must not change a circuit that is
@@ -1073,16 +1139,7 @@ impl CircuitSimApp {
             if canvas_family(c.kind).is_none() {
                 continue;
             }
-            let p1 = to_screen(c.p1);
-            let p2 = to_screen(c.p2);
-            let center = p1 + (p2 - p1) / 2.0;
-            let is_horizontal = c.p1.1 == c.p2.1;
-            let box_size = if is_horizontal {
-                Vec2::new(24.0, 16.0)
-            } else {
-                Vec2::new(16.0, 24.0)
-            };
-            let click_rect = Rect::from_center_size(center, box_size + Vec2::new(12.0, 12.0));
+            let click_rect = part_hit_rect(c, &to_screen);
             if click_rect.contains(pos) {
                 return Some(ProbeTarget::Part(i));
             }
@@ -1131,7 +1188,7 @@ impl CircuitSimApp {
         // same component walk these labels come from.
         let within = self.schematic.components[..ci]
             .iter()
-            .filter(|o| o.kind == c.kind)
+            .filter(|o| canvas_family(o.kind) == Some(family))
             .count();
         let Some(slot) = slot_targets
             .iter()
@@ -1273,6 +1330,7 @@ impl CircuitSimApp {
                         ui.close_menu();
                     }
                 }
+                ui.menu_button("Component", |ui| self.part_picker(ui));
                 ui.separator();
                 if ui.add(egui::Button::new("Label Net…").shortcut_text("F4")).clicked() {
                     self.open_note_dialog(false);
@@ -1431,6 +1489,11 @@ impl CircuitSimApp {
                     self.pick_tool(tool);
                 }
             }
+            // Every other device family: diodes, transistors, dependent
+            // sources, switches, transformer, line, op-amp.
+            ui.menu_button("Parts ▾", |ui| self.part_picker(ui))
+                .response
+                .on_hover_text("Place a diode, transistor, source, switch, transformer, line or op-amp");
             ui.add_space(gap);
 
             let has_component = self.schematic.selected_component.is_some();
@@ -1768,9 +1831,8 @@ impl CircuitSimApp {
                 *degree.entry(w.p2).or_default() += 1;
             }
             for c in &self.schematic.components {
-                *degree.entry(c.p1).or_default() += 1;
-                if c.kind != CompKind::Ground {
-                    *degree.entry(c.p2).or_default() += 1;
+                for pin in c.pins() {
+                    *degree.entry(pin).or_default() += 1;
                 }
             }
             for (pt, n) in degree {
@@ -1793,6 +1855,23 @@ impl CircuitSimApp {
                 if let Some(start_grid) = self.schematic.active_wire_start {
                     painter.line_segment([to_screen(start_grid), to_screen(hover_grid)], Stroke::new(1.5 * z, theme::LT_WIRE));
                 }
+                painter.circle_filled(to_screen(hover_grid), 3.0 * z, theme::LT_WIRE);
+            } else if let Tool::Part(kind) = self.schematic.tool {
+                // Ghost of the library symbol itself, in the armed facing.
+                let (dx, dy) = self.schematic.current_dir.offset(symbols::spec_of(kind).axis_len);
+                let ghost = Component {
+                    kind,
+                    p1: hover_grid,
+                    p2: GridPt(hover_grid.0 + dx, hover_grid.1 + dy),
+                    val: String::new(),
+                };
+                symbols::paint(
+                    &painter,
+                    &ghost,
+                    &to_screen,
+                    Stroke::new(1.0 * z, theme::LT_WIRE.gamma_multiply(0.5)),
+                    theme::LT_WIRE.gamma_multiply(0.5),
+                );
                 painter.circle_filled(to_screen(hover_grid), 3.0 * z, theme::LT_WIRE);
             } else if matches!(self.schematic.tool, Tool::R | Tool::C | Tool::L | Tool::V) {
                 // Ghost component preview
@@ -1984,6 +2063,22 @@ impl CircuitSimApp {
                                  label_font.clone(), theme::LT_SCHEM_TEXT);
                 }
 
+                _ if symbols::is_library_kind(c.kind) => {
+                    let ink = if is_selected { selected_stroke.color } else { theme::LT_WIRE };
+                    let stroke = if is_selected { selected_stroke } else { comp_stroke };
+                    let bounds = symbols::paint(&painter, c, &to_screen, stroke, ink);
+                    if is_selected {
+                        painter.rect_stroke(bounds.expand(4.0), 3.0, selected_stroke);
+                    }
+                    // Name over value, parked right of the symbol so the
+                    // leads and any wire on the left stay clear.
+                    let at = Pos2::new(bounds.right() + 6.0, bounds.center().y);
+                    painter.text(at - Vec2::new(0.0, 7.0), egui::Align2::LEFT_CENTER, &names[i],
+                                 label_font.clone(), theme::LT_SCHEM_TEXT);
+                    painter.text(at + Vec2::new(0.0, 7.0), egui::Align2::LEFT_CENTER, &c.val,
+                                 label_font.clone(), theme::LT_SCHEM_TEXT);
+                }
+
                 CompKind::Ground => {
                     // Stem down from the pin into an open, downward triangle.
                     let pin = p1;
@@ -2003,6 +2098,8 @@ impl CircuitSimApp {
                         painter.rect_stroke(sel_rect, 0.0, selected_stroke);
                     }
                 }
+                // Library kinds were drawn by the arm above.
+                _ => {}
             }
         }
 
@@ -2091,30 +2188,29 @@ impl CircuitSimApp {
                     // Only the R/C/L/V families exist on canvas; a Current
                     // tab series from another family keeps its trace but
                     // gets no schematic flash.
-                    let kind = match family {
-                        ElementFamily::Resistors => Some(CompKind::Resistor),
-                        ElementFamily::Capacitors => Some(CompKind::Capacitor),
-                        ElementFamily::Inductors => Some(CompKind::Inductor),
-                        ElementFamily::VoltageSources => Some(CompKind::Voltage),
-                        _ => None,
-                    };
-                    if let Some(kind) = kind {
+                    {
+                        // The within-family order is the deck's card order,
+                        // which is the schematic's component order.
                         let mut seen = 0usize;
                         for c in &self.schematic.components {
-                            if c.kind == kind {
+                            if canvas_family(c.kind) == Some(family) {
                                 if seen == within {
-                                    let p1 = to_screen(c.p1);
-                                    let p2 = to_screen(c.p2);
-                                    let center = p1 + (p2 - p1) / 2.0;
-                                    let horizontal = c.p1.1 == c.p2.1;
-                                    let rect = Rect::from_center_size(
-                                        center,
-                                        if horizontal {
-                                            Vec2::new(40.0, 22.0)
-                                        } else {
-                                            Vec2::new(22.0, 40.0)
-                                        } * z,
-                                    );
+                                    let rect = if c.pins().len() <= 2 {
+                                        let p1 = to_screen(c.p1);
+                                        let p2 = to_screen(c.p2);
+                                        let center = p1 + (p2 - p1) / 2.0;
+                                        let horizontal = c.p1.1 == c.p2.1;
+                                        Rect::from_center_size(
+                                            center,
+                                            if horizontal {
+                                                Vec2::new(40.0, 22.0)
+                                            } else {
+                                                Vec2::new(22.0, 40.0)
+                                            } * z,
+                                        )
+                                    } else {
+                                        part_hit_rect(c, &to_screen)
+                                    };
                                     painter.rect_stroke(
                                         rect,
                                         2.0,
@@ -2205,12 +2301,7 @@ impl CircuitSimApp {
                 if let Some(interact_pos) = response.interact_pointer_pos() {
                     let mut hit = None;
                     for (i, c) in self.schematic.components.iter().enumerate() {
-                        let p1 = to_screen(c.p1);
-                        let p2 = to_screen(c.p2);
-                        let center = p1 + (p2 - p1) / 2.0;
-                        let is_horizontal = c.p1.1 == c.p2.1;
-                        let box_size = if is_horizontal { Vec2::new(24.0, 16.0) } else { Vec2::new(16.0, 24.0) };
-                        let click_rect = Rect::from_center_size(center, box_size + Vec2::new(12.0, 12.0));
+                        let click_rect = part_hit_rect(c, &to_screen);
                         if click_rect.contains(interact_pos) {
                             hit = Some(i);
                             break;
@@ -2260,7 +2351,7 @@ impl CircuitSimApp {
 
                 match self.schematic.tool {
                     Tool::Wire => self.schematic.wire_click(grid_pt),
-                    Tool::R | Tool::C | Tool::L | Tool::V | Tool::Gnd => {
+                    Tool::R | Tool::C | Tool::L | Tool::V | Tool::Gnd | Tool::Part(_) => {
                         self.schematic.place_at(grid_pt);
                     }
                     Tool::Label | Tool::Directive => {
@@ -2269,14 +2360,8 @@ impl CircuitSimApp {
                     Tool::Select => {
                         let mut selected = None;
                         for (i, c) in self.schematic.components.iter().enumerate() {
-                            let p1 = to_screen(c.p1);
-                            let p2 = to_screen(c.p2);
-                            let center = p1 + (p2 - p1) / 2.0;
-                            let is_horizontal = c.p1.1 == c.p2.1;
-                            let box_size = if is_horizontal { Vec2::new(24.0, 16.0) } else { Vec2::new(16.0, 24.0) };
-
-                            // Make click area slightly larger than visual box
-                            let click_rect = Rect::from_center_size(center, box_size + Vec2::new(12.0, 12.0));
+                            // Click area slightly larger than the visual box
+                            let click_rect = part_hit_rect(c, &to_screen);
                             if click_rect.contains(interact_pos) {
                                 selected = Some(i);
                                 break;
@@ -2584,6 +2669,7 @@ impl CircuitSimApp {
                     CompKind::Inductor  => ("Inductor",  Color32::from_rgb(170, 90, 0)),
                     CompKind::Voltage   => ("Voltage Source", Color32::from_rgb(150, 100, 0)),
                     CompKind::Ground    => ("Ground",    Color32::from_rgb(70, 70, 70)),
+                    other => (symbols::spec_of(other).label, Color32::from_rgb(20, 110, 90)),
                 };
 
                 egui::Window::new("")
@@ -2733,8 +2819,22 @@ impl CircuitSimApp {
                         ui.horizontal(|ui| {
                             ui.label(egui::RichText::new("Value").size(11.0).color(TEXT_SECONDARY));
                             ui.add_space(4.0);
-                            ui.add(egui::TextEdit::singleline(&mut c.val).desired_width(110.0));
+                            let wide = symbols::is_library_kind(c.kind);
+                            ui.add(egui::TextEdit::singleline(&mut c.val).desired_width(if wide { 200.0 } else { 110.0 }));
                         });
+                        if symbols::is_library_kind(c.kind) {
+                            // What the text means, and which pin is which —
+                            // the symbol alone does not say (e.g. an
+                            // op-amp's four pins, a switch's control pair).
+                            let spec = symbols::spec_of(c.kind);
+                            ui.add_space(2.0);
+                            ui.label(egui::RichText::new(spec.val_hint).size(10.0).color(TEXT_SECONDARY));
+                            ui.label(
+                                egui::RichText::new(format!("Pins: {}", spec.pin_names.join(", ")))
+                                    .size(10.0)
+                                    .color(TEXT_SECONDARY),
+                            );
+                        }
                     } else {
                         ui.label(egui::RichText::new("Reference ground node (0)").size(11.0).color(TEXT_SECONDARY));
                     }
@@ -3757,6 +3857,51 @@ mod tests {
         app.schematic.tran_stop = "5m".into();
         assert!(app.generate_netlist_from_schematic());
         app
+    }
+
+    /// A device part is probed by its place in its *family*, not its kind: a
+    /// P-channel MOSFET drawn after an N-channel one is the deck's second `M`.
+    #[test]
+    fn probing_a_pmos_counts_it_in_the_mosfet_family() {
+        let mut app = CircuitSimApp::default();
+        let mut place = |app: &mut CircuitSimApp, tool: Tool, at: (i32, i32), val: Option<&str>| {
+            app.schematic.tool = tool;
+            app.schematic.place_at(GridPt(at.0, at.1));
+            let c = app.schematic.components.last_mut().unwrap();
+            if let Some(v) = val {
+                c.val = v.into();
+            }
+            c.pins()
+        };
+        let tie = |app: &mut CircuitSimApp, pin: GridPt, name: &str| {
+            app.schematic.labels.push(crate::schematic::NetLabel { at: pin, name: name.into() });
+        };
+        let v = place(&mut app, Tool::V, (0, 0), Some("5"));
+        let n = place(&mut app, Tool::Part(CompKind::Nmos), (10, 0), None);
+        let p = place(&mut app, Tool::Part(CompKind::Pmos), (20, 0), None);
+        tie(&mut app, v[0], "vdd");
+        tie(&mut app, v[1], "0");
+        // N: drain=vdd, source=0, gate=vdd.   P: source=vdd, drain=0, gate=0.
+        for (pin, net) in n.iter().zip(["vdd", "0", "vdd"]) {
+            tie(&mut app, *pin, net);
+        }
+        for (pin, net) in p.iter().zip(["vdd", "0", "0"]) {
+            tie(&mut app, *pin, net);
+        }
+        app.schematic.tran_step = "1m".into();
+        app.schematic.tran_stop = "5m".into();
+        assert!(app.generate_netlist_from_schematic(), "{:?}", app.status);
+        app.run_simulation();
+        assert!(app.tran.is_some(), "{:?}", app.status);
+        app.plot_currents.iter_mut().for_each(|b| *b = false);
+        let pmos = app.schematic.components.len() - 1;
+        assert!(app.probe_part_for(pmos, false), "{:?}", app.status);
+        assert_eq!(app.plot_currents.iter().filter(|b| **b).count(), 1);
+        let slot = current_slot_targets(app.tran.as_ref().unwrap())
+            .iter()
+            .position(|&(f, i)| f == ElementFamily::Mosfets && i == 1)
+            .expect("second MOSFET slot");
+        assert!(app.plot_currents[slot], "the P-channel part plots the deck's second M");
     }
 
     #[test]

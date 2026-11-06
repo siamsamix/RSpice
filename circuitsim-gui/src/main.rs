@@ -4,6 +4,7 @@ mod chrome;
 mod icons;
 mod plot;
 mod schematic;
+mod symbols;
 mod theme;
 
 use app::CircuitSimApp;

@@ -2244,3 +2244,30 @@ fn for_deck_searches_the_libs_beside_the_deck_directory_and_extra_dirs() {
     assert!(parse_with_options(deck, &options).is_err());
     let _ = std::fs::remove_dir_all(&root);
 }
+
+/// A frontend that draws a deck reads polarity and the controlled-source /
+/// coupling families through the read views, never as fields.
+#[test]
+fn read_views_expose_polarity_and_the_hidden_families() {
+    let net = parse(
+        ".model nm NMOS\n.model pm PMOS\n.model qn NPN\n.model qp PNP\n\
+         .model jn NJF\n.model jp PJF\n\
+         V1 a 0 DC 1\nR1 a b 1k\nR2 b 0 1k\n\
+         M1 a b 0 0 nm\nM2 a b 0 0 pm\nQ1 a b 0 qn\nQ2 a b 0 qp\nJ1 a b 0 jn\nJ2 a b 0 jp\n\
+         E1 e 0 a 0 2\nG1 0 g a 0 1m\nH1 h 0 V1 2k\nF1 f 0 V1 2\n\
+         L1 a c 1m\nL2 b c 1m\nK1 L1 L2 0.9\n.end\n",
+    )
+    .expect("parses");
+    let c = &net.circuit;
+    assert_eq!(c.mosfet_type("nm"), Some(MosfetType::Nmos));
+    assert_eq!(c.mosfet_type("pm"), Some(MosfetType::Pmos));
+    assert_eq!(c.bjt_type("qn"), Some(BjtType::Npn));
+    assert_eq!(c.bjt_type("qp"), Some(BjtType::Pnp));
+    assert_eq!(c.jfet_type("jn"), Some(JfetType::Njf));
+    assert_eq!(c.jfet_type("jp"), Some(JfetType::Pjf));
+    assert_eq!(c.mosfet_type("missing"), None);
+    assert_eq!((c.vcvs().len(), c.vccs().len(), c.ccvs().len(), c.cccs().len()), (1, 1, 1, 1));
+    assert_eq!(c.vcvs()[0].name, "E1");
+    assert_eq!(c.mutual_inductances().len(), 1);
+    assert_eq!(c.mutual_inductances()[0].coupling, 0.9);
+}

@@ -43,7 +43,7 @@ Source of truth: `CONTEXT.md` §"Where we stand" and `TODO.md` §2–§5. Summar
 
 **Dot commands parsed:** `.model`, `.param`, `.func`, `.subckt`/`.ends`, `.include`, `.lib` (section-aware), `.global`, `.options`, `.temp`, `.ic`, `.nodeset`, `.dc`, `.ac`, `.tran`, `.tf`, `.noise`, `.four`, `.step`, `.meas`, `.mc`, `.end`.
 
-**GUI:** egui schematic editor (`R C L V Gnd` symbols only), waveform tabs (Voltage/Current/Differential, Frequency magnitude/phase/branch), DC tab, Overview tab, CSV export, `--raw`/`.raw` writer + reader (binary + ASCII, stepped runs).
+**GUI:** egui schematic editor (`R C L V Gnd` plus diode, N/P MOSFET, NPN/PNP, N/P JFET, `I`, `E/F/G/H`, `B`, `S/W`, transformer, T-line, op-amp symbols), waveform tabs (Voltage/Current/Differential, Frequency magnitude/phase/branch), DC tab, Overview tab, CSV export, `--raw`/`.raw` writer + reader (binary + ASCII, stepped runs).
 
 **CLI:** `-b/--batch`, `-a/--analysis`, `--output`, `--waves`, `-I`, warnings on stderr, exit codes.
 
@@ -197,7 +197,7 @@ LTspice `barbitrarybehavioralvoltageorcur.htm`: `R=<expr>` (behavioral resistor)
 | 9.8 | Full export surface | CSV of arbitrary traces (voltages, currents, measurements); image export. | Only `.tran` node voltages exportable today. | CLI `--output`/GUI export: all traces + measurements; image export (PNG/SVG). |
 | 9.9 | Waveform compression/decimation | `.options plotwinsize`, `plotreltol`, `plotvntol`, `plotabstol`; LTspice fast-access format. | **Missing.** | `rawwave.rs`/analysis: compression during `.tran`; `.options plot*`. |
 | 9.10 | Persist plot configurations | Trace sets, scales, window layouts saved/reused (`.plt` plot settings). | **Missing.** | GUI settings persistence. |
-| 9.11 | Schematic symbols | Symbols for every device family (diode, MOSFET, BJT, I, controlled/behavioral sources, switches, transformers, T-lines, opamps). Editor is `R C L V Gnd`-only. | **Missing.** | `circuitsim-gui` symbol library: new symbols + `CompKind` per family; attach `model=`/`.subckt` references. |
+| 9.11 | Schematic symbols | Symbols for every device family (diode, MOSFET, BJT, I, controlled/behavioral sources, switches, transformers, T-lines, opamps). | **Done** (`symbols.rs`; part picker, rotate/drag/probe, import). Gaps: 4-pin MOSFET (bulk is tied to source), `K` not recognised on import. | Next: attach `model=`/`.subckt` references via a model picker (TODO §7 symbol-library item). |
 | 9.12 | Symbol library format + component picker | `.asy`/symbol with attached model/spiceline data; picker. | **Missing.** | GUI: symbol format, library search paths (`symbolandlibrarysearchpaths.htm`), picker dialog. |
 | 9.13 | Net/wire labels | Clean node names governing netlist & plot names. | **Done** (state level): `NetLabel`, Edit ▸ Label Net; labels name nodes in `build_netlist`, import creates them. Visual details unverified against LTspice. | Remaining: label flag shape/colors, multi-net bus labels. |
 | 9.14 | SPICE text directives as schematic annotations | `.tran`, `.step`, `.meas`, `.include` as first-class schematic objects (comment/directive toggle). | **Partially done**: directive text objects placed/edited/deleted and spliced into the deck; imported dot cards kept. Missing: comment/directive toggle, moving text, `Configure Analysis` ↔ text mapping. | GUI: remaining items — toggle comment/directive; `Configure Analysis` toolbar mapping tabs ↔ schematic text. |

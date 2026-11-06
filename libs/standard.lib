@@ -29,3 +29,7 @@ Rbot mid bottom {r2}
 R1 in out {r}
 C1 out 0 {c}
 .ends lowpass
+
+* ── Bipolar transistors (generic textbook defaults, used by libs/standard.sym) ─
+.model QNPN NPN(IS=1e-14 BF=100 VAF=100)
+.model QPNP PNP(IS=1e-14 BF=50 VAF=50)

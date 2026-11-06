@@ -2,9 +2,9 @@ mod app;
 mod autolayout;
 mod chrome;
 mod icons;
+mod parts;
 mod plot;
 mod schematic;
-mod symbols;
 mod theme;
 
 use app::CircuitSimApp;

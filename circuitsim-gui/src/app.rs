@@ -22,6 +22,16 @@ use crate::schematic::{
     GRID_SIZE,
 };
 
+/// Centres of the `+` and `-` marks inside a voltage source's circle.
+///
+/// SPICE `V n1 n2` puts the positive terminal on `n1`, and the editor's `p1`
+/// is `n1`, so `+` goes on the `p1` side of the centre and `-` on the `p2`
+/// side. (They used to be swapped.)
+fn source_polarity_marks(center: Pos2, p1: Pos2, p2: Pos2, radius: f32) -> (Pos2, Pos2) {
+    let dir = (p2 - p1).normalized();
+    (center - dir * (radius * 0.45), center + dir * (radius * 0.45))
+}
+
 /// Deck-spelling label for a node (`in`, `out`), falling back to its id.
 /// A free function so UI closures can capture only the names slice.
 fn node_label(names: &[String], i: usize) -> String {
@@ -1953,18 +1963,15 @@ impl CircuitSimApp {
                     let r = 11.0_f32;
                     painter.circle_stroke(center, r, Stroke::new(1.5, theme::LT_WIRE));
 
-                    // + and - polarity symbols inside
-                    let dir = (p2 - p1).normalized();
-                    let plus_c = center + dir * (r * 0.45);
-                    let minus_c = center - dir * (r * 0.45);
+                    // + and - polarity symbols inside. Both stay upright
+                    // whatever the rotation; `+` sits toward p1, the SPICE
+                    // positive node.
+                    let (plus_c, minus_c) = source_polarity_marks(center, p1, p2, r);
                     let ps = 3.0_f32;
-                    painter.line_segment([plus_c - dir * ps, plus_c + dir * ps],
-                                         Stroke::new(1.0, theme::LT_SCHEM_TEXT));
-                    let perp = Vec2::new(-dir.y, dir.x);
-                    painter.line_segment([plus_c - perp * ps, plus_c + perp * ps],
-                                         Stroke::new(1.0, theme::LT_SCHEM_TEXT));
-                    painter.line_segment([minus_c - dir * ps, minus_c + dir * ps],
-                                         Stroke::new(1.0, theme::LT_SCHEM_TEXT));
+                    let mark = Stroke::new(1.0, theme::LT_SCHEM_TEXT);
+                    painter.line_segment([plus_c - Vec2::X * ps, plus_c + Vec2::X * ps], mark);
+                    painter.line_segment([plus_c - Vec2::Y * ps, plus_c + Vec2::Y * ps], mark);
+                    painter.line_segment([minus_c - Vec2::X * ps, minus_c + Vec2::X * ps], mark);
 
                     if is_selected {
                         painter.circle_stroke(center, r + 4.0, selected_stroke);
@@ -3456,6 +3463,21 @@ impl CircuitSimApp {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn source_plus_sits_toward_p1_in_every_orientation() {
+        let c = Pos2::new(100.0, 100.0);
+        for (p1, p2) in [
+            (Pos2::new(100.0, 60.0), Pos2::new(100.0, 140.0)),  // p1 above
+            (Pos2::new(100.0, 140.0), Pos2::new(100.0, 60.0)),  // p1 below
+            (Pos2::new(60.0, 100.0), Pos2::new(140.0, 100.0)),  // p1 left
+            (Pos2::new(140.0, 100.0), Pos2::new(60.0, 100.0)),  // p1 right
+        ] {
+            let (plus, minus) = source_polarity_marks(c, p1, p2, 11.0);
+            assert!(plus.distance(p1) < minus.distance(p1), "+ must be nearer p1 ({p1:?})");
+            assert!(minus.distance(p2) < plus.distance(p2), "- must be nearer p2 ({p2:?})");
+        }
+    }
     use super::*;
     use circuitsim::netlist::parse;
 

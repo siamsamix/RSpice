@@ -13,6 +13,7 @@ use circuitsim::netlist::{
     AnalysisCommands, Netlist, ParseOptions,
 };
 use circuitsim::units::parse_value;
+use crate::autolayout::{ORIGIN_X, ORIGIN_Y};
 use egui::{Pos2, Vec2};
 use std::collections::{HashMap, HashSet};
 
@@ -42,7 +43,7 @@ impl GridPt {
     }
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum CompKind {
     Resistor,
     Capacitor,
@@ -955,13 +956,8 @@ impl SchematicState {
     /// message (parse complaint or "nothing drawable") and leaves the
     /// current schematic untouched.
     ///
-    /// Layout strategy:
-    ///   • Each unique non-ground node gets a vertical column (x = col * COL_W).
-    ///   • Components are placed vertically between their two node columns at
-    ///     increasing y positions (one slot per column pair).
-    ///   • Horizontal wires connect component pins to the node column spine.
-    ///   • A vertical wire runs along each node spine connecting all the pins.
-    ///   • Node 0 (ground) gets a Ground symbol instead of a spine wire.
+    /// Layout: see `autolayout` — signal flow left to right, shunts hang to
+    /// ground symbols, nets are routed orthogonally around the parts.
     pub fn from_netlist(text: &str, previous: &SchematicState) -> Result<(SchematicState, String), String> {
         Self::from_netlist_with_options(text, previous, &ParseOptions::default())
     }
@@ -1049,155 +1045,50 @@ impl SchematicState {
             return Err(msg);
         }
 
-        // ── 2. Collect all non-ground node numbers and assign columns ─────────
-        let mut node_set: Vec<usize> = vec![];
-        for c in &parsed {
-            for &n in &[c.node_a, c.node_b] {
-                if n != 0 && !node_set.contains(&n) {
-                    node_set.push(n);
-                }
-            }
-        }
-        node_set.sort_unstable();
-
-        let node_to_col: HashMap<usize, i32> = node_set
-        .iter()
-        .enumerate()
-        .map(|(i, &n)| (n, i as i32))
-        .collect();
-
-        // ── 3. Lay out components ─────────────────────────────────────────────
-        const COL_W:    i32 = 6;
-        const COMP_LEN: i32 = 4;
-        const ROW_GAP:  i32 = 6;
-        const ORIGIN_X: i32 = 3;
-        const ORIGIN_Y: i32 = 3;
-
-        let mut new_components: Vec<Component> = vec![];
-        let mut new_wires:      Vec<Wire>      = vec![];
-        let mut spine_pins: HashMap<usize, Vec<i32>> = HashMap::new();
-
-        // Tracker for packing parallel components efficiently into rows
-        struct Interval { start: i32, end: i32 }
-        let mut row_intervals: Vec<Vec<Interval>> = vec![];
-
-        for comp in &parsed {
-            let col_a = node_to_col.get(&comp.node_a).copied().unwrap_or(-1);
-            let col_b = node_to_col.get(&comp.node_b).copied().unwrap_or(-1);
-
-            // Ignore malformed ground-to-ground components
-            if col_a < 0 && col_b < 0 { continue; }
-
-            let start_half: i32;
-            let end_half: i32;
-            let mut mid_half: i32;
-
-            // Calculate "half-column" intervals to map out the X-axis territory
-            if col_a >= 0 && col_b >= 0 {
-                start_half = col_a.min(col_b) * 2;
-                end_half = col_a.max(col_b) * 2;
-                mid_half = start_half + (end_half - start_half) / 2;
-
-                // If midpoint lands exactly on a spine (even), push it to the right channel
-                if mid_half % 2 == 0 { mid_half += 1; }
-            } else {
-                let c = col_a.max(col_b); // The non-ground column
-                start_half = c * 2;
-                end_half = c * 2 + 1;
-                mid_half = end_half; // Push ground components into the right-side channel
-            }
-
-            // Interval Packer: Find the lowest Y-row where this X-interval doesn't collide
-            let mut row = 0;
-            loop {
-                if row >= row_intervals.len() {
-                    row_intervals.push(vec![]);
-                }
-                // Overlap check (they collide if they share any X-territory)
-                let overlaps = row_intervals[row].iter().any(|i| {
-                    !(end_half < i.start || start_half > i.end)
-                });
-
-                if !overlaps {
-                    row_intervals[row].push(Interval { start: start_half, end: end_half });
-                    break;
-                }
-                row += 1;
-            }
-
-            let y_top = ORIGIN_Y + (row as i32) * (COMP_LEN + ROW_GAP);
-            let comp_x = ORIGIN_X + mid_half * (COL_W / 2);
-
-            let p1 = GridPt(comp_x, y_top);
-            let p2 = GridPt(comp_x, y_top + COMP_LEN);
-
-            new_components.push(Component {
-                kind: comp.kind,
-                p1,
-                p2,
-                val: comp.val.clone(),
-            });
-
-            // Horizontal wire: p1 -> spine of pin1_node
-            if comp.node_a != 0 {
-                let spine_x = ORIGIN_X + col_a * COL_W;
-                if spine_x != comp_x {
-                    new_wires.push(Wire { p1: GridPt(comp_x, y_top), p2: GridPt(spine_x, y_top) });
-                }
-                spine_pins.entry(comp.node_a).or_default().push(y_top);
-            } else {
-                // Ground pin for node A
-                new_components.push(Component {
-                    kind: CompKind::Ground,
-                    p1: GridPt(comp_x, y_top),
-                                    p2: GridPt(comp_x, y_top),
-                                    val: "".into(),
-                });
-            }
-
-            // Horizontal wire: p2 -> spine of pin2_node
-            if comp.node_b != 0 {
-                let spine_x = ORIGIN_X + col_b * COL_W;
-                if spine_x != comp_x {
-                    new_wires.push(Wire { p1: GridPt(comp_x, y_top + COMP_LEN), p2: GridPt(spine_x, y_top + COMP_LEN) });
-                }
-                spine_pins.entry(comp.node_b).or_default().push(y_top + COMP_LEN);
-            } else {
-                // Ground pin for node B
-                new_components.push(Component {
-                    kind: CompKind::Ground,
-                    p1: GridPt(comp_x, y_top + COMP_LEN),
-                                    p2: GridPt(comp_x, y_top + COMP_LEN),
-                                    val: "".into(),
-                });
-            }
-        }
-
-        // ── 4. Vertical spine wires for each non-ground node ─────────────────
-        for (&node, pins) in &spine_pins {
-            let y_min = *pins.iter().min().unwrap();
-            let y_max = *pins.iter().max().unwrap();
-            // Only draw the vertical spine if the node connects across multiple Y levels
-            if y_min != y_max {
-                let spine_x = ORIGIN_X + node_to_col[&node] * COL_W;
-                new_wires.push(Wire { p1: GridPt(spine_x, y_min), p2: GridPt(spine_x, y_max) });
-            }
-        }
+        // ── 2. Place the parts and route the nets ────────────────────────────
+        // (`autolayout` owns the geometry; see its module docs.)
+        let parts: Vec<crate::autolayout::Part> = parsed
+            .iter()
+            .map(|c| crate::autolayout::Part {
+                kind: c.kind,
+                a: c.node_a,
+                b: c.node_b,
+                val: c.val.clone(),
+            })
+            .collect();
+        let layout = crate::autolayout::layout(&parts);
+        let new_components = layout.components;
+        let new_wires = layout.wires;
 
         // ── 4b. Net labels: every named net keeps its name ──────────────────
-        // The label sits on the net's first spine point, a point the layout
-        // above guarantees is on the net (a wire end or the pin itself).
+        // The label sits on a pin of the net, which the layout guarantees is
+        // a wire end.
+        let node_set: Vec<usize> = layout.anchors.keys().copied().collect();
+        let is_named = |node: usize| {
+            let name = circuit.node_name(node);
+            !name.is_empty() && name != node.to_string()
+        };
         let mut new_labels: Vec<NetLabel> = Vec::new();
         for &node in &node_set {
-            let name = circuit.node_name(node);
-            if name.is_empty() || name == node.to_string() {
-                continue;
+            if is_named(node) {
+                new_labels.push(NetLabel {
+                    at: layout.anchors[&node],
+                    name: circuit.node_name(node).to_string(),
+                });
             }
-            let y = spine_pins[&node].iter().copied().min().unwrap_or(ORIGIN_Y);
-            new_labels.push(NetLabel {
-                at: GridPt(ORIGIN_X + node_to_col[&node] * COL_W, y),
-                name: name.to_string(),
-            });
+        }
+        // Connections the router could not draw are joined by name instead.
+        for &(node, at) in &layout.ties {
+            let name = if is_named(node) {
+                circuit.node_name(node).to_string()
+            } else {
+                let mut cand = format!("_n{node}");
+                while node_set.iter().any(|&m| circuit.node_name(m).eq_ignore_ascii_case(&cand)) {
+                    cand.push('_');
+                }
+                cand
+            };
+            new_labels.push(NetLabel { at, name });
         }
 
         // ── 4c. SPICE directives: the cards the schematic cannot draw ───────
@@ -1655,6 +1546,29 @@ mod tests {
         assert_eq!(again.matches(".tran").count(), 1, "{again}");
         let net = parse(&again).expect("re-parses");
         assert_eq!(net.analysis.tran_stop, Some(5e-3));
+    }
+
+    /// A node with several pins must come back as ONE net. (The old layout
+    /// only joined a node's first and last pin, so every pin in between fell
+    /// off the net and the regenerated deck had extra nodes.)
+    #[test]
+    fn import_keeps_nodes_with_many_pins_connected() {
+        let deck = "V1 1 0 DC 5\nR1 1 2 1k\nR2 1 2 2k\nR3 1 3 3k\nR4 2 3 4k\nR5 3 0 5k\nR6 2 0 6k\nC1 1 0 1u\n.end\n";
+        let orig = parse(deck).expect("deck parses");
+        let (st, _) = SchematicState::from_netlist(deck, &SchematicState::default()).expect("import");
+        let back = st.build_netlist().expect("netlist builds");
+        let (o, b) = (&orig.circuit, &back.circuit);
+        assert_eq!(o.resistors.len(), b.resistors.len());
+        let mut map = HashMap::new();
+        let mut rev = HashMap::new();
+        map.insert(0usize, 0usize);
+        rev.insert(0usize, 0usize);
+        for (x, y) in o.resistors.iter().zip(&b.resistors) {
+            for (from, to) in [(x.n1.0, y.n1.0), (x.n2.0, y.n2.0)] {
+                assert_eq!(*map.entry(from).or_insert(to), to, "node {from} split in two");
+                assert_eq!(*rev.entry(to).or_insert(from), from, "nodes merged into {to}");
+            }
+        }
     }
 
     #[test]

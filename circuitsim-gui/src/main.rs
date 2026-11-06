@@ -1,4 +1,5 @@
 mod app;
+mod autolayout;
 mod chrome;
 mod icons;
 mod plot;

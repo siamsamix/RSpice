@@ -18,6 +18,7 @@ pub(super) fn parse_dot_command(
     circuit: &mut Circuit,
     warnings: &mut Vec<String>,
     line_no: usize,
+    options: &ParseOptions,
 ) -> Result<()> {
     let tokens: Vec<&str> = line.split_whitespace().collect();
     let cmd = tokens[0].to_ascii_lowercase();
@@ -53,6 +54,10 @@ pub(super) fn parse_dot_command(
                 }
                 if tok.eq_ignore_ascii_case("startup") {
                     analysis.tran_startup = true;
+                    continue;
+                }
+                if tok.eq_ignore_ascii_case("nodiscard") {
+                    analysis.tran_nodiscard = true;
                     continue;
                 }
                 match parse_value(tok) {
@@ -209,6 +214,48 @@ pub(super) fn parse_dot_command(
         ".nodeset" => {
             let entries = parse_ic_entries(&tokens, ".nodeset", line_no, warnings)?;
             analysis.nodeset.extend(entries);
+        }
+        ".save" => {
+            if tokens.len() == 1 {
+                warnings.push(format!(
+                    "line {line_no}: .save lists no traces — everything stays saved"
+                ));
+            }
+            for tok in &tokens[1..] {
+                match parse_save_spec(tok) {
+                    Some(spec) => analysis.save.push(spec),
+                    None => warnings.push(format!(
+                        "line {line_no}: .save token '{tok}' is not V(name) or I(dev) — ignored"
+                    )),
+                }
+            }
+        }
+        ".keep" | ".keepnode" => {
+            if tokens.len() == 1 {
+                warnings.push(format!(
+                    "line {line_no}: {} lists no nodes — RSpice keeps every net regardless",
+                    cmd
+                ));
+            }
+            for tok in &tokens[1..] {
+                for name in tok.split(',') {
+                    let name = name.trim();
+                    if !name.is_empty() {
+                        analysis.keepnodes.push(name.to_string());
+                    }
+                }
+            }
+        }
+        ".savebias" => {
+            let args = tokens.get(1..).unwrap_or(&[]);
+            analysis.savebias = Some(parse_savebias(args, line_no, warnings)?);
+        }
+        ".loadbias" => {
+            let spec = tokens.get(1).copied().ok_or_else(|| {
+                SimError::Parse(format!("line {line_no}: .loadbias needs a filename"))
+            })?;
+            analysis.loadbias = Some(spec.to_string());
+            load_bias_file(spec, options, line_no, analysis, warnings)?;
         }
         other => {
             // Echo the arguments so the user can find the card in their deck.
@@ -387,6 +434,132 @@ pub(super) fn parse_ic_entries(
     Ok(entries)
 }
 
+/// Parse one `.save` selector `FUNC(name)` — the halves kept as written so
+/// emission reprints the card (wildcards stay wildcards, hierarchy `:`
+/// passes through). Anything without a balanced `FUNC(name)` shape is None,
+/// which the caller warns about.
+fn parse_save_spec(tok: &str) -> Option<SaveSpec> {
+    let (probe, name) = tok.split_once('(')?;
+    let name = name.strip_suffix(')')?.trim();
+    let probe = probe.trim();
+    if probe.is_empty() || name.is_empty() {
+        return None;
+    }
+    Some(SaveSpec {
+        probe: probe.to_string(),
+        name: name.to_string(),
+    })
+}
+
+/// Parse the `.savebias` argument walk: filename then the keyword/value
+/// selectors (LTspice's order: `temp=`, `time= [repeat]`, `step=`,
+/// `DC1=..DC3=` — the writer re-prints in that order). Malformed numeric
+/// values are loud; unknown tokens warn and are skipped.
+fn parse_savebias(
+    tokens: &[&str],
+    line_no: usize,
+    warnings: &mut Vec<String>,
+) -> Result<SaveBiasCommand> {
+    let file = tokens
+        .first()
+        .copied()
+        .ok_or_else(|| SimError::Parse(format!("line {line_no}: .savebias needs a filename")))?;
+    let mut cmd = SaveBiasCommand {
+        file: file.to_string(),
+        ..Default::default()
+    };
+    for tok in &tokens[1..] {
+        if tok.eq_ignore_ascii_case("internal") {
+            cmd.internal = true;
+            continue;
+        }
+        if tok.eq_ignore_ascii_case("repeat") {
+            cmd.repeat = true;
+            continue;
+        }
+        let Some((key, value)) = tok.split_once('=') else {
+            warnings.push(ignored_tokens_owned(line_no, ".savebias", tok));
+            continue;
+        };
+        let value = parse_value(value)
+            .map_err(|e| SimError::Parse(format!("line {line_no}: .savebias '{tok}': {e}")))?;
+        match key.to_ascii_lowercase().as_str() {
+            "temp" => cmd.temp = Some(value),
+            "time" => cmd.time = Some(value),
+            "step" => {
+                if !(value > 0.0 && value.fract() == 0.0) {
+                    return Err(SimError::Parse(format!(
+                        "line {line_no}: .savebias step={value} must be a whole run number (1, 2, …)"
+                    )));
+                }
+                cmd.step = Some(value as usize);
+            }
+            "dc1" => cmd.dc[0] = Some(value),
+            "dc2" => cmd.dc[1] = Some(value),
+            "dc3" => cmd.dc[2] = Some(value),
+            _ => warnings.push(ignored_tokens_owned(line_no, ".savebias", tok)),
+        }
+    }
+    if cmd.time.is_some_and(|t| t <= 0.0) {
+        return Err(SimError::Parse(format!(
+            "line {line_no}: .savebias time={0} must be > 0",
+            cmd.time.unwrap()
+        )));
+    }
+    if cmd.repeat && cmd.time.is_none() {
+        return Err(SimError::Parse(format!(
+            "line {line_no}: .savebias repeat only goes with a time= value"
+        )));
+    }
+    Ok(cmd)
+}
+
+/// `.loadbias`: read the bias file and fold its `.nodeset`/`.ic` entries
+/// into the analysis lists — one card's output is the next card's input,
+/// same shape both ways. File-written node names are the flattened deck
+/// labels a solved run spells, so they land direct (no subckt-scope
+/// mangling, which only deck-written IC cards need). The file resolves
+/// through the same search path `.include` uses; not finding it is loud,
+/// because silently seeding nothing diverges from the deck's intent.
+fn load_bias_file(
+    spec: &str,
+    options: &ParseOptions,
+    line_no: usize,
+    analysis: &mut AnalysisCommands,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    let path = super::imports::find_library_file(spec, options.deck_dir.as_deref(), options)
+        .ok_or_else(|| {
+            SimError::Parse(format!("line {line_no}: .loadbias file '{spec}' not found"))
+        })?;
+    let (content, _) = super::imports::open_deck_file(&path).map_err(|e| {
+        SimError::Parse(format!("line {line_no}: .loadbias {}: {e}", path.display()))
+    })?;
+    for (bias_no, text) in content.lines().enumerate() {
+        let text = text.trim();
+        if text.is_empty() || text.starts_with('*') || text.starts_with(';') {
+            continue; // the writer's comment header, and spiced-up edits
+        }
+        let tokens: Vec<&str> = text.split_whitespace().collect();
+        match tokens[0].to_ascii_lowercase().as_str() {
+            ".nodeset" => {
+                let entries = parse_ic_entries(&tokens, ".nodeset", bias_no + 1, warnings)?;
+                analysis.nodeset.extend(entries);
+            }
+            ".ic" => {
+                let entries = parse_ic_entries(&tokens, ".ic", bias_no + 1, warnings)?;
+                analysis.ic.extend(entries);
+            }
+            _ => warnings.push(format!(
+                "line {line_no}: .loadbias ignores non-directive line '{}' from {}",
+                text,
+                path.display()
+            )),
+        }
+    }
+    Ok(())
+}
+
 /// Parse `.options` keys the engine consumes. Unknown keys warn (the full
 /// reference-tool option surface is a TODO §2 item) rather than failing an
 /// otherwise simulatable deck.
@@ -402,9 +575,15 @@ pub(super) fn parse_options(
     }
     for tok in &tokens[1..] {
         let Some((key, value)) = tok.split_once('=') else {
-            warnings.push(format!(
-                "line {line_no}: .options token '{tok}' is not KEY=VALUE — ignored"
-            ));
+            // PSpice's boolean flag options are bare words (`accurate`,
+            // `solvehold`), not KEY=VALUE.
+            match tok.to_ascii_lowercase().as_str() {
+                "accurate" => analysis.config.accurate = true,
+                "solvehold" => analysis.config.solvehold = true,
+                _ => warnings.push(format!(
+                    "line {line_no}: .options token '{tok}' is not KEY=VALUE — ignored"
+                )),
+            }
             continue;
         };
         let key = key.to_ascii_lowercase();
@@ -448,6 +627,50 @@ pub(super) fn parse_options(
                 analysis.config.itl4 =
                     parse_value(value).map_err(SimError::Parse)?.max(1.0) as usize
             }
+            // DC retry-rung budget (the gmin/source ladders and swept points
+            // that fell through their warm start). Unset keeps the plain
+            // `itl1` budget on those rungs.
+            "itl2" => {
+                analysis.config.itl2 =
+                    Some(parse_value(value).map_err(SimError::Parse)?.max(1.0) as usize)
+            }
+            // Lower transient iteration limit: recognized-inert (ngspice has
+            // not implemented it in Spice3 either), round-tripped.
+            "itl3" => {
+                analysis.config.itl3 =
+                    Some(parse_value(value).map_err(SimError::Parse)?.max(1.0) as usize)
+            }
+            // Total transient iteration budget; 0 = no limit (the default).
+            "itl5" => {
+                let n = parse_value(value).map_err(SimError::Parse)?.max(0.0) as usize;
+                analysis.config.itl5 = if n == 0 { None } else { Some(n) };
+            }
+            // Integration order cap: 1 forces backward Euler, 2..6 can only
+            // widen (the engine tops out at trapezoidal/Gear-2).
+            "maxord" => {
+                let n = parse_value(value).map_err(SimError::Parse)?;
+                if n < 0.5 || n > 6.5 {
+                    return Err(SimError::Parse(format!(
+                        "line {line_no}: .options maxord={value} must be 1..=6"
+                    )));
+                }
+                analysis.config.maxord = Some(n.round() as u32);
+            }
+            // The KEY=VALUE spellings of the bare boolean flags above.
+            "accurate" => {
+                analysis.config.accurate =
+                    parse_value(value).map_err(SimError::Parse)? > 0.0
+            }
+            "solvehold" => {
+                analysis.config.solvehold =
+                    parse_value(value).map_err(SimError::Parse)? > 0.0
+            }
+            // LTspice's `srcsteps` synonym (default 25 there; 0 stops the
+            // source-stepping ladder).
+            "itl6" => {
+                analysis.config.srcsteps =
+                    parse_value(value).map_err(SimError::Parse)?.max(0.0) as usize
+            }
             // LTspice's truncated-error overestimation factor in the
             // adaptive stepper (TODO §3): the LTE estimate rides ~trtol
             // bigger steps.
@@ -472,8 +695,7 @@ pub(super) fn parse_options(
             }
             // Parsed but not applied yet; keep them as warnings instead of
             // pretending the engine honours them.
-            "itl2" | "itl6" | "maxord" | "tnom" | "temp"
-            | "accurate" | "solvehold" | "plotwinsize" | "numdgt" => {
+            "tnom" | "temp" | "plotwinsize" | "numdgt" => {
                 warnings.push(format!(
                     "line {line_no}: .options {key}={value} is parsed but not applied yet"
                 ));
@@ -1147,6 +1369,9 @@ pub(super) fn emit_commands(analysis: &AnalysisCommands, out: &mut String) {
         if analysis.tran_uic {
             line.push_str(" UIC");
         }
+        if analysis.tran_nodiscard {
+            line.push_str(" nodiscard");
+        }
         if analysis.tran_startup {
             line.push_str(" STARTUP");
         }
@@ -1205,6 +1430,25 @@ pub(super) fn emit_commands(analysis: &AnalysisCommands, out: &mut String) {
     }
     if analysis.config.trtol != 2.0 {
         options.push_str(&format!(" trtol={}", analysis.config.trtol));
+    }
+    if let Some(itl2) = analysis.config.itl2 {
+        options.push_str(&format!(" itl2={itl2}"));
+    }
+    if let Some(itl3) = analysis.config.itl3 {
+        options.push_str(&format!(" itl3={itl3}"));
+    }
+    if let Some(itl5) = analysis.config.itl5 {
+        options.push_str(&format!(" itl5={itl5}"));
+    }
+    if let Some(maxord) = analysis.config.maxord {
+        options.push_str(&format!(" maxord={maxord}"));
+    }
+    // Flag options re-emit bare, as PSpice spells them.
+    if analysis.config.accurate {
+        options.push_str(" accurate");
+    }
+    if analysis.config.solvehold {
+        options.push_str(" solvehold");
     }
     if analysis.config.fast_math {
         options.push_str(" fastmath=1");
@@ -1286,6 +1530,48 @@ pub(super) fn emit_commands(analysis: &AnalysisCommands, out: &mut String) {
     }
     for e in &analysis.ic {
         out.push_str(&format!(".ic V({})={}\n", e.node, e.value));
+    }
+    // Output selection: `.save` selectors reprint as `probe(name)`, the
+    // keep list as a `.keepnode` comma row, and the bias-file cards
+    // verbatim in LTspice argument order.
+    if !analysis.save.is_empty() {
+        let line: Vec<String> = analysis
+            .save
+            .iter()
+            .map(|s| format!("{}({})", s.probe, s.name))
+            .collect();
+        out.push_str(&format!(".save {}\n", line.join(" ")));
+    }
+    if !analysis.keepnodes.is_empty() {
+        out.push_str(&format!(".keepnode {}\n", analysis.keepnodes.join(", ")));
+    }
+    if let Some(cmd) = &analysis.savebias {
+        let mut line = format!(".savebias {}", cmd.file);
+        if cmd.internal {
+            line.push_str(" internal");
+        }
+        if let Some(temp) = cmd.temp {
+            line.push_str(&format!(" temp={temp}"));
+        }
+        if let Some(time) = cmd.time {
+            line.push_str(&format!(" time={time}"));
+        }
+        if cmd.repeat {
+            line.push_str(" repeat");
+        }
+        if let Some(step) = cmd.step {
+            line.push_str(&format!(" step={step}"));
+        }
+        for (i, value) in cmd.dc.iter().enumerate() {
+            if let Some(value) = value {
+                line.push_str(&format!(" DC{}={value}", i + 1));
+            }
+        }
+        out.push_str(&line);
+        out.push('\n');
+    }
+    if let Some(spec) = &analysis.loadbias {
+        out.push_str(&format!(".loadbias {spec}\n"));
     }
 }
 

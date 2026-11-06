@@ -1212,6 +1212,55 @@ impl Circuit {
         self.opamp_models.get(model).cloned().unwrap_or_default()
     }
 
+    // ── Read-only views for frontends ───────────────────────────────────
+    //
+    // The model maps and the controlled-source / coupling families stay
+    // `pub(crate)` (parsing is the only writer, ADR 0001). A frontend that
+    // *draws* a deck still has to know a device's polarity and read the
+    // families it cannot reach as fields, so these are plain read views —
+    // they add no way to write a `Circuit`.
+
+    /// Channel polarity of the MOSFET model card `model` (lowercased card
+    /// name, as stored on the element); `None` for an unknown card.
+    pub fn mosfet_type(&self, model: &str) -> Option<MosfetType> {
+        self.mosfet_models.get(model).map(|m| m.kind.clone())
+    }
+
+    /// Polarity of the BJT model card `model`; `None` for an unknown card.
+    pub fn bjt_type(&self, model: &str) -> Option<BjtType> {
+        self.bjt_models.get(model).map(|m| m.kind.clone())
+    }
+
+    /// Channel type of the JFET model card `model`; `None` for an unknown card.
+    pub fn jfet_type(&self, model: &str) -> Option<JfetType> {
+        self.jfet_models.get(model).map(|m| m.kind.clone())
+    }
+
+    /// Voltage-controlled voltage sources (`E`), in card order.
+    pub fn vcvs(&self) -> &[ControlledSource] {
+        &self.vcvs
+    }
+
+    /// Voltage-controlled current sources (`G`), in card order.
+    pub fn vccs(&self) -> &[ControlledSource] {
+        &self.vccs
+    }
+
+    /// Current-controlled voltage sources (`H`), in card order.
+    pub fn ccvs(&self) -> &[ControlledSource] {
+        &self.ccvs
+    }
+
+    /// Current-controlled current sources (`F`), in card order.
+    pub fn cccs(&self) -> &[ControlledSource] {
+        &self.cccs
+    }
+
+    /// Coupled-inductor pairs (`K`), in card order.
+    pub fn mutual_inductances(&self) -> &[MutualInductance] {
+        &self.mutual_inductances
+    }
+
     /// Split every diode with a nonzero `RS` into a series resistor and an
     /// internal junction node. Model cards may appear after their elements, so
     /// this runs once at the end of parsing rather than in the element walk.

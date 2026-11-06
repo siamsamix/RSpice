@@ -73,9 +73,16 @@ below is written against that state.
 - [x] **[P1] (both)** Initial-condition directives: `.ic` (bias/transient startup) and `.nodeset` —
   done: both parse (fused/split spellings), node names resolve loudly; `.ic` pins a `UIC` transient's
   t=0 state, `.nodeset` seeds (never forces) the DC iteration.
-- [ ] **[P2] (both)** Full `.options` surface: `reltol`, `vntol`, `abstol`, `gmin`, `itl1..itl6`,
-  `maxord`, `method`, PSpice `accurate`/`solvehold` style flags — parsed and honored.
-- [ ] **[P2] (LT)** Waveform/data selection directives: `.save`, `.keep`, `.savebias`, `.loadbias`.
+- [x] **[P2] (both)** Full `.options` surface: `reltol`, `vntol`, `abstol`, `gmin`, `itl1..itl6`,
+  `maxord`, `method`, PSpice `accurate`/`solvehold` style flags — parsed and honored. *(done: `itl2`
+  bounds the DC rung budget, `itl5` the transient Newton budget, `itl6` is the `srcsteps` synonym,
+  `maxord` validates 1..=6 (`1` forces Gear1), `accurate` drives trtol to 1.0, `solvehold` is
+  accepted/remembered/round-tripped; `itl3` and `method` are recognized-inert, the rest warn.)*
+- [x] **[P2] (LT)** Waveform/data selection directives: `.save`, `.keep`, `.savebias`, `.loadbias` —
+  done: `.save` prunes the raw dataset to listed probes (family words `I(Q1)`→`Ic(Q1)`, glob
+  `*`/`?`), `.keep`/`.keepnode` pin named nodes inside the pruned run, `.tran` emits ` nodiscard`
+  with them, `.loadbias` resolves its deck through the library search and folds its `.nodeset`/`.ic`
+  lines, and `.savebias` writes LTspice-ordered snapshots for `tran`/`dc_sweep`/`op` points.
 - [ ] **[P2] (LT)** `.csparam` support (feeds `.meas` results across stepped runs).
 - [ ] **[P2] (PS)** Node aliasing blocks `.aliases`/`.endaliases` for probe names.
 - [ ] **[P2] (both)** Output-file directives & simulation log: `.probe` (PS), `.out`/`.log` with
@@ -444,9 +451,30 @@ below is written against that state.
 
 ## 7. Schematic GUI
 
+- [ ] **[P1] (spot)** Schematic-first workflow: drawing the schematic is the primary way a circuit
+  enters the app. Currently it is netlist-first — the `.cir` netlist text is the source of truth,
+  built by hand or by the schematic-to-netlist part of this app, and Run/F5 simulates `self.netlist`
+  as it stands (`app.rs` `run_simulation`), so a run after schematic edits compiles the *stale* deck
+  until the user clicks Generate Netlist first. Wanted: the app silently regenerates the netlist from
+  the schematic and simulates according to it — LTspice runs exactly this way (verified against the
+  shipped help: `generalpurposeschematicdrivenspi.htm` "General Purpose Schematic Driven SPICE"; the
+  netlist is a by-product surfaced on demand via View ▸ SPICE netlist, `spicenetlist.htm`).
+- [ ] **[P1] (spot)** Two different buttons on the netlist window: one converting the netlist into a
+  schematic (reuse `import_schematic`/`generate_schematic_from_netlist` + `schematic.rs`
+  `from_netlist_with_options`, `autolayout.rs`; switch to the `.asc` tab only on success, as Tools ▸
+  Import Netlist to Schematic already does), and another to simulate directly from the netlist
+  without creating a schematic — LTspice does exactly this for deck files (verified:
+  `spicenetlist.htm`, "open the text file first and then run it"); under the schematic-first loop this
+  is the run-the-literal-deck path, which must not be silently regenerated from the schematic. Beyond
+  both reference tools: LTspice turns only a `.subckt` definition into a symbol
+  (`automaticsymbolgeneration.htm`), never a whole netlist into a schematic. The netlist pane is a
+  bare multiline edit today (`app.rs` `editor_body`) and both maneuvers live only in the Tools menu.
 - [ ] **[P1] (both)** Schematic symbols for every device family — at minimum diode, MOSFET, BJT,
   current/control/behavioral sources, switches, transformers, transmission lines, opamps; the editor is
-  `R C L V Gnd`-only today.
+  `R C L V Gnd`-only today. *(Partly done via the symbol library: diode, N/P MOSFET, NPN/PNP, `I`, `E`/`G`/`B`,
+  switch, op-amp and a generic subcircuit symbol are placeable from Edit ▸ Component / F2. Still missing as
+  symbols: JFET, `F`/`H` controlled sources, `W` current switch, transformer, transmission line — add them as
+  `SYMBOL` blocks in `libs/standard.sym`; `D/M/X` cards in imported decks are still counted, not drawn.)*
 - [x] **[P1] (both)** Symbol library format with attached model/.subckt references and a component
   picker: placing `MM1` should be able to attach `model=...`/`spiceline` data.
   Done: `circuitsim::symbols` + `libs/standard.sym` (own `.sym` text format: pins, drawing, MODEL/SUBCKT,

@@ -5,12 +5,12 @@
 //! netlist are one round trip apart, and both directions live in this module.
 
 use circuitsim::circuit::{
-    Capacitor as CsCapacitor, Circuit as CsCircuit, Inductor as CsInductor, NodeId,
+    Ac as CsAc, Capacitor as CsCapacitor, Circuit as CsCircuit, Inductor as CsInductor, NodeId,
     Resistor as CsResistor, VoltageSource as CsVoltageSource,
 };
 use circuitsim::netlist::{
-    deck_directives, emit as netlist_emit, parse_with_options, AcCommand, AcScale,
-    AnalysisCommands, Netlist, ParseOptions,
+    deck_directives, emit as netlist_emit, parse_source_value, parse_with_options, AcCommand,
+    AcScale, AnalysisCommands, Netlist, ParseOptions, SourceValue,
 };
 use circuitsim::symbols::{Symbol, SymbolLibrary};
 use circuitsim::units::parse_value;
@@ -995,12 +995,22 @@ impl SchematicState {
                     l_idx += 1;
                 }
                 CompKind::Voltage => {
-                    let voltage = parse_value(&c.val)
-                        .map_err(|e| format!("V{v_idx} value '{}': {e}", c.val))?;
+                    // A source's text is the card's value grammar (`5`, `DC 5`,
+                    // `AC 1 0`, `PULSE(…)`): the popup writes `DC 5` and a fresh
+                    // part drops with it, which the plain number parser rejected.
+                    let (voltage, waveform, ac) = match parse_source_value(&c.val, &ParseOptions::default())
+                        .map_err(|e| format!("V{v_idx} value '{}': {e}", c.val))?
+                    {
+                        SourceValue::Dc { value } => (value, None, None),
+                        SourceValue::Ac { magnitude, phase } => {
+                            (0.0, None, Some(CsAc { mag: magnitude, phase }))
+                        }
+                        SourceValue::Waveform(w) => (0.0, Some(w), None),
+                    };
                     circuit.voltage_sources.push(CsVoltageSource {
                         name: format!("V{v_idx}"),
                         n1, n2, voltage,
-                        waveform: None, ac: None,
+                        waveform, ac,
                     });
                     v_idx += 1;
                 }
@@ -1965,5 +1975,19 @@ mod tests {
         let d: Vec<&str> = deck.lines().find(|l| l.starts_with("D1 ")).unwrap().split_whitespace().collect();
         let r: Vec<&str> = deck.lines().find(|l| l.starts_with("R1 ")).unwrap().split_whitespace().collect();
         assert_eq!(d[2], r[1], "{deck}");
+    }
+
+    #[test]
+    fn a_freshly_placed_source_builds_with_its_default_value() {
+        let mut st = SchematicState::default();
+        st.tool = Tool::V;
+        st.place_at(GridPt(0, 0));
+        assert_eq!(st.components[0].val, "DC 5");
+        let net = st.build_netlist().expect("the default value builds");
+        assert_eq!(net.circuit.voltage_sources[0].voltage, 5.0);
+        st.components[0].val = "PULSE(0 5 1m 1u 1u 5m 10m)".into();
+        assert!(st.deck_text().expect("a waveform builds").contains("PULSE"));
+        st.components[0].val = "AC 1 0".into();
+        assert!(st.deck_text().unwrap().contains("AC"));
     }
 }

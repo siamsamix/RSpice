@@ -3,6 +3,7 @@ mod autolayout;
 mod chrome;
 mod icons;
 mod lt_viewer;
+mod parts;
 mod plot;
 mod props;
 mod schematic;

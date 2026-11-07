@@ -10,9 +10,10 @@ use circuitsim::circuit::{
 };
 use circuitsim::netlist::{
     deck_directives, emit as netlist_emit, emit_source_card, parse_source_card,
-    parse_with_options, AcCommand, AcScale, AnalysisCommands, Netlist, ParseOptions,
-    SourceCard,
+    parse_with_options, AcCommand, AcScale, AnalysisCommands, Netlist,
+    ParseOptions, SourceCard,
 };
+use circuitsim::symbols::{Symbol, SymbolLibrary};
 use circuitsim::units::parse_value;
 use crate::autolayout::{ORIGIN_X, ORIGIN_Y};
 use egui::{Pos2, Vec2};
@@ -51,6 +52,9 @@ pub enum CompKind {
     Inductor,
     Voltage,
     Ground,
+    /// A library symbol (diode, MOSFET, subcircuit …): pins, drawing and
+    /// attached SPICE data come from its [`PartData`].
+    Part,
 }
 
 #[derive(Clone)]
@@ -58,6 +62,8 @@ pub struct Component {
     pub kind: CompKind,
     pub p1: GridPt,
     pub p2: GridPt,
+    /// The value text. For a [`CompKind::Part`] this is the attached model or
+    /// `.subckt` name (the reference the card carries after its nodes).
     pub val: String,
     /// Property-dialog extras, keyed by name (all values are user text).
     ///
@@ -70,6 +76,8 @@ pub struct Component {
     /// [`SchematicState::build_netlist`]): `rser` (C, L, V), `lser` (C),
     /// `rpar` (C, L), `cpar` (C, L, V). Empty or zero = absent.
     pub attrs: std::collections::BTreeMap<String, String>,
+    /// Present exactly when `kind` is [`CompKind::Part`].
+    pub part: Option<PartData>,
 }
 
 /// One main element whose `attrs` may ask for parasitic arms
@@ -182,6 +190,91 @@ fn expand_parasitics(
     Ok(())
 }
 
+/// What a placed library symbol carries beyond the two-terminal fields.
+/// `Component::p1` / `p2` hold the symbol's first two pins (pin order is the
+/// SPICE card's node order); the rest sit in `extra`, so every pin has one
+/// home and moving a part cannot leave a pin behind.
+#[derive(Clone, PartialEq, Debug)]
+pub struct PartData {
+    /// The library symbol's name (looked up in [`SchematicState::symbols`]).
+    pub symbol: String,
+    /// The card's first letter, kept here so instance numbering needs no
+    /// library lookup.
+    pub prefix: char,
+    /// Quarter turns of the symbol's authored frame, for the drawing.
+    pub rot: u8,
+    /// Pins 3…n, absolute.
+    pub extra: Vec<GridPt>,
+    /// Total pin count (a one-pin symbol keeps `p2 == p1`).
+    pub pin_count: usize,
+    /// Explicit instance name (`MM1`); empty numbers it automatically.
+    pub name: String,
+    /// Extra card text after the reference (`W=10u L=1u`).
+    pub spiceline: String,
+}
+
+impl Component {
+    /// A two-terminal / ground component without part data.
+    pub fn basic(kind: CompKind, p1: GridPt, p2: GridPt, val: impl Into<String>) -> Self {
+        Self { kind, p1, p2, val: val.into(), attrs: Default::default(), part: None }
+    }
+
+    /// Place library `symbol` with its origin pin at `at`, turned `rot`
+    /// quarter turns, carrying the symbol's default reference and spiceline.
+    pub fn from_symbol(symbol: &Symbol, at: GridPt, rot: u8) -> Self {
+        let pins: Vec<GridPt> = symbol
+            .pins
+            .iter()
+            .map(|pin| {
+                let (x, y) = turn((pin.x, pin.y), rot);
+                GridPt(at.0 + x, at.1 + y)
+            })
+            .collect();
+        Self {
+            kind: CompKind::Part,
+            attrs: Default::default(),
+            p1: pins[0],
+            p2: pins.get(1).copied().unwrap_or(pins[0]),
+            val: symbol.reference.clone(),
+            part: Some(PartData {
+                symbol: symbol.name.clone(),
+                prefix: symbol.prefix,
+                rot: rot % 4,
+                extra: pins.iter().skip(2).copied().collect(),
+                pin_count: pins.len(),
+                name: String::new(),
+                spiceline: symbol.spiceline.clone(),
+            }),
+        }
+    }
+
+    /// The connection points that join the node assignment, in pin order. A
+    /// two-terminal component contributes both ends (a ground's coincide).
+    pub fn pin_points(&self) -> Vec<GridPt> {
+        match &self.part {
+            None => vec![self.p1, self.p2],
+            Some(part) => {
+                let mut pts = vec![self.p1];
+                if part.pin_count >= 2 {
+                    pts.push(self.p2);
+                }
+                pts.extend(part.extra.iter().copied());
+                pts
+            }
+        }
+    }
+}
+
+/// One quarter turn of the editor's rotation, `(x, y) → (−y, x)` — the law
+/// `rotate_selected` has always applied (it takes Right to Down).
+pub fn turn(pt: (i32, i32), quarter_turns: u8) -> (i32, i32) {
+    let (mut x, mut y) = pt;
+    for _ in 0..(quarter_turns % 4) {
+        (x, y) = (-y, x);
+    }
+    (x, y)
+}
+
 /// A value in SPICE engineering notation (`1k`, `4.7u`, `100n`) when that
 /// spelling parses back to exactly `v`; otherwise plain decimal, which
 /// `parse_value` always re-parses.
@@ -217,19 +310,37 @@ pub fn fmt_si(v: f64) -> String {
 /// symbols are not elements and get an empty name.
 pub fn instance_names(components: &[Component]) -> Vec<String> {
     let (mut r, mut c, mut l, mut v) = (0, 0, 0, 0);
+    // Library parts count per prefix letter (`D1`, `M1`, `M2`, `X1`); a part
+    // the user named keeps its name and its number is never handed out again.
+    let taken: HashSet<String> = components
+        .iter()
+        .filter_map(|comp| comp.part.as_ref())
+        .filter(|part| !part.name.is_empty())
+        .map(|part| part.name.to_ascii_lowercase())
+        .collect();
+    let mut per_prefix: HashMap<char, usize> = HashMap::new();
     components
         .iter()
-        .map(|comp| match comp.kind {
-            CompKind::Resistor => { r += 1; format!("R{r}") }
-            CompKind::Capacitor => { c += 1; format!("C{c}") }
-            CompKind::Inductor => { l += 1; format!("L{l}") }
-            CompKind::Voltage => { v += 1; format!("V{v}") }
-            CompKind::Ground => String::new(),
+        .map(|comp| match (comp.kind, &comp.part) {
+            (CompKind::Resistor, _) => { r += 1; format!("R{r}") }
+            (CompKind::Capacitor, _) => { c += 1; format!("C{c}") }
+            (CompKind::Inductor, _) => { l += 1; format!("L{l}") }
+            (CompKind::Voltage, _) => { v += 1; format!("V{v}") }
+            (CompKind::Part, Some(part)) if !part.name.is_empty() => part.name.clone(),
+            (CompKind::Part, Some(part)) => loop {
+                let n = per_prefix.entry(part.prefix).or_insert(0);
+                *n += 1;
+                let candidate = format!("{}{}", part.prefix, n);
+                if !taken.contains(&candidate.to_ascii_lowercase()) {
+                    break candidate;
+                }
+            },
+            (CompKind::Part, None) | (CompKind::Ground, _) => String::new(),
         })
         .collect()
 }
 
-#[derive(Clone)]
+#[derive(Clone, PartialEq, Debug)]
 pub struct Wire {
     pub p1: GridPt,
     pub p2: GridPt,
@@ -338,8 +449,7 @@ impl NodeAssignment {
         //    including it here matches the historical writer exactly).
         let mut points = HashSet::new();
         for c in components {
-            points.insert(c.p1);
-            points.insert(c.p2);
+            points.extend(c.pin_points());
         }
         for w in wires {
             points.insert(w.p1);
@@ -526,7 +636,7 @@ impl Direction {
 }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum Tool { Select, Wire, R, C, L, V, Gnd, Label, Directive }
+pub enum Tool { Select, Wire, R, C, L, V, Gnd, Label, Directive, Part }
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum AnalysisType { Tran, Ac }
@@ -545,6 +655,11 @@ pub struct SchematicState {
     pub wires: Vec<Wire>,
     pub labels: Vec<NetLabel>,
     pub directives: Vec<Directive>,
+    /// The symbol library the component picker offers and parts resolve
+    /// through (the shipped `standard.sym`, plus any library the user loaded).
+    pub symbols: SymbolLibrary,
+    /// The library symbol the Part tool places on each click.
+    pub armed_part: Option<String>,
     /// The annotation under the Select tool's cursor, by index.
     pub selected_note: Option<Note>,
     /// Text armed for the Label / Directive tool: the next canvas click
@@ -574,6 +689,8 @@ impl Default for SchematicState {
             wires: vec![],
             labels: vec![],
             directives: vec![],
+            symbols: SymbolLibrary::builtin(),
+            armed_part: None,
             selected_note: None,
             pending_text: String::new(),
             active_wire_start: None,
@@ -605,72 +722,70 @@ impl SchematicState {
     }
 
     /// Rotate the selected component 90 degrees around `p1`, re-attaching
-    /// the wires that touch its rotated pin. True if something rotated.
+    /// the wires that touch its rotated pins. True if something rotated.
     pub fn rotate_selected(&mut self) -> bool {
-        let Some((old_p2, new_p2)) = self
-            .selected_component
-            .and_then(|idx| self.components.get_mut(idx))
-            .map(|c| {
-                let old_p2 = c.p2;
-                let dx = c.p2.0 - c.p1.0;
-                let dy = c.p2.1 - c.p1.1;
-                // 90-degree rotation formula: (x, y) -> (-y, x)
-                c.p2 = GridPt(c.p1.0 - dy, c.p1.1 + dx);
-                (old_p2, c.p2)
-            })
-        else {
+        let Some(idx) = self.selected_component.filter(|&i| i < self.components.len()) else {
             return false;
         };
-        // Keep wires and labels attached to the rotated pin
-        for w in self.wires.iter_mut() {
-            if w.p1 == old_p2 {
-                w.p1 = new_p2;
-            }
-            if w.p2 == old_p2 {
-                w.p2 = new_p2;
-            }
-        }
-        for l in self.labels.iter_mut() {
-            if l.at == old_p2 {
-                l.at = new_p2;
-            }
+        let origin = self.components[idx].p1;
+        self.retarget_pins(idx, |pt| {
+            // 90-degree rotation formula about p1: (x, y) -> (-y, x)
+            let (x, y) = turn((pt.0 - origin.0, pt.1 - origin.1), 1);
+            GridPt(origin.0 + x, origin.1 + y)
+        });
+        if let Some(part) = self.components[idx].part.as_mut() {
+            part.rot = (part.rot + 1) % 4;
         }
         true
     }
 
-    /// Drag a selected component by a grid delta; wires attached at either
-    /// of its pins stretch by the same delta. True if the component moved.
+    /// Drag a selected component by a grid delta; wires attached at any of
+    /// its pins stretch by the same delta. True if the component moved.
     pub fn drag_component(&mut self, idx: usize, dx: i32, dy: i32) -> bool {
-        let Some(pins) = self.components.get_mut(idx).map(|c| {
-            let pins = (c.p1, c.p2);
-            // Move component endpoints
-            c.p1.0 += dx;
-            c.p1.1 += dy;
-            c.p2.0 += dx;
-            c.p2.1 += dy;
-            pins
-        }) else {
+        if idx >= self.components.len() {
             return false;
-        };
-        // Stretch wires attached to the component's pins
-        for w in self.wires.iter_mut() {
-            if w.p1 == pins.0 || w.p1 == pins.1 {
-                w.p1.0 += dx;
-                w.p1.1 += dy;
+        }
+        self.retarget_pins(idx, |pt| GridPt(pt.0 + dx, pt.1 + dy));
+        true
+    }
+
+    /// Move every pin of component `idx` through `to_new`, then carry the
+    /// wire ends and net labels that sat on an old pin to its new place. The
+    /// old→new pairs are collected first and applied in one lookup, so a pin
+    /// that lands on another pin's old point never drags that pin's wires
+    /// along twice.
+    fn retarget_pins(&mut self, idx: usize, to_new: impl Fn(GridPt) -> GridPt) {
+        let c = &mut self.components[idx];
+        let moves: HashMap<GridPt, GridPt> = c
+            .pin_points()
+            .into_iter()
+            .map(|old| (old, to_new(old)))
+            .filter(|(old, new)| old != new)
+            .collect();
+        c.p1 = to_new(c.p1);
+        c.p2 = to_new(c.p2);
+        if let Some(part) = c.part.as_mut() {
+            for pt in part.extra.iter_mut() {
+                *pt = to_new(*pt);
             }
-            if w.p2 == pins.0 || w.p2 == pins.1 {
-                w.p2.0 += dx;
-                w.p2.1 += dy;
+        }
+        if moves.is_empty() {
+            return;
+        }
+        for w in self.wires.iter_mut() {
+            if let Some(&new) = moves.get(&w.p1) {
+                w.p1 = new;
+            }
+            if let Some(&new) = moves.get(&w.p2) {
+                w.p2 = new;
             }
         }
         // A label sitting on a pin names that pin's net: it travels with it.
         for l in self.labels.iter_mut() {
-            if l.at == pins.0 || l.at == pins.1 {
-                l.at.0 += dx;
-                l.at.1 += dy;
+            if let Some(&new) = moves.get(&l.at) {
+                l.at = new;
             }
         }
-        true
     }
 
     /// One click of the wire tool: opens a wire or closes the in-flight
@@ -685,14 +800,23 @@ impl SchematicState {
 
     /// Drop a fresh component of the active tool at a grid point — the
     /// tool's default value, oriented by the placement direction (grounds
-    /// are pins, not directed elements, so both points coincide).
+    /// are pins, not directed elements, so both points coincide). The Part
+    /// tool places its armed library symbol, carrying the symbol's default
+    /// model/subckt reference and spiceline.
     pub fn place_at(&mut self, at: GridPt) {
         match self.tool {
             Tool::Gnd => {
-                self.components.push(Component {
-                    kind: CompKind::Ground, p1: at, p2: at, val: "".into(),
-                    attrs: Default::default(),
-                });
+                self.components.push(Component::basic(CompKind::Ground, at, at, ""));
+                return;
+            }
+            Tool::Part => {
+                // A symbol that vanished from the library (or was never
+                // armed) places nothing; `arm_part` is where it is refused.
+                let Some(symbol) = self.armed_part.as_deref().and_then(|n| self.symbols.get(n)) else {
+                    return;
+                };
+                let rot = self.current_dir_turns();
+                self.components.push(Component::from_symbol(symbol, at, rot));
                 return;
             }
             Tool::R | Tool::C | Tool::L | Tool::V => {}
@@ -709,13 +833,30 @@ impl SchematicState {
 
         // Calculate P2 based on current rotation direction
         let (dx, dy) = self.current_dir.offset(3);
-        self.components.push(Component {
-            kind,
-            p1: at,
-            p2: GridPt(at.0 + dx, at.1 + dy),
-            val,
-            attrs: Default::default(),
-        });
+        self.components.push(Component::basic(kind, at, GridPt(at.0 + dx, at.1 + dy), val));
+    }
+
+    /// The placement facing as quarter turns of a symbol's authored frame
+    /// (authored facing right, so Right is no turn).
+    pub fn current_dir_turns(&self) -> u8 {
+        match self.current_dir {
+            Direction::Right => 0,
+            Direction::Down => 1,
+            Direction::Left => 2,
+            Direction::Up => 3,
+        }
+    }
+
+    /// Arm the Part tool with library symbol `name`: the picker's OK. An
+    /// unknown name is refused here, not at the click.
+    pub fn arm_part(&mut self, name: &str) -> Result<(), String> {
+        let symbol = self
+            .symbols
+            .get(name)
+            .ok_or_else(|| format!("no symbol named '{name}' in the library"))?;
+        self.armed_part = Some(symbol.name.clone());
+        self.tool = Tool::Part;
+        Ok(())
     }
 
     /// Apply a selection computed by the canvas hit-test.
@@ -883,7 +1024,7 @@ impl SchematicState {
         let mut pts = self
             .components
             .iter()
-            .flat_map(|c| [c.p1, c.p2])
+            .flat_map(|c| c.pin_points())
             .chain(self.wires.iter().flat_map(|w| [w.p1, w.p2]))
             .chain(self.labels.iter().map(|l| l.at))
             .chain(self.directives.iter().map(|d| d.at))
@@ -932,6 +1073,16 @@ impl SchematicState {
 
         for c in &self.components {
             if c.kind == CompKind::Ground { continue; }
+
+            // A library part is a free-text card (see `part_cards`), not a
+            // typed element — but its pins still own nets: registering them
+            // here keeps their numbers and label names in this circuit.
+            if c.kind == CompKind::Part {
+                for pin in c.pin_points() {
+                    circuit.ensure_node(assignment.node_of(pin));
+                }
+                continue;
+            }
 
             let n1 = NodeId(assignment.node_of(c.p1));
             let n2 = NodeId(assignment.node_of(c.p2));
@@ -1009,7 +1160,7 @@ impl SchematicState {
                     });
                     v_idx += 1;
                 }
-                CompKind::Ground => unreachable!(),
+                CompKind::Ground | CompKind::Part => unreachable!(),
             }
         }
 
@@ -1097,23 +1248,80 @@ impl SchematicState {
         })
     }
 
+    /// The SPICE cards of the placed library parts, in component order, plus
+    /// the `.include` lines their symbols' libraries need (each file once,
+    /// and not when a directive on the canvas already includes it).
+    ///
+    /// A part is one card — `<name> <pin nets…> <model|subckt> <spiceline>` —
+    /// written from the symbol, with the nets spelled exactly as the typed
+    /// elements spell them (`netlist`'s node names: labels, else numbers).
+    pub fn part_cards(&self, netlist: &Netlist) -> Result<(Vec<String>, Vec<String>), String> {
+        let assignment = NodeAssignment::of(&self.components, &self.wires, &self.labels);
+        let names = instance_names(&self.components);
+        let mut seen: HashSet<String> = HashSet::new();
+        for part in self.components.iter().filter_map(|c| c.part.as_ref()) {
+            if !part.name.is_empty() && !seen.insert(part.name.to_ascii_lowercase()) {
+                return Err(format!("instance name '{}' is used by two parts", part.name));
+            }
+        }
+
+        let (mut includes, mut cards): (Vec<String>, Vec<String>) = (Vec::new(), Vec::new());
+        for (c, name) in self.components.iter().zip(&names) {
+            let Some(part) = c.part.as_ref() else { continue };
+            let symbol = self.symbols.get(&part.symbol).ok_or_else(|| {
+                format!("{name}: symbol '{}' is not in the library", part.symbol)
+            })?;
+            let nets: Vec<String> = c
+                .pin_points()
+                .into_iter()
+                .map(|pin| match assignment.node_of(pin) {
+                    0 => "0".to_string(),
+                    node => netlist.circuit.node_name(node).to_string(),
+                })
+                .collect();
+            cards.push(symbol.card(name, &nets, &c.val, &part.spiceline).map_err(|e| match e {
+                circuitsim::SimError::Circuit(msg) | circuitsim::SimError::Parse(msg) => msg,
+                other => other.to_string(),
+            })?);
+            if let Some(lib) = &symbol.lib {
+                let already = |l: &String| l.eq_ignore_ascii_case(lib);
+                let on_canvas = self.directives.iter().any(|d| {
+                    d.text.lines().any(|line| {
+                        let mut words = line.split_whitespace();
+                        matches!(words.next(), Some(w) if w.eq_ignore_ascii_case(".include") || w.eq_ignore_ascii_case(".lib"))
+                            && words.next().is_some_and(|f| f.trim_matches(['"', '\'']).eq_ignore_ascii_case(lib))
+                    })
+                });
+                if !on_canvas && !includes.iter().any(already) {
+                    includes.push(lib.clone());
+                }
+            }
+        }
+        Ok((includes.into_iter().map(|l| format!(".include {l}")).collect(), cards))
+    }
+
     /// The deck text the schematic stands for: the canonical writer's output
-    /// for the elements and the analysis fields, with every directive's text
-    /// spliced in verbatim ahead of the element cards (where `.param`,
-    /// `.model` and `.subckt` conventionally sit; the deck grammar does not
-    /// care about order, a reader does). This — not [`Self::build_netlist`]
-    /// alone — is what the Generate Netlist command writes and what a run
-    /// of the schematic simulates.
+    /// for the elements and the analysis fields, with the library parts'
+    /// `.include` lines, every directive's text and the part cards spliced in
+    /// verbatim ahead of the element cards (where `.param`, `.model` and
+    /// `.subckt` conventionally sit; the deck grammar does not care about
+    /// order, a reader does). This — not [`Self::build_netlist`] alone — is
+    /// what the Generate Netlist command writes and what a run of the
+    /// schematic simulates.
     pub fn deck_text(&self) -> Result<String, String> {
-        let mut text = netlist_emit(&self.build_netlist()?);
-        if self.directives.is_empty() {
+        let netlist = self.build_netlist()?;
+        let mut text = netlist_emit(&netlist);
+        let (includes, cards) = self.part_cards(&netlist)?;
+        if self.directives.is_empty() && includes.is_empty() && cards.is_empty() {
             return Ok(text);
         }
-        let block: String = self
-            .directives
-            .iter()
-            .map(|d| format!("{}\n", d.text.trim()))
-            .collect();
+        let mut block: String = includes.iter().map(|l| format!("{l}\n")).collect();
+        for d in &self.directives {
+            block.push_str(&format!("{}\n", d.text.trim()));
+        }
+        for card in &cards {
+            block.push_str(&format!("{card}\n"));
+        }
         // The writer opens with a `* Canonical netlist` comment line.
         let after_title = text.find('\n').map_or(text.len(), |i| i + 1);
         text.insert_str(after_title, &block);
@@ -1299,6 +1507,8 @@ impl SchematicState {
         // sweeps, AC wins the UI — the simulation itself still runs both.)
         let mut state = SchematicState {
             tool: previous.tool,
+            symbols: previous.symbols.clone(),
+            armed_part: previous.armed_part.clone(),
             current_dir: previous.current_dir,
             active_wire_start: previous.active_wire_start,
             drag_last_grid: previous.drag_last_grid,
@@ -1357,7 +1567,7 @@ mod tests {
     use circuitsim::netlist::parse;
 
     fn comp(kind: CompKind, x: i32, y: i32, val: &str) -> Component {
-        Component { kind, p1: GridPt(x, y), p2: GridPt(x + 3, y), val: val.to_string(), attrs: Default::default() }
+        Component { kind, p1: GridPt(x, y), p2: GridPt(x + 3, y), val: val.to_string(), attrs: Default::default(), part: None }
     }
 
     #[test]
@@ -1570,10 +1780,10 @@ mod tests {
     fn divider() -> SchematicState {
         let mut st = SchematicState::default();
         st.components = vec![
-            Component { kind: CompKind::Voltage, p1: GridPt(0, 0), p2: GridPt(0, 3), val: "5".into(), attrs: Default::default() },
-            Component { kind: CompKind::Resistor, p1: GridPt(4, 0), p2: GridPt(4, 3), val: "1k".into(), attrs: Default::default() },
-            Component { kind: CompKind::Ground, p1: GridPt(0, 3), p2: GridPt(0, 3), val: "".into(), attrs: Default::default() },
-            Component { kind: CompKind::Ground, p1: GridPt(4, 3), p2: GridPt(4, 3), val: "".into(), attrs: Default::default() },
+            Component { kind: CompKind::Voltage, p1: GridPt(0, 0), p2: GridPt(0, 3), val: "5".into(), attrs: Default::default(), part: None },
+            Component { kind: CompKind::Resistor, p1: GridPt(4, 0), p2: GridPt(4, 3), val: "1k".into(), attrs: Default::default(), part: None },
+            Component { kind: CompKind::Ground, p1: GridPt(0, 3), p2: GridPt(0, 3), val: "".into(), attrs: Default::default(), part: None },
+            Component { kind: CompKind::Ground, p1: GridPt(4, 3), p2: GridPt(4, 3), val: "".into(), attrs: Default::default(), part: None },
         ];
         st.wires = vec![Wire { p1: GridPt(0, 0), p2: GridPt(4, 0) }];
         st
@@ -1622,10 +1832,10 @@ mod tests {
         // Two parts with no wire between them become one net by label alone.
         let mut st = SchematicState::default();
         st.components = vec![
-            Component { kind: CompKind::Resistor, p1: GridPt(0, 0), p2: GridPt(0, 3), val: "1k".into(), attrs: Default::default() },
-            Component { kind: CompKind::Resistor, p1: GridPt(8, 0), p2: GridPt(8, 3), val: "2k".into(), attrs: Default::default() },
-            Component { kind: CompKind::Ground, p1: GridPt(0, 3), p2: GridPt(0, 3), val: "".into(), attrs: Default::default() },
-            Component { kind: CompKind::Ground, p1: GridPt(8, 3), p2: GridPt(8, 3), val: "".into(), attrs: Default::default() },
+            Component { kind: CompKind::Resistor, p1: GridPt(0, 0), p2: GridPt(0, 3), val: "1k".into(), attrs: Default::default(), part: None },
+            Component { kind: CompKind::Resistor, p1: GridPt(8, 0), p2: GridPt(8, 3), val: "2k".into(), attrs: Default::default(), part: None },
+            Component { kind: CompKind::Ground, p1: GridPt(0, 3), p2: GridPt(0, 3), val: "".into(), attrs: Default::default(), part: None },
+            Component { kind: CompKind::Ground, p1: GridPt(8, 3), p2: GridPt(8, 3), val: "".into(), attrs: Default::default(), part: None },
         ];
         let apart = NodeAssignment::of(&st.components, &st.wires, &[]);
         assert_ne!(apart.node_of(GridPt(0, 0)), apart.node_of(GridPt(8, 0)));
@@ -1803,5 +2013,190 @@ mod tests {
         }
         assert!(assignment.conflicts().is_empty());
         assert_eq!(st.labels.len(), 2);
+    }
+
+    // ── Library parts (symbol library + component picker) ───────────────────
+
+    fn libs_options() -> circuitsim::netlist::ParseOptions {
+        circuitsim::netlist::ParseOptions {
+            deck_dir: None,
+            search_paths: vec![std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/../libs"))],
+        }
+    }
+
+    /// An nmos placed at (10,10): D(10,10) G(8,12) S(10,14) B(12,12), source
+    /// grounded and drain labeled `out`.
+    fn schematic_with_nmos() -> SchematicState {
+        let mut s = SchematicState::default();
+        s.current_dir = Direction::Right; // the symbols' authored facing
+        s.arm_part("nmos").unwrap();
+        s.place_at(GridPt(10, 10));
+        s.components.push(Component::basic(CompKind::Ground, GridPt(10, 14), GridPt(10, 14), ""));
+        s.labels.push(NetLabel { at: GridPt(10, 10), name: "out".into() });
+        s
+    }
+
+    #[test]
+    fn placing_a_part_attaches_the_symbols_model_and_spiceline() {
+        let s = schematic_with_nmos();
+        let part = &s.components[0];
+        assert!(part.kind == CompKind::Part);
+        assert_eq!(part.val, "NMOS1", "the model reference starts from the symbol default");
+        assert_eq!(part.part.as_ref().unwrap().spiceline, "W=10u L=1u");
+        assert_eq!(part.pin_points(), [GridPt(10, 10), GridPt(8, 12), GridPt(10, 14), GridPt(12, 12)]);
+    }
+
+    #[test]
+    fn a_placed_part_writes_its_card_with_label_and_ground_nets_and_the_include() {
+        let mut s = schematic_with_nmos();
+        s.components[0].part.as_mut().unwrap().name = "MM1".into();
+        s.components[0].val = "NMOS1".into();
+        s.components[0].part.as_mut().unwrap().spiceline = "W=4u L=0.5u".into();
+        let deck = s.deck_text().unwrap();
+        assert!(deck.contains(".include standard.lib\n"), "{deck}");
+        let card = deck.lines().find(|l| l.starts_with("MM1 ")).unwrap_or_else(|| panic!("{deck}"));
+        let t: Vec<&str> = card.split_whitespace().collect();
+        assert_eq!((t[1], t[3]), ("out", "0"), "{card}");
+        assert_eq!(&t[5..], ["NMOS1", "W=4u", "L=0.5u"], "{card}");
+        // The deck the editor would run reads, and the model resolves.
+        let parsed = circuitsim::netlist::parse_with_options(&deck, &libs_options()).unwrap_or_else(|e| panic!("{e}\n{deck}"));
+        assert_eq!(parsed.circuit.mosfets.len(), 1);
+    }
+
+    #[test]
+    fn the_library_include_is_written_once_and_not_when_a_directive_has_it() {
+        let mut s = SchematicState::default();
+        s.arm_part("diode").unwrap();
+        s.place_at(GridPt(0, 0));
+        s.place_at(GridPt(0, 4));
+        let deck = s.deck_text().unwrap();
+        assert_eq!(deck.matches(".include standard.lib").count(), 1, "{deck}");
+
+        s.directives.push(Directive { at: GridPt(0, 8), text: ".include standard.lib".into() });
+        let deck = s.deck_text().unwrap();
+        assert_eq!(deck.matches(".include standard.lib").count(), 1, "the user's own include is enough: {deck}");
+    }
+
+    #[test]
+    fn parts_number_per_prefix_and_a_chosen_name_is_never_reissued() {
+        let mut s = SchematicState::default();
+        s.arm_part("nmos").unwrap();
+        s.place_at(GridPt(0, 0));
+        s.place_at(GridPt(0, 8));
+        s.place_at(GridPt(0, 16));
+        s.arm_part("diode").unwrap();
+        s.place_at(GridPt(20, 0));
+        s.components[1].part.as_mut().unwrap().name = "M1".into();
+        assert_eq!(instance_names(&s.components), ["M2", "M1", "M3", "D1"]);
+    }
+
+    #[test]
+    fn two_parts_with_one_name_are_refused() {
+        let mut s = SchematicState::default();
+        s.arm_part("diode").unwrap();
+        s.place_at(GridPt(0, 0));
+        s.place_at(GridPt(0, 4));
+        for c in &mut s.components {
+            c.part.as_mut().unwrap().name = "D7".into();
+        }
+        assert!(s.deck_text().unwrap_err().contains("used by two parts"));
+    }
+
+    #[test]
+    fn a_device_without_its_model_name_is_refused_not_written() {
+        let mut s = SchematicState::default();
+        s.arm_part("subckt2").unwrap();
+        s.place_at(GridPt(0, 0));
+        assert!(s.deck_text().unwrap_err().contains("needs a subckt name"));
+        s.components[0].val = "lowpass".into();
+        assert!(s.deck_text().unwrap().contains("X1 "));
+    }
+
+    #[test]
+    fn attached_text_cannot_inject_a_second_card_through_the_editor() {
+        let mut s = schematic_with_nmos();
+        s.components[0].part.as_mut().unwrap().spiceline = "W=1u\nV9 1 0 DC 5".into();
+        assert!(s.deck_text().is_err());
+    }
+
+    #[test]
+    fn an_unknown_symbol_is_refused_when_armed_and_when_the_library_loses_it() {
+        let mut s = SchematicState::default();
+        assert!(s.arm_part("flux-capacitor").is_err());
+        assert!(s.tool == Tool::Select);
+        s.arm_part("diode").unwrap();
+        s.place_at(GridPt(0, 0));
+        s.symbols = SymbolLibrary::default();
+        assert!(s.deck_text().unwrap_err().contains("not in the library"));
+    }
+
+    #[test]
+    fn placement_facing_turns_the_symbol() {
+        let mut s = SchematicState::default();
+        s.arm_part("diode").unwrap();
+        s.current_dir = Direction::Down;
+        s.place_at(GridPt(5, 5));
+        assert_eq!(s.components[0].pin_points(), [GridPt(5, 5), GridPt(5, 8)]);
+        assert_eq!(s.components[0].part.as_ref().unwrap().rot, 1);
+    }
+
+    #[test]
+    fn rotating_a_part_turns_every_pin_and_keeps_wires_on_them() {
+        let mut s = schematic_with_nmos();
+        s.components.pop(); // no ground: only the part and wires here
+        s.labels.clear();
+        // A wire on the gate pin and one on the bulk pin.
+        s.wires.push(Wire { p1: GridPt(8, 12), p2: GridPt(4, 12) });
+        s.wires.push(Wire { p1: GridPt(12, 12), p2: GridPt(16, 12) });
+        s.selected_component = Some(0);
+        assert!(s.rotate_selected());
+        // (dx, dy) -> (-dy, dx) about the drain at (10,10).
+        assert_eq!(s.components[0].pin_points(), [GridPt(10, 10), GridPt(8, 8), GridPt(6, 10), GridPt(8, 12)]);
+        assert_eq!(s.components[0].part.as_ref().unwrap().rot, 1);
+        assert_eq!(s.wires[0].p1, GridPt(8, 8), "the gate wire followed its pin");
+        assert_eq!(s.wires[1].p1, GridPt(8, 12), "the bulk wire followed its pin");
+        // Four turns come home.
+        for _ in 0..3 {
+            s.rotate_selected();
+        }
+        assert_eq!(s.components[0].pin_points(), [GridPt(10, 10), GridPt(8, 12), GridPt(10, 14), GridPt(12, 12)]);
+        assert_eq!((s.wires[0].p1, s.wires[1].p1), (GridPt(8, 12), GridPt(12, 12)));
+    }
+
+    #[test]
+    fn dragging_a_part_moves_every_pin_and_stretches_attached_wires() {
+        let mut s = schematic_with_nmos();
+        s.wires.push(Wire { p1: GridPt(10, 14), p2: GridPt(10, 20) });
+        assert!(s.drag_component(0, 2, 1));
+        assert_eq!(s.components[0].pin_points(), [GridPt(12, 11), GridPt(10, 13), GridPt(12, 15), GridPt(14, 13)]);
+        assert_eq!(s.wires[0], Wire { p1: GridPt(12, 15), p2: GridPt(10, 20) });
+    }
+
+    #[test]
+    fn a_part_only_net_still_gets_a_node_and_pins_join_wired_nets() {
+        let mut s = SchematicState::default();
+        s.current_dir = Direction::Right;
+        s.arm_part("diode").unwrap();
+        s.place_at(GridPt(0, 0)); // A(0,0) K(3,0)
+        s.components.push(Component::basic(CompKind::Resistor, GridPt(3, 0), GridPt(6, 0), "1k"));
+        let deck = s.deck_text().unwrap();
+        // The diode's cathode and the resistor's first end are one net.
+        let d: Vec<&str> = deck.lines().find(|l| l.starts_with("D1 ")).unwrap().split_whitespace().collect();
+        let r: Vec<&str> = deck.lines().find(|l| l.starts_with("R1 ")).unwrap().split_whitespace().collect();
+        assert_eq!(d[2], r[1], "{deck}");
+    }
+
+    #[test]
+    fn a_freshly_placed_source_builds_with_its_default_value() {
+        let mut st = SchematicState::default();
+        st.tool = Tool::V;
+        st.place_at(GridPt(0, 0));
+        assert_eq!(st.components[0].val, "DC 5");
+        let net = st.build_netlist().expect("the default value builds");
+        assert_eq!(net.circuit.voltage_sources[0].voltage, 5.0);
+        st.components[0].val = "PULSE(0 5 1m 1u 1u 5m 10m)".into();
+        assert!(st.deck_text().expect("a waveform builds").contains("PULSE"));
+        st.components[0].val = "AC 1 0".into();
+        assert!(st.deck_text().unwrap().contains("AC"));
     }
 }

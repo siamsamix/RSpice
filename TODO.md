@@ -471,9 +471,17 @@ below is written against that state.
   bare multiline edit today (`app.rs` `editor_body`) and both maneuvers live only in the Tools menu.
 - [ ] **[P1] (both)** Schematic symbols for every device family — at minimum diode, MOSFET, BJT,
   current/control/behavioral sources, switches, transformers, transmission lines, opamps; the editor is
-  `R C L V Gnd`-only today.
-- [ ] **[P1] (both)** Symbol library format with attached model/.subckt references and a component
+  `R C L V Gnd`-only today. *(Partly done via the symbol library: diode, N/P MOSFET, NPN/PNP, `I`, `E`/`G`/`B`,
+  switch, op-amp and a generic subcircuit symbol are placeable from Edit ▸ Component / F2. Still missing as
+  symbols: JFET, `F`/`H` controlled sources, `W` current switch, transformer, transmission line — add them as
+  `SYMBOL` blocks in `libs/standard.sym`; `D/M/X` cards in imported decks are still counted, not drawn.)*
+- [x] **[P1] (both)** Symbol library format with attached model/.subckt references and a component
   picker: placing `MM1` should be able to attach `model=...`/`spiceline` data.
+  Done: `circuitsim::symbols` + `libs/standard.sym` (own `.sym` text format: pins, drawing, MODEL/SUBCKT,
+  LIB, SPICELINE); Edit ▸ Component (F2) picker; a placed part carries its model/subckt + spiceline and
+  writes one card, with `.include` for its library. Limits: symbols are drawn but not yet cross-probed;
+  D/M/X cards in imported decks still become counted, not drawn, parts; R/C/L/V prefixes stay with the
+  built-in tools; the format is RSpice's own, not LTspice `.asy` (not checked against an LTspice install).
 - [x] **[P1] (both)** Net/wire labels with clean node names governing the generated netlist and plot
   names. *(done at the state level, GUI only — `NetLabel` in `schematic.rs`: Edit ▸ Label Net (F4)
   asks for a name, the next click drops it; same-name labels (case-insensitive) are one net even

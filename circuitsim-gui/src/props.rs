@@ -282,7 +282,7 @@ fn rows_for(kind: CompKind) -> Vec<Row> {
             row("rpar", "Parallel Resistance[Ω]:", true, false),
             row("cpar", "Parallel Capacitance[F]:", true, false),
         ],
-        CompKind::Voltage | CompKind::Ground => vec![],
+        CompKind::Voltage | CompKind::Ground | CompKind::Part => vec![],
     }
 }
 
@@ -293,6 +293,7 @@ fn title_for(kind: CompKind) -> &'static str {
         CompKind::Inductor => "Inductor",
         CompKind::Voltage => "Independent Voltage Source",
         CompKind::Ground => "Ground",
+        CompKind::Part => "Part",
     }
 }
 
@@ -312,7 +313,7 @@ pub struct PropsDialog {
 impl PropsDialog {
     /// Open the dialog for component `idx`; `None` for parts without one.
     pub fn open(idx: usize, comp: &Component, name: &str) -> Option<Self> {
-        if comp.kind == CompKind::Ground {
+        if matches!(comp.kind, CompKind::Ground | CompKind::Part) {
             return None;
         }
         let mut fields = comp.attrs.clone();
@@ -619,6 +620,7 @@ mod tests {
             p2: GridPt(0, 4),
             val: val.into(),
             attrs: Default::default(),
+            part: None,
         }
     }
 

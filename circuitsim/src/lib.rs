@@ -24,6 +24,7 @@ pub mod rawcompare;
 pub mod rawwave;
 pub mod runs;
 pub mod sparse;
+pub mod symbols;
 pub mod units;
 
 pub use behavior::{Behavior, BehavioralRuntime, BExpr, MathFn, NoiseKind, ProbeBinding, ProbeSpec};

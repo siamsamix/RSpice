@@ -208,7 +208,7 @@ pub fn layout(parts: &[Part]) -> Layout {
             let bottom = (x, row_y[r] + COMP_LEN);
             let p = &parts[i];
             let (p1, p2) = if p.a == 0 { (bottom, top) } else { (top, bottom) };
-            comps[i] = Some(Component { kind: p.kind, p1: gp(p1), p2: gp(p2), val: p.val.clone(), attrs: Default::default() });
+            comps[i] = Some(Component { kind: p.kind, p1: gp(p1), p2: gp(p2), val: p.val.clone(), attrs: Default::default(), part: None });
             add_pin(&mut nets, node, top, 3);
             grounds.push(bottom);
             bodies.push(Body { a: top, b: bottom, ground: Some((bottom.0, bottom.1 + 1)) });
@@ -226,7 +226,7 @@ pub fn layout(parts: &[Part]) -> Layout {
         } else {
             (right, left, p.a, p.b, 0, 1)
         };
-        comps[i] = Some(Component { kind: p.kind, p1: gp(p1), p2: gp(p2), val: p.val.clone(), attrs: Default::default() });
+        comps[i] = Some(Component { kind: p.kind, p1: gp(p1), p2: gp(p2), val: p.val.clone(), attrs: Default::default(), part: None });
         add_pin(&mut nets, n1, p1, h1);
         add_pin(&mut nets, n2, p2, h2);
         bodies.push(Body { a: left, b: right, ground: None });
@@ -287,7 +287,7 @@ pub fn layout(parts: &[Part]) -> Layout {
     // ── 5. Assemble ──────────────────────────────────────────────────────
     let mut components: Vec<Component> = comps.into_iter().flatten().collect();
     for g in grounds {
-        components.push(Component { kind: CompKind::Ground, p1: gp(g), p2: gp(g), val: String::new(), attrs: Default::default() });
+        components.push(Component { kind: CompKind::Ground, p1: gp(g), p2: gp(g), val: String::new(), attrs: Default::default(), part: None });
     }
     let anchors = nets
         .iter()

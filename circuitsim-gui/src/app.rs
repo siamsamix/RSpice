@@ -161,8 +161,8 @@ const TOOLS: [(Tool, Icon, &str); 7] = [
 
 
 use crate::theme::{
-    self, bar_frame, card_frame, code_frame, section_heading, ACCENT, ACCENT_DIM, LT_STRIP,
-    LT_WHITE, LT_WORKSPACE, STATUS_ERROR, STATUS_OK, TEXT_DISABLED, TEXT_SECONDARY,
+    self, bar_frame, card_frame, code_frame, section_heading, ACCENT, STATUS_ERROR, STATUS_OK,
+    TEXT_DISABLED, TEXT_SECONDARY,
 };
 
 const DEFAULT_NETLIST: &str = r#"* RC charging — edit and press Run (F5)
@@ -352,6 +352,12 @@ pub struct CircuitSimApp {
     plot_currents: Vec<bool>,
     ac_mag_scale: AcMagScale,
     result_tab: ResultTab,
+    /// Classic-theme LTspice-style viewers, property dialog, trace picker.
+    lt_tran: crate::lt_viewer::ViewerState,
+    lt_ac: crate::lt_viewer::ViewerState,
+    props: Option<crate::props::PropsDialog>,
+    lt_picker: bool,
+    lt_hint: Option<String>,
     tran_sub_tab: TranSubTab,
     editor_mode: EditorMode,
     schematic: SchematicState,
@@ -424,6 +430,11 @@ impl Default for CircuitSimApp {
             plot_currents: Vec::new(),
             ac_mag_scale: AcMagScale::default(),
             result_tab: ResultTab::Overview,
+            lt_tran: Default::default(),
+            lt_ac: Default::default(),
+            props: None,
+            lt_picker: false,
+            lt_hint: None,
             tran_sub_tab: TranSubTab::default(),
             editor_mode: EditorMode::Text,
             schematic: SchematicState::default(),
@@ -719,20 +730,20 @@ impl eframe::App for CircuitSimApp {
         // LTspice's frame: menu bar, icon toolbar, document tabs, the gray
         // MDI workspace, status bar.
         egui::TopBottomPanel::top("menubar")
-        .frame(bar_frame(LT_WHITE, egui::Margin::symmetric(4.0, 0.0)))
+        .frame(bar_frame(theme::pal().white, egui::Margin::symmetric(4.0, 0.0)))
         .show(ctx, |ui| {
             self.menu_bar(ui);
         });
 
         egui::TopBottomPanel::top("toolbar")
-        .frame(bar_frame(LT_WHITE, egui::Margin::symmetric(6.0, 4.0)))
+        .frame(bar_frame(theme::pal().white, egui::Margin::symmetric(6.0, 4.0)))
         .show(ctx, |ui| {
             self.toolbar(ui);
         });
 
         egui::TopBottomPanel::top("tabs")
         .frame(bar_frame(
-            LT_STRIP,
+            theme::pal().strip,
             egui::Margin { left: 4.0, right: 4.0, top: 4.0, bottom: 0.0 },
         ))
         .show(ctx, |ui| {
@@ -740,7 +751,7 @@ impl eframe::App for CircuitSimApp {
         });
 
         egui::TopBottomPanel::bottom("status")
-        .frame(bar_frame(LT_STRIP, egui::Margin::symmetric(8.0, 3.0)))
+        .frame(bar_frame(theme::pal().strip, egui::Margin::symmetric(8.0, 3.0)))
         .show(ctx, |ui| {
             self.status_bar(ui);
         });
@@ -748,8 +759,8 @@ impl eframe::App for CircuitSimApp {
         egui::CentralPanel::default()
         .frame(
             egui::Frame::none()
-            .fill(LT_WORKSPACE)
-            .stroke(egui::Stroke::new(1.0, theme::LT_FRAME))
+            .fill(theme::pal().workspace)
+            .stroke(egui::Stroke::new(1.0, theme::pal().frame))
             .inner_margin(egui::Margin::same(3.0)),
         )
         .show(ctx, |ui| {
@@ -1305,6 +1316,18 @@ impl CircuitSimApp {
                 ui.separator();
                 ui.checkbox(&mut self.schematic_grid, "Schematic Grid");
                 ui.checkbox(&mut self.plot_grid, "Plot Grid");
+                ui.separator();
+                ui.menu_button("Theme", |ui| {
+                    for (kind, label) in [
+                        (theme::ThemeKind::Classic, "Classic (LTspice)"),
+                        (theme::ThemeKind::Modern, "Modern"),
+                    ] {
+                        if ui.radio(theme::kind() == kind, label).clicked() {
+                            theme::apply_kind(ui.ctx(), kind);
+                            ui.close_menu();
+                        }
+                    }
+                });
             });
 
             ui.menu_button("Simulate", |ui| {
@@ -1524,8 +1547,8 @@ impl CircuitSimApp {
             let (title, icon) = self.pane_title(pane);
             let active = self.active_pane == pane;
             let body_fill = match (pane, &self.editor_mode) {
-                (Pane::Editor, EditorMode::Text) => LT_WHITE,
-                _ => LT_WORKSPACE,
+                (Pane::Editor, EditorMode::Text) => theme::pal().white,
+                _ => theme::pal().workspace,
             };
             let id = egui::Id::new(match pane {
                 Pane::Editor => "pane_editor",
@@ -1608,6 +1631,10 @@ impl CircuitSimApp {
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
         ui.horizontal(|ui| {
+            if let (true, Some(h)) = (theme::is_classic(), self.lt_hint.clone()) {
+                ui.label(egui::RichText::new(h).font(theme::bold(14.0)));
+                return;
+            }
             match &self.status {
                 Some((true, msg)) => {
                     ui.label(msg);
@@ -1628,6 +1655,7 @@ impl CircuitSimApp {
     }
 
     fn schematic_panel(&mut self, ui: &mut egui::Ui) {
+        self.show_props(ui.ctx());
         // Spacebar rotates the selection (or the next placement) — unless a
         // text field has focus, where Space is just a character.
         if !ui.ctx().wants_keyboard_input() && ui.input(|i| i.key_pressed(egui::Key::Space)) {
@@ -1638,8 +1666,8 @@ impl CircuitSimApp {
         // analysis the Run button compiles. The drawing tools live in the
         // main toolbar.
         egui::Frame::none()
-        .fill(theme::LT_STRIP)
-        .stroke(egui::Stroke::new(1.0, theme::BORDER_SUBTLE))
+        .fill(theme::pal().strip)
+        .stroke(egui::Stroke::new(1.0, theme::pal().border_subtle))
         .inner_margin(egui::Margin::symmetric(8.0, 3.0))
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -1704,7 +1732,7 @@ impl CircuitSimApp {
         let (response, painter) = ui.allocate_painter(ui.available_size(), egui::Sense::click_and_drag());
         let rect = response.rect;
         self.canvas_rect = rect;
-        painter.rect_filled(rect, 0.0, theme::LT_WORKSPACE);
+        painter.rect_filled(rect, 0.0, theme::pal().workspace);
 
         // --- NEW PAN & ZOOM LOGIC ---
         // Handle Zoom (Ctrl + Scroll or Pinch)
@@ -1753,7 +1781,7 @@ impl CircuitSimApp {
 
         // Draw existing wires — thin blue, with a dot where three or more
         // wire ends / pins meet (a junction), as in the reference.
-        let wire_color = theme::LT_WIRE;
+        let wire_color = theme::pal().wire;
         let wire_selected_color = Color32::from_rgb(230, 80, 40);
         for (wi, w) in self.schematic.wires.iter().enumerate() {
             let selected = self.schematic.selected_wire == Some(wi);
@@ -1791,9 +1819,9 @@ impl CircuitSimApp {
 
             if self.schematic.tool == Tool::Wire {
                 if let Some(start_grid) = self.schematic.active_wire_start {
-                    painter.line_segment([to_screen(start_grid), to_screen(hover_grid)], Stroke::new(1.5 * z, theme::LT_WIRE));
+                    painter.line_segment([to_screen(start_grid), to_screen(hover_grid)], Stroke::new(1.5 * z, theme::pal().wire));
                 }
-                painter.circle_filled(to_screen(hover_grid), 3.0 * z, theme::LT_WIRE);
+                painter.circle_filled(to_screen(hover_grid), 3.0 * z, theme::pal().wire);
             } else if matches!(self.schematic.tool, Tool::R | Tool::C | Tool::L | Tool::V) {
                 // Ghost component preview
                 let (dx, dy) = self.schematic.current_dir.offset(3);
@@ -1801,20 +1829,20 @@ impl CircuitSimApp {
 
                 painter.line_segment(
                     [to_screen(hover_grid), to_screen(p2_grid)],
-                                     Stroke::new(1.0 * z, theme::LT_WIRE.gamma_multiply(0.5))
+                                     Stroke::new(1.0 * z, theme::pal().wire.gamma_multiply(0.5))
                 );
                 // Ghost body box at center of preview
                 let ghost_center = to_screen(hover_grid) + (to_screen(p2_grid) - to_screen(hover_grid)) / 2.0;
                 let is_h = hover_grid.1 == p2_grid.1;
                 let ghost_rect = Rect::from_center_size(ghost_center,
                                                         if is_h { Vec2::new(28.0 * z, 16.0 * z) } else { Vec2::new(16.0 * z, 28.0 * z) });
-                painter.rect_stroke(ghost_rect, 0.0, Stroke::new(1.0 * z, theme::LT_WIRE.gamma_multiply(0.5)));
-                painter.circle_filled(to_screen(hover_grid), 3.0 * z, theme::LT_WIRE);
+                painter.rect_stroke(ghost_rect, 0.0, Stroke::new(1.0 * z, theme::pal().wire.gamma_multiply(0.5)));
+                painter.circle_filled(to_screen(hover_grid), 3.0 * z, theme::pal().wire);
             }
         }
 
         // Draw Components with proper electronic symbols
-        let comp_stroke = Stroke::new(1.5 * z, theme::LT_WIRE);
+        let comp_stroke = Stroke::new(1.5 * z, theme::pal().wire);
         let selected_stroke = Stroke::new(1.5 * z, Color32::from_rgb(230, 80, 40));
         let names = instance_names(&self.schematic.components);
         let label_font = theme::bold(10.0);
@@ -1876,9 +1904,9 @@ impl CircuitSimApp {
                     // Value label
                     let off = if is_horizontal { Vec2::new(0.0, 14.0) } else { Vec2::new(18.0, 0.0) };
                     painter.text(center + off, val_anchor, &c.val,
-                                 label_font.clone(), theme::LT_SCHEM_TEXT);
+                                 label_font.clone(), theme::pal().schem_text);
                     painter.text(center - off * 0.8, name_anchor, &names[i],
-                                 label_font.clone(), theme::LT_SCHEM_TEXT);
+                                 label_font.clone(), theme::pal().schem_text);
                 }
 
                 CompKind::Capacitor => {
@@ -1896,9 +1924,9 @@ impl CircuitSimApp {
                     let plate2_c = center + dir * (gap / 2.0);
 
                     painter.line_segment([plate1_c - perp * plate_half, plate1_c + perp * plate_half],
-                                         Stroke::new(2.0, theme::LT_WIRE));
+                                         Stroke::new(2.0, theme::pal().wire));
                     painter.line_segment([plate2_c - perp * plate_half, plate2_c + perp * plate_half],
-                                         Stroke::new(2.0, theme::LT_WIRE));
+                                         Stroke::new(2.0, theme::pal().wire));
 
                     if is_selected {
                         let sel_rect = Rect::from_center_size(center,
@@ -1909,9 +1937,9 @@ impl CircuitSimApp {
 
                     let off = if is_horizontal { Vec2::new(0.0, 16.0) } else { Vec2::new(20.0, 0.0) };
                     painter.text(center + off, val_anchor, &c.val,
-                                 label_font.clone(), theme::LT_SCHEM_TEXT);
+                                 label_font.clone(), theme::pal().schem_text);
                     painter.text(center - off * 0.8, name_anchor, &names[i],
-                                 label_font.clone(), theme::LT_SCHEM_TEXT);
+                                 label_font.clone(), theme::pal().schem_text);
                 }
 
                 CompKind::Inductor => {
@@ -1949,9 +1977,9 @@ impl CircuitSimApp {
 
                     let off = if is_horizontal { Vec2::new(0.0, 14.0) } else { Vec2::new(18.0, 0.0) };
                     painter.text(center + off, val_anchor, &c.val,
-                                 label_font.clone(), theme::LT_SCHEM_TEXT);
+                                 label_font.clone(), theme::pal().schem_text);
                     painter.text(center - off * 0.8, name_anchor, &names[i],
-                                 label_font.clone(), theme::LT_SCHEM_TEXT);
+                                 label_font.clone(), theme::pal().schem_text);
                 }
 
                 CompKind::Voltage => {
@@ -1961,14 +1989,14 @@ impl CircuitSimApp {
 
                     // Circle body
                     let r = 11.0_f32;
-                    painter.circle_stroke(center, r, Stroke::new(1.5, theme::LT_WIRE));
+                    painter.circle_stroke(center, r, Stroke::new(1.5, theme::pal().wire));
 
                     // + and - polarity symbols inside. Both stay upright
                     // whatever the rotation; `+` sits toward p1, the SPICE
                     // positive node.
                     let (plus_c, minus_c) = source_polarity_marks(center, p1, p2, r);
                     let ps = 3.0_f32;
-                    let mark = Stroke::new(1.0, theme::LT_SCHEM_TEXT);
+                    let mark = Stroke::new(1.0, theme::pal().schem_text);
                     painter.line_segment([plus_c - Vec2::X * ps, plus_c + Vec2::X * ps], mark);
                     painter.line_segment([plus_c - Vec2::Y * ps, plus_c + Vec2::Y * ps], mark);
                     painter.line_segment([minus_c - Vec2::X * ps, minus_c + Vec2::X * ps], mark);
@@ -1979,9 +2007,9 @@ impl CircuitSimApp {
 
                     let off = if is_horizontal { Vec2::new(0.0, 16.0) } else { Vec2::new(20.0, 0.0) };
                     painter.text(center + off, val_anchor, &c.val,
-                                 label_font.clone(), theme::LT_SCHEM_TEXT);
+                                 label_font.clone(), theme::pal().schem_text);
                     painter.text(center - off * 0.8, name_anchor, &names[i],
-                                 label_font.clone(), theme::LT_SCHEM_TEXT);
+                                 label_font.clone(), theme::pal().schem_text);
                 }
 
                 CompKind::Ground => {
@@ -2053,7 +2081,7 @@ impl CircuitSimApp {
                     text_size + pad * 2.0,
                 );
                 painter.rect_filled(pill_rect, 0.0, bg_color);
-                painter.rect_stroke(pill_rect, 0.0, egui::Stroke::new(0.5, theme::LT_FRAME));
+                painter.rect_stroke(pill_rect, 0.0, egui::Stroke::new(0.5, theme::pal().frame));
                 painter.text(
                     *pos + label_offset,
                     egui::Align2::LEFT_TOP,
@@ -2145,7 +2173,7 @@ impl CircuitSimApp {
                 let color = if self.schematic.selected_note == Some(note) {
                     selected_color
                 } else {
-                    theme::LT_SCHEM_TEXT
+                    theme::pal().schem_text
                 };
                 let galley = painter.layout_no_wrap(l.name.clone(), label_font_id.clone(), color);
                 let size = galley.size();
@@ -2167,7 +2195,7 @@ impl CircuitSimApp {
                 let note = Note::Directive(i);
                 let at = to_screen(d.at);
                 let selected = self.schematic.selected_note == Some(note);
-                let color = if selected { selected_color } else { theme::LT_SCHEM_TEXT };
+                let color = if selected { selected_color } else { theme::pal().schem_text };
                 let galley = painter.layout(d.text.clone(), mono.clone(), color, f32::INFINITY);
                 let text_rect = Rect::from_min_size(at, galley.size());
                 painter.galley(at, galley, color);
@@ -2192,9 +2220,9 @@ impl CircuitSimApp {
                         egui::Align2::LEFT_BOTTOM,
                         &self.schematic.pending_text,
                         font,
-                        theme::LT_SCHEM_TEXT.gamma_multiply(0.55),
+                        theme::pal().schem_text.gamma_multiply(0.55),
                     );
-                    painter.circle_filled(snapped, 3.0 * z, theme::LT_WIRE);
+                    painter.circle_filled(snapped, 3.0 * z, theme::pal().wire);
                 }
             }
         }
@@ -2370,6 +2398,20 @@ impl CircuitSimApp {
         // Cancel wire dragging on Right Click
         if response.secondary_clicked() {
             self.schematic.cancel_gesture();
+            // Classic: right-click a part → its LTspice-style property dialog.
+            if theme::is_classic() {
+                if let Some(p) = response.interact_pointer_pos() {
+                    let hit = self.schematic.components.iter().position(|c| {
+                        let (p1, p2) = (to_screen(c.p1), to_screen(c.p2));
+                        let center = p1 + (p2 - p1) / 2.0;
+                        let size = if c.p1.1 == c.p2.1 { Vec2::new(24.0, 16.0) } else { Vec2::new(16.0, 24.0) };
+                        Rect::from_center_size(center, size + Vec2::new(12.0, 12.0)).contains(p)
+                    });
+                    if let Some(i) = hit {
+                        self.open_props(i);
+                    }
+                }
+            }
         }
 
         // ── Cross-probe preview: the LTspice dot reads the probe at the
@@ -2463,13 +2505,13 @@ impl CircuitSimApp {
                 .frame(
                     egui::Frame::none()
                     .fill(theme::BG_SURFACE)
-                    .stroke(egui::Stroke::new(1.0, theme::LT_FRAME))
+                    .stroke(egui::Stroke::new(1.0, theme::pal().frame))
                     .rounding(egui::Rounding::same(0.0))
                     .inner_margin(egui::Margin::same(10.0))
                 )
                 .show(ui.ctx(), |ui| {
                     ui.horizontal(|ui| {
-                        ui.label(egui::RichText::new("Wire").strong().size(12.0).color(theme::LT_WIRE));
+                        ui.label(egui::RichText::new("Wire").strong().size(12.0).color(theme::pal().wire));
                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                             ui.label(egui::RichText::new("✕ close").size(10.0).color(TEXT_SECONDARY));
                         });
@@ -2521,12 +2563,12 @@ impl CircuitSimApp {
                 .frame(
                     egui::Frame::none()
                     .fill(theme::BG_SURFACE)
-                    .stroke(egui::Stroke::new(1.0, theme::LT_FRAME))
+                    .stroke(egui::Stroke::new(1.0, theme::pal().frame))
                     .rounding(egui::Rounding::same(0.0))
                     .inner_margin(egui::Margin::same(10.0))
                 )
                 .show(ui.ctx(), |ui| {
-                    ui.label(egui::RichText::new(heading).strong().size(12.0).color(theme::LT_WIRE));
+                    ui.label(egui::RichText::new(heading).strong().size(12.0).color(theme::pal().wire));
                     ui.add_space(4.0);
                     if let Some((_, buf)) = self.note_edit.as_mut() {
                         if multiline {
@@ -2569,7 +2611,7 @@ impl CircuitSimApp {
         // --- ADD THIS AT THE END OF schematic_panel ---
         // Show Editor Window for selected component
         let mut delete_idx = None;
-        if let Some(idx) = self.schematic.selected_component {
+        if let Some(idx) = self.schematic.selected_component.filter(|_| !theme::is_classic()) {
             if let Some(c) = self.schematic.components.get_mut(idx) {
                 let p1 = to_screen(c.p1);
                 let p2 = to_screen(c.p2);
@@ -2596,7 +2638,7 @@ impl CircuitSimApp {
                 .frame(
                     egui::Frame::none()
                     .fill(theme::BG_SURFACE)
-                    .stroke(egui::Stroke::new(1.0, theme::LT_FRAME))
+                    .stroke(egui::Stroke::new(1.0, theme::pal().frame))
                     .rounding(egui::Rounding::same(0.0))
                     .inner_margin(egui::Margin::same(12.0))
                 )
@@ -2770,6 +2812,7 @@ impl CircuitSimApp {
     }
 
     fn results_panel(&mut self, ui: &mut egui::Ui) {
+        self.classic_trace_picker(ui.ctx());
         ui.horizontal(|ui| {
             ui.selectable_value(&mut self.result_tab, ResultTab::Overview, "Overview");
             ui.selectable_value(&mut self.result_tab, ResultTab::Dc, "DC");
@@ -2894,7 +2937,7 @@ impl CircuitSimApp {
         ui.label(
             egui::RichText::new(format!("{cur:.6e} A"))
             .family(egui::FontFamily::Monospace)
-            .color(ACCENT_DIM),
+            .color(theme::pal().accent_dim),
         );
         ui.end_row();
     }
@@ -2934,7 +2977,7 @@ impl CircuitSimApp {
                     ui.label(
                         egui::RichText::new(format!("{v:.6e} V"))
                         .family(egui::FontFamily::Monospace)
-                        .color(ACCENT_DIM),
+                        .color(theme::pal().accent_dim),
                     );
                     ui.end_row();
                 }
@@ -3071,6 +3114,9 @@ impl CircuitSimApp {
             );
             return;
         };
+        if theme::is_classic() {
+            return self.classic_tran(ui);
+        }
 
         // ── Sub-tab bar ───────────────────────────────────────────────────────
         ui.horizontal(|ui| {
@@ -3343,6 +3389,9 @@ impl CircuitSimApp {
             });
             return;
         };
+        if theme::is_classic() {
+            return self.classic_ac(ui);
+        }
 
         let n_nodes = self.node_names.len();
 
@@ -3460,6 +3509,215 @@ impl CircuitSimApp {
     }
 
 }
+
+// ─── Classic theme: LTspice-style viewers and dialogs ──────────────────────
+
+impl CircuitSimApp {
+    fn open_props(&mut self, idx: usize) {
+        let names = instance_names(&self.schematic.components);
+        let Some(c) = self.schematic.components.get(idx) else { return };
+        let name = names.get(idx).cloned().unwrap_or_default();
+        self.schematic.selected_component = Some(idx);
+        self.props = crate::props::PropsDialog::open(idx, c, &name);
+    }
+
+    fn show_props(&mut self, ctx: &egui::Context) {
+        use crate::props::PropsOutcome;
+        let Some(d) = self.props.as_mut() else { return };
+        match d.show(ctx) {
+            PropsOutcome::Open => {}
+            PropsOutcome::Cancel => self.props = None,
+            PropsOutcome::Ok => {
+                let idx = d.index();
+                if let Some(c) = self.schematic.components.get_mut(idx) {
+                    d.apply(c);
+                }
+                self.props = None;
+            }
+        }
+    }
+
+    fn lt_traces_from(series: Vec<crate::plot::PlotSeries>) -> Vec<crate::lt_viewer::Trace> {
+        series
+            .into_iter()
+            .map(|s| crate::lt_viewer::Trace {
+                name: s.name,
+                color: s.color,
+                x: s.points.iter().map(|p| p[0]).collect(),
+                y: s.points.iter().map(|p| p[1]).collect(),
+                phase: None,
+            })
+            .collect()
+    }
+
+    fn classic_tran(&mut self, ui: &mut egui::Ui) {
+        use crate::lt_viewer::{Mode, ViewerConfig, XKind};
+        let Some(tran) = &self.tran else { return };
+        let mut series = tran_voltage_series(tran, &self.plot_nodes, &self.node_names, 1.0, 1.0);
+        if let Some(circuit) = &self.circuit {
+            let currents = tran_current_series(tran, circuit, &self.plot_currents, 1.0, 1.0);
+            // Currents only join once the user has asked for some.
+            if self.plot_currents.iter().any(|&on| on) && self.plot_nodes.iter().any(|&on| on) {
+                series.extend(currents);
+            } else if !self.plot_nodes.iter().any(|&on| on) {
+                series = currents;
+            }
+        }
+        let traces = Self::lt_traces_from(series);
+        let cfg = ViewerConfig {
+            title: self.file_label.clone(),
+            x_kind: XKind::Time,
+            x_unit: "s".into(),
+            y_unit: "V".into(),
+            mode: Mode::Real,
+            mag_db: false,
+            log_x_default: false,
+        };
+        let out = self.lt_tran.show(ui, &cfg, &traces);
+        self.lt_after_viewer(out, &traces, false);
+    }
+
+    fn classic_ac(&mut self, ui: &mut egui::Ui) {
+        use crate::lt_viewer::{Mode, Trace, ViewerConfig, XKind};
+        let Some(ac) = &self.ac else { return };
+        let db = matches!(self.ac_mag_scale, AcMagScale::Db);
+        let mag_qty = if db { AcQuantity::MagnitudeDb } else { AcQuantity::MagnitudeLinear };
+        let mags = ac_voltage_series(ac, &self.ac_plot_nodes, &self.node_names, mag_qty, 1.0, 1.0, false);
+        let phases = ac_voltage_series(ac, &self.ac_plot_nodes, &self.node_names, AcQuantity::Phase, 1.0, 1.0, false);
+        let traces: Vec<Trace> = mags
+            .into_iter()
+            .zip(phases)
+            .map(|(m, p)| Trace {
+                name: m.name,
+                color: m.color,
+                x: m.points.iter().map(|q| q[0]).collect(),
+                y: m.points.iter().map(|q| q[1]).collect(),
+                phase: Some(p.points.iter().map(|q| q[1]).collect()),
+            })
+            .collect();
+        let cfg = ViewerConfig {
+            title: self.file_label.clone(),
+            x_kind: XKind::Frequency,
+            x_unit: "Hz".into(),
+            y_unit: "V".into(),
+            mode: Mode::Ac,
+            mag_db: db,
+            log_x_default: true,
+        };
+        let out = self.lt_ac.show(ui, &cfg, &traces);
+        self.lt_after_viewer(out, &traces, true);
+    }
+
+    /// Handle what the viewer asked for: hint text, trace picker, CSV, probe flash.
+    fn lt_after_viewer(&mut self, out: crate::lt_viewer::ViewerOutput, traces: &[crate::lt_viewer::Trace], ac: bool) {
+        self.lt_hint = out.hint;
+        if out.request_add_traces {
+            self.lt_picker = true;
+        }
+        if out.request_export_csv {
+            self.export_csv(traces, ac);
+        }
+        if !ac {
+            // Hover → schematic probe flash for node traces, as the old plot did.
+            let visible: Vec<usize> = self
+                .plot_nodes
+                .iter()
+                .enumerate()
+                .filter(|&(n, &on)| n > 0 && on)
+                .map(|(n, _)| n)
+                .collect();
+            self.probe_flash = out.hovered_trace.and_then(|i| visible.get(i).copied()).map(ProbeFlash::Node);
+        }
+    }
+
+    fn export_csv(&mut self, traces: &[crate::lt_viewer::Trace], ac: bool) {
+        let text = lt_csv(traces, ac);
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            if let Some(path) = rfd::FileDialog::new().add_filter("CSV", &["csv"]).set_file_name("waveforms.csv").save_file() {
+                self.status = Some(match std::fs::write(&path, text) {
+                    Ok(()) => (true, format!("Exported {}", path.display())),
+                    Err(e) => (false, e.to_string()),
+                });
+            }
+        }
+        #[cfg(target_arch = "wasm32")]
+        {
+            let _ = text;
+            self.status = Some((false, "CSV export is not available in the browser build".into()));
+        }
+    }
+
+    /// The "Select Visible Traces" window of the Classic viewer.
+    fn classic_trace_picker(&mut self, ctx: &egui::Context) {
+        if !self.lt_picker {
+            return;
+        }
+        let mut open = true;
+        let ac = self.result_tab == ResultTab::FreqResponse;
+        egui::Window::new("Select Visible Traces")
+            .id(egui::Id::new("lt_trace_picker"))
+            .open(&mut open)
+            .collapsible(false)
+            .resizable(false)
+            .show(ctx, |ui| {
+                let n = self.node_names.len();
+                let flags = if ac { &mut self.ac_plot_nodes } else { &mut self.plot_nodes };
+                for i in 1..n.min(flags.len()) {
+                    ui.checkbox(&mut flags[i], format!("V({})", node_label(&self.node_names, i)));
+                }
+                if !ac {
+                    ui.separator();
+                    let labels: Vec<String> = match &self.tran {
+                        Some(t) => current_slots(t)
+                            .into_iter()
+                            .flat_map(|(family, count)| {
+                                (0..count).map(move |i| format!("{}[{i}]", family.probe_prefix()))
+                            })
+                            .collect(),
+                        None => Vec::new(),
+                    };
+                    for (slot, label) in labels.iter().enumerate() {
+                        if let Some(flag) = self.plot_currents.get_mut(slot) {
+                            ui.checkbox(flag, label);
+                        }
+                    }
+                }
+            });
+        if !open {
+            self.lt_picker = false;
+        }
+    }
+}
+
+/// CSV of the viewer's traces: one x column per trace set, then each series.
+/// Traces share x here (one analysis), so a single leading column suffices.
+fn lt_csv(traces: &[crate::lt_viewer::Trace], ac: bool) -> String {
+    let mut out = String::new();
+    let Some(first) = traces.first() else { return out };
+    out.push_str(if ac { "freq" } else { "time" });
+    for t in traces {
+        out.push(',');
+        out.push_str(&t.name);
+        if ac {
+            out.push_str(&format!(",{} phase", t.name));
+        }
+    }
+    out.push('\n');
+    for k in 0..first.x.len() {
+        out.push_str(&format!("{:e}", first.x[k]));
+        for t in traces {
+            out.push_str(&format!(",{:e}", t.y.get(k).copied().unwrap_or(f64::NAN)));
+            if ac {
+                let p = t.phase.as_ref().and_then(|p| p.get(k)).copied().unwrap_or(f64::NAN);
+                out.push_str(&format!(",{p:e}"));
+            }
+        }
+        out.push('\n');
+    }
+    out
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -3594,7 +3852,7 @@ mod tests {
     const BAD_DECK: &str = "R1 1\n.end\n";
 
     fn resistor(val: &str) -> Component {
-        Component { kind: CompKind::Resistor, p1: GridPt(2, 2), p2: GridPt(5, 2), val: val.into() }
+        Component { kind: CompKind::Resistor, p1: GridPt(2, 2), p2: GridPt(5, 2), val: val.into(), attrs: Default::default() }
     }
 
     fn status_is_error(app: &CircuitSimApp) -> bool {
@@ -3740,6 +3998,7 @@ mod tests {
             p1: GridPt(p1.0, p1.1),
             p2: GridPt(p2.0, p2.1),
             val: val.to_string(),
+            attrs: Default::default(),
         };
         app.schematic.components = vec![
             comp(CompKind::Voltage, (0, 0), (0, 3), "5"),

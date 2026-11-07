@@ -8,7 +8,7 @@ use egui::{pos2, vec2, Align2, Color32, FontId, Rect, Response, Sense, Stroke, U
 
 use crate::icons::{paint_icon, Icon};
 use crate::theme::{
-    BG_HOVER, LT_FRAME, LT_TITLE_ACTIVE, LT_TITLE_INACTIVE, LT_TITLE_INACTIVE_TEXT, LT_WHITE,
+    self, BG_HOVER, LT_FRAME, LT_TITLE_ACTIVE, LT_TITLE_INACTIVE, LT_TITLE_INACTIVE_TEXT, LT_WHITE,
     TEXT_PRIMARY, TEXT_SECONDARY, TITLE_ACTIVE_BG,
 };
 
@@ -34,7 +34,46 @@ enum Glyph {
     Close,
 }
 
+/// Classic window button: a square gray key with a black outline and glyph
+/// (the three keys at the right of every LTspice child window).
+fn classic_title_button(ui: &mut Ui, rect: Rect, glyph: Glyph, enabled: bool, id: egui::Id) -> bool {
+    let response = ui.interact(rect, id, if enabled { Sense::click() } else { Sense::hover() });
+    let painter = ui.painter();
+    let down = enabled && response.is_pointer_button_down_on();
+    let fill = if down {
+        Color32::from_rgb(170, 170, 170)
+    } else if enabled && response.hovered() {
+        Color32::from_rgb(235, 235, 235)
+    } else {
+        Color32::from_rgb(212, 212, 212)
+    };
+    painter.rect(rect, 0.0, fill, Stroke::new(1.0, Color32::BLACK));
+    let ink = if enabled { Color32::BLACK } else { Color32::from_gray(130) };
+    let s = Stroke::new(1.6, ink);
+    let c = rect.center();
+    match glyph {
+        Glyph::Minimize => {
+            painter.line_segment([pos2(c.x - 5.0, c.y + 4.0), pos2(c.x + 4.0, c.y + 4.0)], s);
+        }
+        Glyph::Maximize => {
+            painter.rect_stroke(Rect::from_center_size(c, vec2(10.0, 9.0)), 0.0, s);
+        }
+        Glyph::Restore => {
+            painter.rect_stroke(Rect::from_center_size(c + vec2(1.5, -1.5), vec2(7.0, 6.0)), 0.0, s);
+            painter.rect_stroke(Rect::from_center_size(c + vec2(-1.5, 1.5), vec2(7.0, 6.0)), 0.0, s);
+        }
+        Glyph::Close => {
+            painter.line_segment([pos2(c.x - 4.5, c.y - 4.5), pos2(c.x + 4.5, c.y + 4.5)], s);
+            painter.line_segment([pos2(c.x + 4.5, c.y - 4.5), pos2(c.x - 4.5, c.y + 4.5)], s);
+        }
+    }
+    response.clicked()
+}
+
 fn title_button(ui: &mut Ui, rect: Rect, glyph: Glyph, enabled: bool, id: egui::Id) -> bool {
+    if theme::is_classic() {
+        return classic_title_button(ui, rect, glyph, enabled, id);
+    }
     let response = ui.interact(rect, id, if enabled { Sense::click() } else { Sense::hover() });
     let painter = ui.painter();
     let hot = enabled && response.hovered();
@@ -101,7 +140,22 @@ pub fn child_window(
     });
     events.activated = pressed_inside;
 
-    {
+    if theme::is_classic() {
+        // Flat classic title bar: solid blue when active, mid gray otherwise,
+        // no accent underline.
+        let p = theme::pal();
+        let painter = ui.painter();
+        painter.rect_filled(body_rect, 0.0, body_fill);
+        painter.rect_filled(title_rect, 0.0, if active { p.title_active_bg } else { p.title_inactive });
+        paint_icon(painter, Rect::from_min_size(title_rect.min + vec2(4.0, 4.0), vec2(16.0, 16.0)), icon);
+        painter.text(
+            pos2(title_rect.min.x + 26.0, title_rect.center().y),
+            Align2::LEFT_CENTER,
+            title,
+            FontId::proportional(12.0),
+            if active { p.title_active_text } else { p.title_inactive_text },
+        );
+    } else {
         let painter = ui.painter();
         painter.rect_filled(body_rect, 0.0, body_fill);
         painter.rect_filled(title_rect, 0.0, if active { TITLE_ACTIVE_BG } else { LT_TITLE_INACTIVE });
@@ -119,10 +173,12 @@ pub fn child_window(
     }
 
     // Window buttons, right-aligned: minimize, maximize/restore, close.
-    let bw = 22.0;
-    let bh = 18.0;
-    let top = title_rect.min.y + (TITLE_H - 2.0 - bh) / 2.0;
-    let right = title_rect.max.x - 3.0;
+    let classic = theme::is_classic();
+    let bw = if classic { 20.0 } else { 22.0 };
+    let bh = if classic { 18.0 } else { 18.0 };
+    let top = title_rect.min.y
+        + if classic { (TITLE_H - bh) / 2.0 } else { (TITLE_H - 2.0 - bh) / 2.0 };
+    let right = title_rect.max.x - if classic { 2.0 } else { 3.0 };
     let close_rect = Rect::from_min_size(pos2(right - bw, top), vec2(bw, bh));
     let max_rect = Rect::from_min_size(pos2(right - 2.0 * bw - 2.0, top), vec2(bw, bh));
     let min_rect = Rect::from_min_size(pos2(right - 3.0 * bw - 4.0, top), vec2(bw, bh));
@@ -143,14 +199,22 @@ pub fn child_window(
     child.set_clip_rect(inner.intersect(ui.clip_rect()));
     body(&mut child);
 
-    ui.painter()
-        .rect_stroke(rect, 0.0, Stroke::new(1.0, LT_FRAME));
+    if classic {
+        // Heavy dark frame around the whole child window.
+        ui.painter().rect_stroke(rect, 0.0, Stroke::new(2.0, theme::pal().frame));
+    } else {
+        ui.painter()
+            .rect_stroke(rect, 0.0, Stroke::new(1.0, LT_FRAME));
+    }
     events
 }
 
 /// One document tab: icon + label, white and joined to the workspace when
 /// `selected`.
 pub fn tab(ui: &mut Ui, label: &str, icon: Icon, selected: bool) -> Response {
+    if theme::is_classic() {
+        return classic_tab(ui, label, icon, selected);
+    }
     let font = FontId::proportional(12.0);
     let galley = ui
         .painter()
@@ -181,6 +245,40 @@ pub fn tab(ui: &mut Ui, label: &str, icon: Icon, selected: bool) -> Response {
         }
         paint_icon(painter, Rect::from_min_size(rect.min + vec2(8.0, 5.0), vec2(16.0, 16.0)), icon);
         painter.galley(pos2(rect.min.x + 30.0, rect.center().y - galley.size().y / 2.0), galley, TEXT_PRIMARY);
+    }
+    response
+}
+
+/// Classic document tab: small flat rectangle, white when selected, with a
+/// thin gray outline (the `Draft1.asc` / `Draft1.raw` strip of LTspice).
+fn classic_tab(ui: &mut Ui, label: &str, icon: Icon, selected: bool) -> Response {
+    let p = theme::pal();
+    let font = FontId::proportional(11.5);
+    let galley = ui.painter().layout_no_wrap(label.to_owned(), font, Color32::BLACK);
+    let size = vec2(galley.size().x + 34.0, 22.0);
+    let (rect, response) = ui.allocate_exact_size(size, Sense::click());
+    if ui.is_rect_visible(rect) {
+        let painter = ui.painter();
+        let fill = if selected {
+            p.white
+        } else if response.hovered() {
+            p.bg_hover
+        } else {
+            p.tab_idle
+        };
+        painter.rect(rect, 0.0, fill, Stroke::new(1.0, Color32::from_rgb(160, 160, 160)));
+        if selected {
+            painter.line_segment(
+                [pos2(rect.left() + 1.0, rect.bottom()), pos2(rect.right() - 1.0, rect.bottom())],
+                Stroke::new(1.5, p.white),
+            );
+        }
+        paint_icon(painter, Rect::from_min_size(rect.min + vec2(4.0, 3.0), vec2(16.0, 16.0)), icon);
+        painter.galley(
+            pos2(rect.min.x + 25.0, rect.center().y - galley.size().y / 2.0),
+            galley,
+            Color32::BLACK,
+        );
     }
     response
 }

@@ -17,7 +17,7 @@ use circuitsim::rawwave::RawDataset;
 use egui::{Stroke, TextStyle};
 use egui_plot::{GridMark, Legend, Line, Plot, PlotPoint, PlotPoints, PlotUi};
 
-use crate::theme::{bold, LT_PLOT_BG, LT_PLOT_FRAME, PLOT_COLORS};
+use crate::theme::{bold, pal, PLOT_COLORS};
 
 /// One named polyline with its palette color and data in axis units.
 pub struct PlotSeries {
@@ -148,10 +148,10 @@ pub fn grid_on(ui: &egui::Ui) -> bool {
 pub fn viewer_scope<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) -> R {
     ui.scope(|ui| {
         let visuals = ui.visuals_mut();
-        visuals.extreme_bg_color = LT_PLOT_BG;
-        visuals.override_text_color = Some(LT_PLOT_FRAME);
-        visuals.window_stroke = Stroke::new(1.0, LT_PLOT_FRAME);
-        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, LT_PLOT_FRAME);
+        visuals.extreme_bg_color = pal().plot_bg;
+        visuals.override_text_color = Some(pal().plot_frame);
+        visuals.window_stroke = Stroke::new(1.0, pal().plot_frame);
+        visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, pal().plot_frame);
         // Legend entries take their text from the widget states.
         for w in [
             &mut visuals.widgets.noninteractive,
@@ -159,7 +159,7 @@ pub fn viewer_scope<R>(ui: &mut egui::Ui, add: impl FnOnce(&mut egui::Ui) -> R) 
             &mut visuals.widgets.hovered,
             &mut visuals.widgets.active,
         ] {
-            w.fg_stroke.color = LT_PLOT_FRAME;
+            w.fg_stroke.color = pal().plot_frame;
         }
         ui.style_mut().text_styles.insert(TextStyle::Body, bold(11.5));
         add(ui)

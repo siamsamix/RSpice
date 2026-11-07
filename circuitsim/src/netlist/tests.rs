@@ -2244,3 +2244,58 @@ fn for_deck_searches_the_libs_beside_the_deck_directory_and_extra_dirs() {
     assert!(parse_with_options(deck, &options).is_err());
     let _ = std::fs::remove_dir_all(&root);
 }
+
+// ── SourceCard bridge ───────────────────────────────────────────────
+
+fn card(text: &str) -> SourceCard {
+    parse_source_card(text, &ParseOptions::default()).expect("card parses")
+}
+
+#[test]
+fn source_card_bare_number_is_dc() {
+    let c = card("5");
+    assert_eq!(c.dc, Some(5.0));
+    assert!(c.ac.is_none() && c.waveform.is_none());
+    assert_eq!(emit_source_card(&c), "DC 5");
+}
+
+#[test]
+fn source_card_dc_plus_ac_round_trips() {
+    let c = card("DC 0 AC 5");
+    assert_eq!(c.dc, Some(0.0));
+    let ac = c.ac.expect("ac");
+    assert_eq!((ac.mag, ac.phase), (5.0, 0.0));
+    assert_eq!(emit_source_card(&c), "DC 0 AC 5 0");
+    assert_eq!(emit_source_card(&card("DC 0 AC 5 0")), "DC 0 AC 5 0");
+}
+
+#[test]
+fn source_card_ac_with_phase_only() {
+    let c = card("AC 5 90");
+    assert_eq!(c.dc, None);
+    assert_eq!(emit_source_card(&c), "AC 5 90");
+}
+
+#[test]
+fn source_card_sine_and_combined_round_trip() {
+    let c = card("SIN(0 1 1k)");
+    assert!(matches!(c.waveform, Some(Waveform::Sine(_))));
+    assert_eq!(c.dc, None);
+    let text = emit_source_card(&c);
+    assert_eq!(text, "SIN(0 1 1000 0 0)");
+    assert_eq!(emit_source_card(&card(&text)), text);
+
+    let both = card("DC 1 AC 2 45 PULSE(0 5 1 2 2 5 10)");
+    let text = emit_source_card(&both);
+    assert_eq!(text, "DC 1 AC 2 45 PULSE(0 5 1 2 2 5 10)");
+    assert_eq!(emit_source_card(&card(&text)), text);
+}
+
+#[test]
+fn source_card_empty_and_stray_tokens() {
+    assert_eq!(emit_source_card(&SourceCard::default()), "DC 0");
+    assert!(parse_source_card("  ", &ParseOptions::default()).is_err());
+    // Anything after a waveform is not placed: an error, not a silent drop.
+    assert!(parse_source_card("SIN(0 1 1k) AC 1", &ParseOptions::default()).is_err());
+    assert!(parse_source_card("DC five", &ParseOptions::default()).is_err());
+}

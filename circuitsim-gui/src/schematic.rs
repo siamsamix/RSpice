@@ -9,8 +9,9 @@ use circuitsim::circuit::{
     Resistor as CsResistor, VoltageSource as CsVoltageSource,
 };
 use circuitsim::netlist::{
-    deck_directives, emit as netlist_emit, parse_with_options, AcCommand, AcScale,
-    AnalysisCommands, Netlist, ParseOptions,
+    deck_directives, emit as netlist_emit, emit_source_card, parse_source_card,
+    parse_with_options, AcCommand, AcScale, AnalysisCommands, Netlist, ParseOptions,
+    SourceCard,
 };
 use circuitsim::units::parse_value;
 use crate::autolayout::{ORIGIN_X, ORIGIN_Y};
@@ -58,6 +59,127 @@ pub struct Component {
     pub p1: GridPt,
     pub p2: GridPt,
     pub val: String,
+    /// Property-dialog extras, keyed by name (all values are user text).
+    ///
+    /// Annotations only — stored and shown, never simulated: `tolerance`,
+    /// `power`, `voltage_rating`, `rms_current`, `current_rating`,
+    /// `manufacturer`, `part`, and the label-visibility flags `vis_dc`,
+    /// `vis_ac`, `vis_par` (`"1"` = shown).
+    ///
+    /// Simulated parasitics (expanded into extra elements by
+    /// [`SchematicState::build_netlist`]): `rser` (C, L, V), `lser` (C),
+    /// `rpar` (C, L), `cpar` (C, L, V). Empty or zero = absent.
+    pub attrs: std::collections::BTreeMap<String, String>,
+}
+
+/// One main element whose `attrs` may ask for parasitic arms
+/// (see [`Component::attrs`]); collected while the main elements are built
+/// and expanded afterwards by [`expand_parasitics`].
+struct Parasitic<'a> {
+    kind: CompKind,
+    /// Index of the main element in its family vector of the circuit.
+    main: usize,
+    /// Instance name of the main element (`C1`), the stem of the extras.
+    name: String,
+    n1: NodeId,
+    n2: NodeId,
+    attrs: &'a std::collections::BTreeMap<String, String>,
+}
+
+/// A parasitic attribute as a positive number; `None` when empty or zero,
+/// an error for text that is not a finite, non-negative value.
+fn parasitic_value(
+    p: &Parasitic,
+    key: &str,
+    label: &str,
+) -> Result<Option<f64>, String> {
+    let Some(text) = p.attrs.get(key) else { return Ok(None) };
+    let text = text.trim();
+    if text.is_empty() {
+        return Ok(None);
+    }
+    let v = parse_value(text)
+        .map_err(|e| format!("{} {label} '{text}': {e}", p.name))?;
+    if !v.is_finite() || v < 0.0 {
+        return Err(format!("{} {label} '{text}' must be zero or positive", p.name));
+    }
+    Ok((v > 0.0).then_some(v))
+}
+
+/// Expand `rser`/`lser`/`rpar`/`cpar` attributes into real elements, the way
+/// LTspice's `Rser=`/`Lser=`/`Rpar=`/`Cpar=` parameters do. The main element
+/// is rewired onto fresh internal nodes (ids from `next_node`):
+///
+/// * C: `n1 —Rser— a —Lser— b —C— n2`
+/// * L: `n1 —Rser— a —L— n2`
+/// * V: `n1 —Rser— a —V— n2` (`n1` stays the + terminal)
+///
+/// Parallel arms (`Rpar`, `Cpar`) span `n1`–`n2` across the whole branch.
+/// Extras are named `R{main}_ser`, `L{main}_ser`, `R{main}_par`,
+/// `C{main}_par` (e.g. `RC1_ser`): the digit never follows the letter, so
+/// they cannot clash with the plain `R1…Rn` names.
+fn expand_parasitics(
+    circuit: &mut CsCircuit,
+    parasitics: &[Parasitic],
+    mut next_node: usize,
+) -> Result<(), String> {
+    let mut fresh = |circuit: &mut CsCircuit| {
+        let id = next_node;
+        next_node += 1;
+        circuit.ensure_node(id);
+        NodeId(id)
+    };
+    for p in parasitics {
+        let (n1, n2) = (p.n1, p.n2);
+        let rser = parasitic_value(p, "rser", "series resistance")?;
+        let lser = match p.kind {
+            CompKind::Capacitor => parasitic_value(p, "lser", "series inductance")?,
+            _ => None,
+        };
+        let rpar = match p.kind {
+            CompKind::Capacitor | CompKind::Inductor => {
+                parasitic_value(p, "rpar", "parallel resistance")?
+            }
+            _ => None,
+        };
+        let cpar = parasitic_value(p, "cpar", "parallel capacitance")?;
+
+        // Series chain from n1 towards the main element.
+        let mut head = n1;
+        if let Some(r) = rser {
+            let a = fresh(circuit);
+            circuit.resistors.push(CsResistor {
+                name: format!("R{}_ser", p.name), n1: head, n2: a, resistance: r, model: None,
+            });
+            head = a;
+        }
+        if let Some(l) = lser {
+            let b = fresh(circuit);
+            circuit.inductors.push(CsInductor {
+                name: format!("L{}_ser", p.name), n1: head, n2: b, inductance: l, model: None,
+            });
+            head = b;
+        }
+        if head != n1 {
+            match p.kind {
+                CompKind::Capacitor => circuit.capacitors[p.main].n1 = head,
+                CompKind::Inductor => circuit.inductors[p.main].n1 = head,
+                CompKind::Voltage => circuit.voltage_sources[p.main].n1 = head,
+                _ => {}
+            }
+        }
+        if let Some(r) = rpar {
+            circuit.resistors.push(CsResistor {
+                name: format!("R{}_par", p.name), n1, n2, resistance: r, model: None,
+            });
+        }
+        if let Some(c) = cpar {
+            circuit.capacitors.push(CsCapacitor {
+                name: format!("C{}_par", p.name), n1, n2, capacitance: c, model: None,
+            });
+        }
+    }
+    Ok(())
 }
 
 /// A value in SPICE engineering notation (`1k`, `4.7u`, `100n`) when that
@@ -569,6 +691,7 @@ impl SchematicState {
             Tool::Gnd => {
                 self.components.push(Component {
                     kind: CompKind::Ground, p1: at, p2: at, val: "".into(),
+                    attrs: Default::default(),
                 });
                 return;
             }
@@ -591,6 +714,7 @@ impl SchematicState {
             p1: at,
             p2: GridPt(at.0 + dx, at.1 + dy),
             val,
+            attrs: Default::default(),
         });
     }
 
@@ -804,6 +928,7 @@ impl SchematicState {
 
         let mut circuit = CsCircuit::new("schematic");
         let mut r_idx = 1; let mut c_idx = 1; let mut l_idx = 1; let mut v_idx = 1;
+        let mut parasitics: Vec<Parasitic> = Vec::new();
 
         for c in &self.components {
             if c.kind == CompKind::Ground { continue; }
@@ -831,6 +956,13 @@ impl SchematicState {
                         name: format!("C{c_idx}"), n1, n2, capacitance,
                         model: None,
                     });
+                    parasitics.push(Parasitic {
+                        kind: c.kind,
+                        main: circuit.capacitors.len() - 1,
+                        name: format!("C{c_idx}"),
+                        n1, n2,
+                        attrs: &c.attrs,
+                    });
                     c_idx += 1;
                 }
                 CompKind::Inductor => {
@@ -840,21 +972,58 @@ impl SchematicState {
                         name: format!("L{l_idx}"), n1, n2, inductance,
                         model: None,
                     });
+                    parasitics.push(Parasitic {
+                        kind: c.kind,
+                        main: circuit.inductors.len() - 1,
+                        name: format!("L{l_idx}"),
+                        n1, n2,
+                        attrs: &c.attrs,
+                    });
                     l_idx += 1;
                 }
                 CompKind::Voltage => {
-                    let voltage = parse_value(&c.val)
+                    // The value is a full source card (`DC 5`, `AC 1`,
+                    // `SIN(…)`, or a bare number), read through the deck
+                    // grammar so the schematic never drifts from `parse`.
+                    let card = parse_source_card(&c.val, &ParseOptions::default())
                         .map_err(|e| format!("V{v_idx} value '{}': {e}", c.val))?;
+                    // Same DC rule as the deck parser: an explicit DC wins,
+                    // else the waveform's value at t = 0, else 0.
+                    let voltage = match (card.dc, &card.waveform) {
+                        (Some(v), _) => v,
+                        (None, Some(w)) => w.start_value(),
+                        (None, None) => 0.0,
+                    };
                     circuit.voltage_sources.push(CsVoltageSource {
                         name: format!("V{v_idx}"),
                         n1, n2, voltage,
-                        waveform: None, ac: None,
+                        waveform: card.waveform,
+                        ac: card.ac,
+                    });
+                    parasitics.push(Parasitic {
+                        kind: c.kind,
+                        main: circuit.voltage_sources.len() - 1,
+                        name: format!("V{v_idx}"),
+                        n1, n2,
+                        attrs: &c.attrs,
                     });
                     v_idx += 1;
                 }
                 CompKind::Ground => unreachable!(),
             }
         }
+
+        // Parasitic arms (ESR/ESL/Rpar/Cpar…) go in AFTER every main element,
+        // so each main element keeps its position in its family vector —
+        // the GUI addresses current probes by that index.
+        let first_free_node = assignment
+            .pt_list
+            .iter()
+            .map(|&p| assignment.node_of(p) + 1)
+            .max()
+            .unwrap_or(0)
+            .max(circuit.nodes);
+        expand_parasitics(&mut circuit, &parasitics, first_free_node)?;
 
         // Labeled nets carry their label as the node's name, so the emitted
         // deck, the run's `V(name)` traces and the canvas all agree. A net no
@@ -1018,13 +1187,23 @@ impl SchematicState {
             });
         }
         for v in &circuit.voltage_sources {
-            // Only the DC level is drawn; PULSE/SIN parameters stay in the
-            // netlist (the schematic has no waveform editing yet).
+            // A plain DC source keeps its bare-number spelling; one with an
+            // AC stimulus or a waveform is carried as its full source card,
+            // which `build_netlist` reads back through the deck grammar.
+            let val = if v.waveform.is_none() && v.ac.is_none() {
+                fmt_val(v.voltage)
+            } else {
+                emit_source_card(&SourceCard {
+                    dc: (v.waveform.is_none()).then_some(v.voltage),
+                    ac: v.ac.clone(),
+                    waveform: v.waveform.clone(),
+                })
+            };
             parsed.push(ParsedComp {
                 kind:   CompKind::Voltage,
                 node_a: v.n1.0,
                 node_b: v.n2.0,
-                val:    fmt_val(v.voltage),
+                val,
             });
         }
         // Diodes, MOSFETs and current sources have no schematic symbol yet —
@@ -1178,7 +1357,7 @@ mod tests {
     use circuitsim::netlist::parse;
 
     fn comp(kind: CompKind, x: i32, y: i32, val: &str) -> Component {
-        Component { kind, p1: GridPt(x, y), p2: GridPt(x + 3, y), val: val.to_string() }
+        Component { kind, p1: GridPt(x, y), p2: GridPt(x + 3, y), val: val.to_string(), attrs: Default::default() }
     }
 
     #[test]
@@ -1207,6 +1386,47 @@ mod tests {
             .expect("deck imports");
         assert_eq!(state.tran_step, "1u");
         assert_eq!(state.tran_stop, "5m");
+    }
+
+    #[test]
+    fn source_cards_survive_import_and_build() {
+        let deck = "* src\nV1 1 0 DC 0 AC 1 SIN(0 1 1k)\nR1 1 0 1k\n.tran 1u 1m\n.end\n";
+        let (st, _) = SchematicState::from_netlist(deck, &SchematicState::default()).expect("imports");
+        let v = st.components.iter().find(|c| c.kind == CompKind::Voltage).unwrap();
+        assert!(v.val.contains("SIN") && v.val.contains("AC"), "{}", v.val);
+        let net = st.build_netlist().expect("builds");
+        let src = &net.circuit.voltage_sources[0];
+        assert!(src.waveform.is_some());
+        assert_eq!(src.ac.map(|a| a.mag), Some(1.0));
+    }
+
+    #[test]
+    fn parasitic_attrs_add_elements_and_zero_means_absent() {
+        let deck = "* p\nV1 1 0 DC 5\nR1 1 2 1k\nC1 2 0 1u\n.op\n.end\n";
+        let (mut st, _) = SchematicState::from_netlist(deck, &SchematicState::default()).expect("imports");
+        let base = st.build_netlist().expect("builds");
+        let (r0, c0) = (base.circuit.resistors.len(), base.circuit.capacitors.len());
+        for c in st.components.iter_mut() {
+            match c.kind {
+                CompKind::Capacitor => {
+                    c.attrs.insert("rser".into(), "50m".into());
+                    c.attrs.insert("rpar".into(), "0".into());
+                }
+                CompKind::Voltage => {
+                    c.attrs.insert("rser".into(), "10".into());
+                    c.attrs.insert("cpar".into(), "1p".into());
+                }
+                _ => {}
+            }
+        }
+        let net = st.build_netlist().expect("builds with parasitics");
+        assert_eq!(net.circuit.resistors.len(), r0 + 2, "C ESR + V Rser, zero Rpar skipped");
+        assert_eq!(net.circuit.capacitors.len(), c0 + 1, "V Cpar");
+        // Bad text is reported, not ignored.
+        for c in st.components.iter_mut().filter(|c| c.kind == CompKind::Capacitor) {
+            c.attrs.insert("rser".into(), "oops".into());
+        }
+        assert!(st.build_netlist().is_err());
     }
 
     #[test]
@@ -1350,10 +1570,10 @@ mod tests {
     fn divider() -> SchematicState {
         let mut st = SchematicState::default();
         st.components = vec![
-            Component { kind: CompKind::Voltage, p1: GridPt(0, 0), p2: GridPt(0, 3), val: "5".into() },
-            Component { kind: CompKind::Resistor, p1: GridPt(4, 0), p2: GridPt(4, 3), val: "1k".into() },
-            Component { kind: CompKind::Ground, p1: GridPt(0, 3), p2: GridPt(0, 3), val: "".into() },
-            Component { kind: CompKind::Ground, p1: GridPt(4, 3), p2: GridPt(4, 3), val: "".into() },
+            Component { kind: CompKind::Voltage, p1: GridPt(0, 0), p2: GridPt(0, 3), val: "5".into(), attrs: Default::default() },
+            Component { kind: CompKind::Resistor, p1: GridPt(4, 0), p2: GridPt(4, 3), val: "1k".into(), attrs: Default::default() },
+            Component { kind: CompKind::Ground, p1: GridPt(0, 3), p2: GridPt(0, 3), val: "".into(), attrs: Default::default() },
+            Component { kind: CompKind::Ground, p1: GridPt(4, 3), p2: GridPt(4, 3), val: "".into(), attrs: Default::default() },
         ];
         st.wires = vec![Wire { p1: GridPt(0, 0), p2: GridPt(4, 0) }];
         st
@@ -1402,10 +1622,10 @@ mod tests {
         // Two parts with no wire between them become one net by label alone.
         let mut st = SchematicState::default();
         st.components = vec![
-            Component { kind: CompKind::Resistor, p1: GridPt(0, 0), p2: GridPt(0, 3), val: "1k".into() },
-            Component { kind: CompKind::Resistor, p1: GridPt(8, 0), p2: GridPt(8, 3), val: "2k".into() },
-            Component { kind: CompKind::Ground, p1: GridPt(0, 3), p2: GridPt(0, 3), val: "".into() },
-            Component { kind: CompKind::Ground, p1: GridPt(8, 3), p2: GridPt(8, 3), val: "".into() },
+            Component { kind: CompKind::Resistor, p1: GridPt(0, 0), p2: GridPt(0, 3), val: "1k".into(), attrs: Default::default() },
+            Component { kind: CompKind::Resistor, p1: GridPt(8, 0), p2: GridPt(8, 3), val: "2k".into(), attrs: Default::default() },
+            Component { kind: CompKind::Ground, p1: GridPt(0, 3), p2: GridPt(0, 3), val: "".into(), attrs: Default::default() },
+            Component { kind: CompKind::Ground, p1: GridPt(8, 3), p2: GridPt(8, 3), val: "".into(), attrs: Default::default() },
         ];
         let apart = NodeAssignment::of(&st.components, &st.wires, &[]);
         assert_ne!(apart.node_of(GridPt(0, 0)), apart.node_of(GridPt(8, 0)));

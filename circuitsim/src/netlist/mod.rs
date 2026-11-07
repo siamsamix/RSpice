@@ -1104,3 +1104,57 @@ pub fn emit_source_value(value: &SourceValue) -> String {
         SourceValue::Waveform(w) => self::waveforms::waveform_text(w),
     }
 }
+
+/// The COMBINED value of an independent source card: any mix of the DC
+/// level, the small-signal `AC` stimulus and one waveform family — what the
+/// deck grammar allows on one card (`DC 0 AC 5 SIN(0 1 1k)`).
+/// [`SourceValue`] keeps only one facet of that; a frontend that edits the
+/// whole card (the schematic's source dialog) goes through this instead.
+#[derive(Debug, Clone, Default)]
+pub struct SourceCard {
+    /// `DC <v>` or a bare number; `None` when the card states no level.
+    pub dc: Option<f64>,
+    /// `AC <mag> [phase]`.
+    pub ac: Option<Ac>,
+    /// The single waveform (`PULSE`/`SIN`/`EXP`/`PWL`/`SFFM`/`AM`), if any.
+    pub waveform: Option<Waveform>,
+}
+
+/// Parse the value tail of a source card into a [`SourceCard`], through the
+/// same grammar [`parse`] applies to `V`/`I` cards (a bare number is a DC
+/// level). Tokens the grammar cannot place are an error, never dropped.
+pub fn parse_source_card(text: &str, options: &ParseOptions) -> Result<SourceCard> {
+    let tokens: Vec<&str> = text.split_whitespace().collect();
+    if tokens.is_empty() {
+        return Err(SimError::Parse("source value is empty".into()));
+    }
+    let (spec, leftovers) = self::waveforms::parse_source_value_specs(&tokens, options)?;
+    if !leftovers.is_empty() {
+        return Err(SimError::Parse(format!(
+            "source value ignores unsupported tokens: {}",
+            leftovers.join(" ")
+        )));
+    }
+    Ok(SourceCard { dc: spec.dc, ac: spec.ac, waveform: spec.waveform })
+}
+
+/// Canonical card text for a [`SourceCard`]: `DC <x> AC <mag> <phase>
+/// <waveform>`, absent parts omitted, an empty card spelled `DC 0`. The
+/// inverse of [`parse_source_card`].
+pub fn emit_source_card(card: &SourceCard) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(dc) = card.dc {
+        parts.push(format!("DC {dc}"));
+    }
+    if let Some(ac) = &card.ac {
+        parts.push(format!("AC {} {}", ac.mag, ac.phase));
+    }
+    if let Some(w) = &card.waveform {
+        parts.push(self::waveforms::waveform_text(w));
+    }
+    if parts.is_empty() {
+        "DC 0".to_string()
+    } else {
+        parts.join(" ")
+    }
+}

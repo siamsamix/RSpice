@@ -8,7 +8,7 @@
 use egui::epaint::{PathShape, Shape};
 use egui::{vec2, Color32, Painter, Pos2, Rect, Response, Sense, Stroke, Ui};
 
-use crate::theme::{ACCENT_DIM, BG_HOVER, BORDER_SUBTLE, LT_WIRE};
+use crate::theme::{pal, ACCENT_DIM, BG_HOVER, BORDER_SUBTLE};
 
 /// Every glyph the chrome draws.
 #[derive(Clone, Copy, PartialEq)]
@@ -107,13 +107,13 @@ fn paint(painter: &Painter, rect: Rect, icon: Icon, enabled: bool) {
             // Black folder with a blue arrow.
             painter.rect_filled(rect_u(0.08, 0.22, 0.42, 0.34), 1.0, dim(BLACK, enabled));
             painter.rect_filled(rect_u(0.08, 0.30, 0.92, 0.84), 1.0, dim(BLACK, enabled));
-            poly_fill(&[(0.5, 0.36), (0.72, 0.58), (0.28, 0.58)], LT_WIRE, Stroke::NONE);
-            painter.rect_filled(rect_u(0.44, 0.56, 0.56, 0.74), 0.0, dim(LT_WIRE, enabled));
+            poly_fill(&[(0.5, 0.36), (0.72, 0.58), (0.28, 0.58)], pal().wire, Stroke::NONE);
+            painter.rect_filled(rect_u(0.44, 0.56, 0.56, 0.74), 0.0, dim(pal().wire, enabled));
         }
         Icon::Save => {
             painter.rect_filled(rect_u(0.1, 0.1, 0.9, 0.9), 2.0, dim(BLACK, enabled));
             painter.rect_filled(rect_u(0.28, 0.1, 0.72, 0.4), 0.0, dim(Color32::WHITE, enabled));
-            painter.rect_filled(rect_u(0.24, 0.58, 0.76, 0.9), 0.0, dim(LT_WIRE, enabled));
+            painter.rect_filled(rect_u(0.24, 0.58, 0.76, 0.9), 0.0, dim(pal().wire, enabled));
         }
         Icon::Run => {
             poly_fill(&[(0.2, 0.08), (0.2, 0.92), (0.86, 0.5)], GREEN, stroke(Color32::from_rgb(0, 120, 0), 1.0));
@@ -134,12 +134,12 @@ fn paint(painter: &Painter, rect: Rect, icon: Icon, enabled: bool) {
             painter.text(c, egui::Align2::CENTER_CENTER, label, crate::theme::bold(size), dim(BLACK, enabled));
         }
         Icon::TileVertical => {
-            let s = stroke(LT_WIRE, 1.4);
+            let s = stroke(pal().wire, 1.4);
             painter.rect(rect_u(0.06, 0.1, 0.46, 0.9), 2.0, Color32::WHITE, s);
             painter.rect(rect_u(0.54, 0.1, 0.94, 0.9), 2.0, Color32::WHITE, s);
         }
         Icon::TileHorizontal => {
-            let s = stroke(LT_WIRE, 1.4);
+            let s = stroke(pal().wire, 1.4);
             painter.rect(rect_u(0.1, 0.06, 0.9, 0.46), 2.0, Color32::WHITE, s);
             painter.rect(rect_u(0.1, 0.54, 0.9, 0.94), 2.0, Color32::WHITE, s);
         }
@@ -168,7 +168,7 @@ fn paint(painter: &Painter, rect: Rect, icon: Icon, enabled: bool) {
             line(&[(0.5, 0.66), (0.72, 0.94)], stroke(BLACK, 2.4));
         }
         Icon::Wire => {
-            let s = stroke(LT_WIRE, 1.8);
+            let s = stroke(pal().wire, 1.8);
             line(&[(0.2, 0.18), (0.2, 0.5), (0.8, 0.5), (0.8, 0.82)], s);
             for (x, y) in [(0.2, 0.18), (0.8, 0.82)] {
                 painter.circle(p(x, y), 0.09 * w, Color32::WHITE, s);
@@ -178,10 +178,10 @@ fn paint(painter: &Painter, rect: Rect, icon: Icon, enabled: bool) {
             let s = stroke(BLACK, 1.8);
             line(&[(0.5, 0.1), (0.5, 0.48)], s);
             closed(&[(0.14, 0.48), (0.86, 0.48), (0.5, 0.9)], s);
-            painter.circle_filled(p(0.5, 0.1), 0.07 * w, dim(LT_WIRE, enabled));
+            painter.circle_filled(p(0.5, 0.1), 0.07 * w, dim(pal().wire, enabled));
         }
         Icon::Resistor => {
-            let s = stroke(LT_WIRE, 1.6);
+            let s = stroke(pal().wire, 1.6);
             let mut pts = vec![(0.04, 0.5), (0.22, 0.5)];
             for k in 0..6 {
                 let x = 0.22 + (k as f32 + 0.5) * (0.56 / 6.0);
@@ -191,15 +191,15 @@ fn paint(painter: &Painter, rect: Rect, icon: Icon, enabled: bool) {
             line(&pts, s);
         }
         Icon::Capacitor => {
-            let s = stroke(LT_WIRE, 1.6);
+            let s = stroke(pal().wire, 1.6);
             line(&[(0.04, 0.5), (0.4, 0.5)], s);
             line(&[(0.6, 0.5), (0.96, 0.5)], s);
-            let plate = stroke(LT_WIRE, 2.4);
+            let plate = stroke(pal().wire, 2.4);
             line(&[(0.4, 0.18), (0.4, 0.82)], plate);
             line(&[(0.6, 0.18), (0.6, 0.82)], plate);
         }
         Icon::Inductor => {
-            let s = stroke(LT_WIRE, 1.6);
+            let s = stroke(pal().wire, 1.6);
             let mut pts = vec![(0.04, 0.6)];
             for k in 0..3 {
                 for step in 0..=8 {
@@ -213,7 +213,7 @@ fn paint(painter: &Painter, rect: Rect, icon: Icon, enabled: bool) {
             line(&pts, s);
         }
         Icon::Voltage => {
-            let s = stroke(LT_WIRE, 1.6);
+            let s = stroke(pal().wire, 1.6);
             line(&[(0.5, 0.02), (0.5, 0.18)], s);
             line(&[(0.5, 0.82), (0.5, 0.98)], s);
             painter.circle_stroke(p(0.5, 0.5), 0.32 * w, s);
@@ -263,7 +263,7 @@ fn paint(painter: &Painter, rect: Rect, icon: Icon, enabled: bool) {
                 })
                 .collect();
             line(&red, stroke(Color32::from_rgb(220, 0, 0), 1.0));
-            line(&[(0.1, 0.74), (0.9, 0.74)], stroke(LT_WIRE, 1.0));
+            line(&[(0.1, 0.74), (0.9, 0.74)], stroke(pal().wire, 1.0));
         }
     }
 }

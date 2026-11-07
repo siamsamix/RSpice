@@ -83,6 +83,129 @@ pub const PLOT_COLORS: [Color32; 8] = [
 ];
 
 // ---------------------------------------------------------------------------
+// Theme selection.
+//
+// Two looks share one app: `Modern` (the constants above, unchanged) and
+// `Classic` (pixel-sampled from the LTspice reference screenshots in `docs/`).
+// Code that must differ per theme asks [`pal`] instead of naming a constant;
+// the Modern palette is built from the very same constants, so nothing drawn
+// in Modern changes.
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicU8, Ordering};
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum ThemeKind {
+    /// Soft, rounded light theme.
+    Modern,
+    /// Flat gray LTspice look: square corners, gray workspace, black viewer.
+    Classic,
+}
+
+static THEME_KIND: AtomicU8 = AtomicU8::new(1);
+
+pub fn kind() -> ThemeKind {
+    if THEME_KIND.load(Ordering::Relaxed) == 0 { ThemeKind::Modern } else { ThemeKind::Classic }
+}
+
+pub fn set_kind(kind: ThemeKind) {
+    THEME_KIND.store(matches!(kind, ThemeKind::Classic) as u8, Ordering::Relaxed);
+}
+
+pub fn is_classic() -> bool {
+    kind() == ThemeKind::Classic
+}
+
+/// The theme named by the `RSPICE_THEME` environment variable
+/// (`modern` / `classic`), if any.
+pub fn kind_from_env() -> Option<ThemeKind> {
+    match std::env::var("RSPICE_THEME").ok()?.to_ascii_lowercase().as_str() {
+        "modern" => Some(ThemeKind::Modern),
+        "classic" | "ltspice" => Some(ThemeKind::Classic),
+        _ => None,
+    }
+}
+
+/// Every colour whose value differs between the two themes.
+#[derive(Clone, Copy)]
+pub struct Palette {
+    pub white: Color32,
+    pub strip: Color32,
+    pub workspace: Color32,
+    pub frame: Color32,
+    pub title_active: Color32,
+    pub title_active_bg: Color32,
+    pub title_active_text: Color32,
+    pub title_inactive: Color32,
+    pub title_inactive_text: Color32,
+    pub plot_bg: Color32,
+    pub plot_frame: Color32,
+    pub wire: Color32,
+    pub schem_text: Color32,
+    pub accent: Color32,
+    pub accent_dim: Color32,
+    pub bg_hover: Color32,
+    pub border_subtle: Color32,
+    pub select_fill: Color32,
+    pub tab_idle: Color32,
+}
+
+impl Palette {
+    pub const MODERN: Palette = Palette {
+        white: LT_WHITE,
+        strip: LT_STRIP,
+        workspace: LT_WORKSPACE,
+        frame: LT_FRAME,
+        title_active: LT_TITLE_ACTIVE,
+        title_active_bg: TITLE_ACTIVE_BG,
+        title_active_text: TEXT_PRIMARY,
+        title_inactive: LT_TITLE_INACTIVE,
+        title_inactive_text: LT_TITLE_INACTIVE_TEXT,
+        plot_bg: LT_PLOT_BG,
+        plot_frame: LT_PLOT_FRAME,
+        wire: LT_WIRE,
+        schem_text: LT_SCHEM_TEXT,
+        accent: ACCENT,
+        accent_dim: ACCENT_DIM,
+        bg_hover: BG_HOVER,
+        border_subtle: BORDER_SUBTLE,
+        select_fill: SELECT_FILL,
+        tab_idle: Color32::from_rgb(236, 239, 244),
+    };
+
+    /// Sampled from `docs/ltspice-window*.png`.
+    pub const CLASSIC: Palette = Palette {
+        white: Color32::from_rgb(255, 255, 255),
+        strip: Color32::from_rgb(245, 245, 245),
+        workspace: Color32::from_rgb(192, 192, 192),
+        frame: Color32::from_rgb(106, 106, 106),
+        title_active: Color32::from_rgb(50, 150, 250),
+        title_active_bg: Color32::from_rgb(50, 150, 250),
+        title_active_text: Color32::BLACK,
+        title_inactive: Color32::from_rgb(128, 128, 128),
+        title_inactive_text: Color32::from_rgb(200, 200, 200),
+        plot_bg: Color32::BLACK,
+        plot_frame: Color32::from_rgb(192, 192, 192),
+        wire: Color32::from_rgb(0, 0, 255),
+        schem_text: Color32::BLACK,
+        accent: Color32::from_rgb(50, 150, 250),
+        accent_dim: Color32::from_rgb(0, 0, 200),
+        bg_hover: Color32::from_rgb(227, 227, 227),
+        border_subtle: Color32::from_rgb(174, 174, 174),
+        select_fill: Color32::from_rgb(166, 202, 240),
+        tab_idle: Color32::from_rgb(236, 236, 236),
+    };
+}
+
+/// The active theme's palette.
+pub fn pal() -> Palette {
+    match kind() {
+        ThemeKind::Modern => Palette::MODERN,
+        ThemeKind::Classic => Palette::CLASSIC,
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Fonts
 // ---------------------------------------------------------------------------
 
@@ -226,6 +349,96 @@ pub fn apply(ctx: &egui::Context) {
     ctx.set_style(style);
 }
 
+/// Select and install a theme on `ctx`. Modern goes through [`apply`]
+/// untouched.
+pub fn apply_kind(ctx: &egui::Context, kind: ThemeKind) {
+    set_kind(kind);
+    match kind {
+        ThemeKind::Modern => apply(ctx),
+        ThemeKind::Classic => apply_classic(ctx),
+    }
+}
+
+/// The Classic (LTspice / classic Windows) look: flat, square, no shadows,
+/// gray dialogs, black text.
+pub fn apply_classic(ctx: &egui::Context) {
+    let p = Palette::CLASSIC;
+    let face = Color32::from_rgb(240, 240, 240);
+    let edge = Color32::from_rgb(173, 173, 173);
+    let mut visuals = Visuals::light();
+
+    visuals.panel_fill = face;
+    visuals.window_fill = face;
+    visuals.extreme_bg_color = Color32::WHITE;
+    visuals.faint_bg_color = Color32::from_rgb(245, 245, 245);
+    visuals.code_bg_color = Color32::from_rgb(235, 235, 235);
+    visuals.window_stroke = Stroke::new(1.0, Color32::from_rgb(100, 100, 100));
+    visuals.window_shadow = egui::epaint::Shadow::NONE;
+    visuals.popup_shadow = egui::epaint::Shadow {
+        offset: egui::vec2(2.0, 2.0),
+        blur: 0.0,
+        spread: 0.0,
+        color: Color32::from_black_alpha(60),
+    };
+
+    let flat = Rounding::ZERO;
+    visuals.widgets.noninteractive.bg_fill = face;
+    visuals.widgets.noninteractive.weak_bg_fill = face;
+    visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, edge);
+    visuals.widgets.noninteractive.fg_stroke = Stroke::new(1.0, Color32::BLACK);
+    visuals.widgets.noninteractive.rounding = flat;
+
+    visuals.widgets.inactive.bg_fill = Color32::from_rgb(225, 225, 225);
+    visuals.widgets.inactive.weak_bg_fill = Color32::from_rgb(225, 225, 225);
+    visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, edge);
+    visuals.widgets.inactive.fg_stroke = Stroke::new(1.0, Color32::BLACK);
+    visuals.widgets.inactive.rounding = flat;
+
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(229, 241, 251);
+    visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(229, 241, 251);
+    visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0, 120, 215));
+    visuals.widgets.hovered.fg_stroke = Stroke::new(1.0, Color32::BLACK);
+    visuals.widgets.hovered.rounding = flat;
+
+    visuals.widgets.active.bg_fill = Color32::from_rgb(204, 228, 247);
+    visuals.widgets.active.weak_bg_fill = Color32::from_rgb(204, 228, 247);
+    visuals.widgets.active.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0, 84, 153));
+    visuals.widgets.active.fg_stroke = Stroke::new(1.0, Color32::BLACK);
+    visuals.widgets.active.rounding = flat;
+
+    visuals.widgets.open.bg_fill = Color32::from_rgb(204, 228, 247);
+    visuals.widgets.open.weak_bg_fill = Color32::from_rgb(204, 228, 247);
+    visuals.widgets.open.bg_stroke = Stroke::new(1.0, Color32::from_rgb(0, 84, 153));
+    visuals.widgets.open.fg_stroke = Stroke::new(1.0, Color32::BLACK);
+    visuals.widgets.open.rounding = flat;
+
+    visuals.selection.bg_fill = p.select_fill;
+    visuals.selection.stroke = Stroke::new(1.0, Color32::from_rgb(0, 84, 153));
+    visuals.hyperlink_color = p.accent_dim;
+    visuals.warn_fg_color = STATUS_WARN;
+    visuals.error_fg_color = Color32::from_rgb(200, 0, 0);
+    visuals.override_text_color = Some(Color32::BLACK);
+    visuals.window_rounding = flat;
+    visuals.menu_rounding = flat;
+
+    ctx.set_visuals(visuals);
+
+    let mut style = (*ctx.style()).clone();
+    style.spacing.scroll.bar_width = 12.0;
+    style.spacing.item_spacing = egui::vec2(6.0, 3.0);
+    style.spacing.button_padding = egui::vec2(8.0, 2.0);
+    style.spacing.window_margin = egui::Margin::same(8.0);
+    style.spacing.menu_margin = egui::Margin::same(2.0);
+    style.spacing.indent = 14.0;
+    style.spacing.interact_size.y = 20.0;
+    style.text_styles.insert(TextStyle::Heading, FontId::new(13.0, FontFamily::Proportional));
+    style.text_styles.insert(TextStyle::Body, FontId::new(12.0, FontFamily::Proportional));
+    style.text_styles.insert(TextStyle::Monospace, FontId::new(12.0, FontFamily::Monospace));
+    style.text_styles.insert(TextStyle::Button, FontId::new(12.0, FontFamily::Proportional));
+    style.text_styles.insert(TextStyle::Small, FontId::new(10.5, FontFamily::Proportional));
+    ctx.set_style(style);
+}
+
 // ---------------------------------------------------------------------------
 // Frame Constructors
 // ---------------------------------------------------------------------------
@@ -247,8 +460,8 @@ pub fn bar_frame(fill: Color32, margin: egui::Margin) -> egui::Frame {
 /// Waveform viewer surface — black, edge to edge, like the reference.
 pub fn code_frame() -> egui::Frame {
     egui::Frame::none()
-        .fill(LT_PLOT_BG)
-        .stroke(Stroke::new(1.0, LT_PLOT_FRAME))
+        .fill(pal().plot_bg)
+        .stroke(Stroke::new(1.0, pal().plot_frame))
         .rounding(Rounding::same(0.0))
         .inner_margin(egui::Margin::same(0.0))
 }

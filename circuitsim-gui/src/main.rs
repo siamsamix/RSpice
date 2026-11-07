@@ -2,8 +2,10 @@ mod app;
 mod autolayout;
 mod chrome;
 mod icons;
+mod lt_viewer;
 mod parts;
 mod plot;
+mod props;
 mod schematic;
 mod theme;
 
@@ -22,7 +24,8 @@ fn main() -> eframe::Result<()> {
         "RSpice",
         options,
         Box::new(|cc| {
-            theme::apply(&cc.egui_ctx);
+            let kind = theme::kind_from_env().unwrap_or(theme::ThemeKind::Classic);
+            theme::apply_kind(&cc.egui_ctx, kind);
             Ok(Box::new(CircuitSimApp::new(cc)))
         }),
     )
@@ -65,7 +68,7 @@ fn main() {
                 });
 
                 // 3. Apply your custom theme adjustments
-                theme::apply(&cc.egui_ctx);
+                theme::apply_kind(&cc.egui_ctx, theme::ThemeKind::Classic);
 
                 Ok(Box::new(CircuitSimApp::new(cc)))
             }),
